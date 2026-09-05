@@ -2,6 +2,8 @@
 
 Desktop-focused email, backed by a provider-agnostic Inbox SDK. Bring your mailboxes into one unified inbox while keeping their identities, credentials, and provider capabilities separate.
 
+> **Personal fork note:** This fork adds local Microsoft 365 / Exchange OAuth 2.0 IMAP and SMTP support for personal use. I may propose the work upstream later; for now, this fork exists to scratch my own itch.
+
 ![Unified inbox showing the included fictional mailboxes](docs/screenshots/unified-inbox.png)
 
 ## Run locally
@@ -182,6 +184,7 @@ The goal is **ready-to-connect providers out of the box**: choose a service, com
 | Mock mailboxes | Included and offline | Keep the full app usable immediately, without personal credentials. |
 | Gmail | Implemented; host OAuth client configuration required | Make authorization, reconnects, and multi-account setup simpler. |
 | [Inbound.new](https://inbound.new) | Implemented; API-key onboarding and domain/address views | Improve large-domain onboarding, import progress, and recovery within the provider's sync limits. |
+| Microsoft 365 / Exchange | Implemented in this fork; OAuth 2.0 IMAP + SMTP | Keep the local setup reliable and consider an upstream contribution. |
 | iCloud / IMAP | In progress | Email + app-specific-password setup for iCloud, secure IMAP/SMTP presets, and end-to-end provider qualification. |
 | [Resend](https://resend.com/docs/dashboard/receiving/introduction) | Planned | Add a sending/receiving adapter using received-email APIs, attachment retrieval, and verified webhook ingestion. |
 | [Cloudflare Email Service](https://developers.cloudflare.com/email-service/) | Planned | Bridge Email Routing / Email Workers into durable SDK mail storage, and integrate supported sending APIs or SMTP. |
