@@ -79,6 +79,17 @@ export function connectHostProvider(id: string, credentials: Record<string, stri
   return request<{ connectionId?: string; authorizeUrl?: string }>(`/host/providers/${encodeURIComponent(id)}/${connectionId ? `connections/${encodeURIComponent(connectionId)}/reconnect` : "connect"}`, signal, credentials);
 }
 
+export async function completeMicrosoftOAuth(search: string, signal: AbortSignal): Promise<{ id: string }> {
+  if (!/^\?(?:[^\x00-\x1f\x7f#]{1,8192})$/.test(search)) throw new Error("The Microsoft sign-in response was invalid.");
+  const response = await hostFetch(`/host/providers/exchange-imap/callback${search}`, {
+    method: "POST", credentials: "include", cache: "no-store", signal,
+    headers: { "X-Superlocal": "1" },
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok || !result || typeof result.id !== "string") throw new Error("Account connection could not be completed.");
+  return { id: result.id };
+}
+
 function isInboxViewPreferences(value: unknown): value is InboxViewPreferences {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;

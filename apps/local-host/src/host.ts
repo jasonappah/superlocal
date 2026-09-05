@@ -58,7 +58,7 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
 
 function credentialsFor(provider: HostProviderRegistration, input: Record<string, unknown>): Record<string, string> {
   const invalid = () => new InboxError('HOST_INVALID_CREDENTIALS', 'Only the declared provider credential fields are accepted.', 400)
-  if (provider.onboarding.connection !== 'credentials') {
+  if (provider.onboarding.connection === 'none') {
     if (Object.keys(input).length) throw invalid()
     return {}
   }

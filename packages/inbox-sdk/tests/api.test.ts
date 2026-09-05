@@ -1230,7 +1230,12 @@ describe('IMAP host onboarding boundary', () => {
     expect(config.mode).toBe('mock')
     expect(config.providers.gmail.enabled).toBe(false)
     expect(config.providers.inbound.enabled).toBe(false)
-    const host = await createLocalHost({ ...config, mode: 'real', dataDir: join(root, 'runtime') }, {})
+    const host = await createLocalHost({ ...config, mode: 'real', dataDir: join(root, 'runtime'), providers: {
+      ...config.providers, exchangeImap: { enabled: true, oauth: {
+        clientId: '9e5f94bc-e8a4-4e73-b8be-63364c29d753',
+        scopes: ['https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access'],
+      } },
+    } }, {})
     cleanup.push(() => host.close())
     const origin = config.web.origin
     const base = `http://localhost:${config.backend.port}`
@@ -1238,8 +1243,27 @@ describe('IMAP host onboarding boundary', () => {
     const cookie = session.headers.get('set-cookie')!.split(';')[0]!
     const headers = { Origin: origin, Cookie: cookie, 'Content-Type': 'application/json' }
     const descriptor = await (await host.fetch(new Request(`${base}/host/config`, { headers }))).json()
-    expect(descriptor.providers).toEqual([expect.objectContaining({ id: 'imap', ready: true, mailboxSelection: 'automatic', reconnect: true,
-      fields: [expect.objectContaining({ name: 'email', type: 'email' }), expect.objectContaining({ name: 'password', label: 'App-specific password', type: 'password' })] })])
+    expect(descriptor.providers).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'imap', ready: true, mailboxSelection: 'automatic', reconnect: true,
+      fields: [expect.objectContaining({ name: 'email', type: 'email' }), expect.objectContaining({ name: 'password', label: 'App-specific password', type: 'password' })] }),
+    expect.objectContaining({ id: 'exchange-imap', ready: true, connection: 'oauth', reconnect: true,
+      fields: [expect.objectContaining({ name: 'email', type: 'email' })] })]))
+    expect(descriptor.providers).toHaveLength(2)
+    const microsoftStart = await host.fetch(new Request(`${base}/host/providers/exchange-imap/connect`, { method: 'POST', headers,
+      body: JSON.stringify({ credentials: { email: 'reader@utdallas.edu' } }) }))
+    expect(microsoftStart.status).toBe(200)
+    const microsoftHandoff = new URL((await microsoftStart.json() as { authorizeUrl: string }).authorizeUrl)
+    expect(microsoftHandoff.origin).toBe(origin)
+    expect(microsoftHandoff.pathname).toMatch(/^\/v1\/oauth\/microsoft\/authorize\//)
+    const microsoftAuthorize = await host.fetch(new Request(microsoftHandoff, { headers: { Cookie: cookie } }))
+    expect(microsoftAuthorize.status).toBe(302)
+    const microsoftLocation = new URL(microsoftAuthorize.headers.get('location')!)
+    expect(microsoftLocation.origin).toBe('https://login.microsoftonline.com')
+    expect(microsoftLocation.pathname).toBe('/common/oauth2/v2.0/authorize')
+    expect(microsoftLocation.searchParams.get('code_challenge_method')).toBe('S256')
+    expect(microsoftLocation.searchParams.get('scope')?.split(' ').sort()).toEqual([
+      'https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access',
+    ].sort())
+    expect(microsoftLocation.href).not.toContain('client_secret')
     expect(await host.inbox.accounts(host.owner)).toEqual([])
     let captured: any
     const original = host.inbox.createConnection

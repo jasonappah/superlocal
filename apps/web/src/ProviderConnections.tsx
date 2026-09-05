@@ -26,7 +26,7 @@ function coverage(candidates: MailboxCandidate[]): MailboxCandidate[] {
 }
 
 const method = (provider: HostProvider) =>
-  provider.connection === "oauth" ? "Sign in with your Google account"
+  provider.connection === "oauth" ? `Sign in with ${provider.name}`
   : provider.fields?.some(field => field.name === "apiKey") ? "Paste an API key"
   : provider.fields?.some(field => field.type === "password") ? "Email and app-specific password"
   : "";
@@ -281,7 +281,8 @@ export default function ProviderConnections({ host, store, resume, onStepChange,
     return (
       <form className="provider-flow provider-connect" ref={root as unknown as RefObject<HTMLFormElement>} tabIndex={-1} key={`${provider.id}:${step.reconnectId ?? ""}`} onSubmit={event => void connect(event, provider, step.reconnectId)}>
         {provider.connection === "oauth" ? <>
-          <p className="settings-note">You will be sent to Google to approve access, then brought back here while your mail loads.</p>
+          {(provider.fields ?? []).filter(field => !field.advanced).map(fieldInput)}
+          <p className="settings-note">You will be sent to {provider.name} to approve access, then brought back here while your mail loads.</p>
           <button className="settings-button" type="submit">{provider.actionLabel || `Sign in with ${provider.name}`}</button>
         </> : <>
           {reconnecting && <p className="settings-note">Enter a new password for {reconnecting.email || reconnecting.name}. Server settings stay the same.</p>}

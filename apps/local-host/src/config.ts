@@ -27,6 +27,7 @@ export interface LocalConfig {
   providers: {
     mock: { enabled: boolean }
     gmail: { enabled: boolean; oauth: { clientId: SecretSource; clientSecret: SecretSource; scopes: string[] } }
+    exchangeImap: { enabled: boolean; oauth: { clientId: SecretSource; scopes: string[] } }
     inbound: { enabled: boolean }
     imap: { enabled: boolean; servers: ImapHostPreset[] }
   }
@@ -140,6 +141,12 @@ function defaults() {
       } },
       inbound: { enabled: false },
       imap: { enabled: true, servers: [] },
+      exchangeImap: { enabled: false, oauth: {
+        // Mozilla's public Thunderbird registration is a temporary local-development default.
+        // Replace it with a personal Entra public-client registration when one is available.
+        clientId: '9e5f94bc-e8a4-4e73-b8be-63364c29d753',
+        scopes: ['https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access'],
+      } },
     },
   }
 }
@@ -169,11 +176,12 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   const allowedEmails = normalizeAllowedEmails(environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS === undefined ? auth.allowedEmails ?? [] :
     environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.trim() === '' ? [] : environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.split(','))
   const writes = record(input.allowProviderWrites, 'allowProviderWrites', ['mock', 'real'])
-  const providers = record(input.providers, 'providers', ['mock', 'gmail', 'inbound', 'imap'])
+  const providers = record(input.providers, 'providers', ['mock', 'gmail', 'inbound', 'imap', 'exchangeImap'])
   const mock = record(providers.mock, 'providers.mock', ['enabled'])
   const gmail = record(providers.gmail, 'providers.gmail', ['enabled', 'oauth'])
   const inbound = record(providers.inbound, 'providers.inbound', ['enabled'])
   const imap = record(providers.imap ?? { enabled: true, servers: [] }, 'providers.imap', ['enabled', 'servers'])
+  const exchangeImap = record(providers.exchangeImap ?? { enabled: false, oauth: { clientId: null, scopes: [] } }, 'providers.exchangeImap', ['enabled', 'oauth'])
   if (!Array.isArray(imap.servers ?? []) || ((imap.servers ?? []) as unknown[]).length > 16) invalid('providers.imap.servers')
   const imapServers: ImapHostPreset[] = ((imap.servers ?? []) as unknown[]).map(value => {
     const server = record(value, 'IMAP server preset', ['id', 'name', 'imap', 'smtp', 'sentCopy'])
@@ -190,9 +198,13 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   })
   if (new Set(imapServers.map(server => server.id)).size !== imapServers.length) invalid('unique IMAP preset ids')
   const oauth = record(gmail.oauth, 'providers.gmail.oauth', ['clientId', 'clientSecret', 'scopes'])
+  const exchangeOauth = record(exchangeImap.oauth, 'providers.exchangeImap.oauth', ['clientId', 'scopes'])
   if (typeof auth.sessionHours !== 'number' || !Number.isInteger(auth.sessionHours) || auth.sessionHours < 1 || auth.sessionHours > 24) invalid('auth (1–24 sessionHours)')
   if (!Array.isArray(oauth.scopes) || oauth.scopes.length > 64 || oauth.scopes.some(scope => typeof scope !== 'string' || !/^[\x21\x23-\x5b\x5d-\x7e]{1,2048}$/.test(scope)) ||
     !oauth.scopes.includes('openid') || !oauth.scopes.includes('email') || oauth.scopes.join(' ').length > 8192) invalid('providers.gmail.oauth.scopes')
+  if (!Array.isArray(exchangeOauth.scopes) || exchangeOauth.scopes.length > 64 || exchangeOauth.scopes.some(scope => typeof scope !== 'string' || !/^[\x21\x23-\x5b\x5d-\x7e]{1,2048}$/.test(scope)) ||
+    !exchangeOauth.scopes.includes('https://outlook.office.com/IMAP.AccessAsUser.All') || !exchangeOauth.scopes.includes('https://outlook.office.com/SMTP.Send') ||
+    !exchangeOauth.scopes.includes('offline_access') || exchangeOauth.scopes.join(' ').length > 8192) invalid('providers.exchangeImap.oauth.scopes')
   if (!Array.isArray(web.allowedOrigins) || web.allowedOrigins.length > 16) invalid('web.allowedOrigins')
   const webPort = port(environment.SUPERLOCAL_WEB_PORT ?? web.port, 'web.port')
   const apiPort = port(environment.SUPERLOCAL_API_PORT ?? backend.port, 'backend.port')
@@ -213,6 +225,10 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
       imap: { enabled: bool(imap.enabled, 'providers.imap.enabled'), servers: imapServers }, gmail: {
       enabled: bool(gmail.enabled, 'providers.gmail.enabled'), oauth: {
         clientId: secretSource(oauth.clientId, 'providers.gmail.oauth.clientId'), clientSecret: secretSource(oauth.clientSecret, 'providers.gmail.oauth.clientSecret'), scopes: oauth.scopes as string[],
+      },
+    }, exchangeImap: {
+      enabled: bool(exchangeImap.enabled, 'providers.exchangeImap.enabled'), oauth: {
+        clientId: secretSource(exchangeOauth.clientId, 'providers.exchangeImap.oauth.clientId'), scopes: exchangeOauth.scopes as string[],
       },
     } },
   }

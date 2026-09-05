@@ -68,6 +68,20 @@ export function createGoogleCredentialRefresh(
   }
 }
 
+export function createMicrosoftCredentialRefresh(
+  config: { clientId: string } | undefined,
+  now: () => number = Date.now,
+): ProviderDefinition['refresh'] {
+  if (!config) return undefined
+  return async (credentials, signal, context) => {
+    const identity = context?.connection.identity
+    if (context && (context.connection.providerId !== 'exchange-imap' || !identity || identity.issuer !== 'https://login.microsoftonline.com/common/v2.0' || identity.registrationId !== config.clientId)) {
+      throw new CredentialError('unavailable', 'Microsoft 365 credential refresh requires the original OAuth connection.')
+    }
+    return refreshOAuthCredentials('outlook', { ...credentials, clientId: config.clientId }, signal, now)
+  }
+}
+
 export async function verifyGoogleCredentials(
   context: CredentialContext,
   config: GoogleOAuthConfig | undefined,

@@ -51,6 +51,7 @@ import { captureIssueReport, type IssueReport } from "./issue-reports";
 import SenderContext from "./SenderContext";
 import { senderContact, senderConversations } from "./sender-context";
 import { normalizeSplits, attentionSplit, type SplitPreferences } from "../../shared/splits";
+import { completeMicrosoftOAuth } from "./host";
 
 type Route = {
   account: string;
@@ -197,6 +198,21 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   // The read-only host reminder shows once per tab; the disabled controls and Add Accounts keep the state visible afterwards.
   const [readOnlyDismissed, setReadOnlyDismissed] = useState(() => readSessionText("read-only-notice") === "dismissed");
   const [onboardingReturn, setOnboardingReturn] = useState<{ providerId: string; connectionId: string | null } | null>(null);
+  useEffect(() => {
+    const url = new URL(location.href);
+    // Microsoft registers the local web root as its public-client redirect URI. Relay the
+    // returned one-time code to the authenticated local host, then remove it from history.
+    if (!url.searchParams.get("state") || (!url.searchParams.get("code") && !url.searchParams.get("error"))) return;
+    const search = url.search;
+    url.search = "";
+    history.replaceState(history.state, "", url);
+    const controller = new AbortController();
+    void completeMicrosoftOAuth(search, controller.signal).then(result => {
+      setOnboardingReturn({ providerId: "exchange-imap", connectionId: result.id });
+      openSettings("Add Accounts");
+    }).catch(() => setNotice({ text: "Account connection could not be completed. Try again in Add Accounts." }));
+    return () => controller.abort();
+  }, []);
   useEffect(() => {
     const url = new URL(location.href);
     const connection = url.searchParams.get("connection");

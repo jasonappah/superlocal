@@ -3,9 +3,11 @@ import type { InboxApiOptions } from 'inbox-sdk/http'
 import { builtInProviders } from 'inbox-sdk/providers'
 import { createHash } from 'node:crypto'
 import { ImapProvider } from '../../../packages/inbox-sdk/server/sdk/imap'
-import { createGoogleCredentialRefresh, verifyGoogleCredentials } from '../../../packages/inbox-sdk/server/credential-refresh'
+import { createGoogleCredentialRefresh, createMicrosoftCredentialRefresh, verifyGoogleCredentials } from '../../../packages/inbox-sdk/server/credential-refresh'
 import { createGoogleOAuthApi } from '../../../packages/inbox-sdk/server/google-oauth-api'
 import { createGoogleOAuthHost, type GoogleOAuthConfig } from '../../../packages/inbox-sdk/server/google-oauth'
+import { createMicrosoftOAuthApi } from '../../../packages/inbox-sdk/server/microsoft-oauth-api'
+import { createMicrosoftOAuthHost, type MicrosoftOAuthConfig } from '../../../packages/inbox-sdk/server/microsoft-oauth'
 import { resolveSecret, type ImapHostPreset, type LocalConfig } from './config'
 import type { openLocalRuntime } from './runtime'
 
@@ -105,6 +107,61 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
       return { connectionId: connection.id }
     },
   })
+  if (config.providers.exchangeImap.enabled) {
+    const clientId = resolveSecret(config.providers.exchangeImap.oauth.clientId, environment)
+    const microsoftConfig: MicrosoftOAuthConfig | undefined = clientId ? { clientId, scopes: config.providers.exchangeImap.oauth.scopes, redirectUri: `${config.web.origin}/` } : undefined
+    let coordinator: ReturnType<typeof createMicrosoftOAuthHost> | undefined
+    const oauth = (inbox: Inbox) => {
+      if (!microsoftConfig) throw new InboxError('HOST_PROVIDER_NOT_READY', 'Configure a Microsoft 365 public client ID, then restart.', 409)
+      return coordinator ??= createMicrosoftOAuthHost({ inbox, database: runtime.database, encryptionKey: runtime.encryptionKey, config: microsoftConfig })
+    }
+    const prepare = (credentials: Record<string, unknown>) => {
+      const address = typeof credentials.email === 'string' ? credentials.email.toLowerCase() : ''
+      if (!/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(address)) throw new InboxError('HOST_INVALID_CREDENTIALS', 'Enter a valid Microsoft 365 mailbox email.', 400)
+      return address
+    }
+    registrations.push({
+      definition: { ...builtInProviders.find(provider => provider.id === 'imap')!, id: 'exchange-imap', name: 'Microsoft 365 / Exchange IMAP', connection: 'oauth',
+        scopes: config.providers.exchangeImap.oauth.scopes, refresh: createMicrosoftCredentialRefresh(microsoftConfig),
+        create(credentials, context) {
+          const address = prepare(credentials)
+          return new ImapProvider({ accountId: credentials.accountId, userId: credentials.userId, signal: context?.signal, email: address,
+            imap: { host: 'outlook.office365.com', port: 993, secure: true, user: address, accessToken: String(credentials.accessToken ?? '') },
+            smtp: { host: 'outlook.office365.com', port: 587, secure: false, user: address, accessToken: String(credentials.accessToken ?? '') }, sentCopy: 'server' })
+        },
+      },
+      onboarding: { id: 'exchange-imap', name: 'Microsoft 365 / Exchange', connection: 'oauth', enabled: true, ready: !!microsoftConfig,
+        actionLabel: 'Sign in with Microsoft', mailboxSelection: 'automatic', reconnect: true,
+        fields: [{ name: 'email', label: 'Microsoft 365 email address', type: 'email', required: true }],
+        ...(!microsoftConfig ? { setupMessage: 'Set providers.exchangeImap.oauth.clientId in superlocal.local.json, then restart.' } : {}), },
+      async connect(inbox, owner, credentials, origin) {
+        if (origin !== config.web.origin) throw new InboxError('HOST_OAUTH_ORIGIN_REQUIRED', 'Open the configured web.origin before starting OAuth.', 409)
+        const attempt = await oauth(inbox).start(owner, { email: prepare(credentials) })
+        return { authorizeUrl: attempt.authorizeUrl! }
+      },
+      async reconnect(inbox, owner, connectionId, credentials) {
+        const attempt = await oauth(inbox).start(owner, { email: prepare(credentials), connectionId })
+        return { authorizeUrl: attempt.authorizeUrl! }
+      },
+      mount(inbox, authenticate) {
+        const api = createMicrosoftOAuthApi({ oauth: () => oauth(inbox), authenticate })
+        return { callbackPath: '/host/providers/exchange-imap/callback', matches: path => path.startsWith('/v1/oauth/microsoft/') || path === '/host/providers/exchange-imap/callback',
+          async fetch(request) {
+            const incoming = new URL(request.url)
+            if (incoming.pathname !== '/host/providers/exchange-imap/callback') return api.fetch(request)
+            if (request.method !== 'POST') return new Response(null, { status: 405 })
+            const owner = await authenticate(request)
+            if (!owner) return new Response(null, { status: 401 })
+            const callback = new URL(`${incoming.search}`, `${config.web.origin}/`)
+            try {
+              const result = await oauth(inbox).complete(callback.href, request.headers.get('cookie') ?? '', owner.id)
+              return Response.json({ id: result.connection.id }, { headers: { 'Set-Cookie': result.setCookie, 'Cache-Control': 'no-store' } })
+            } catch { return Response.json({ error: 'Account connection could not be completed.' }, { status: 400, headers: { 'Cache-Control': 'no-store' } }) }
+          },
+        }
+      },
+    })
+  }
   if (config.providers.imap.enabled) {
     const presets: ImapHostPreset[] = [{ id: 'icloud', name: 'iCloud Mail',
       imap: { host: 'imap.mail.me.com', port: 993, secure: true },
