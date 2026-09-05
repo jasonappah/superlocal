@@ -69,8 +69,8 @@ export function createMicrosoftOAuthCoordinator(options: {
   ); CREATE INDEX IF NOT EXISTS sdk_oauth_attempt_expiry ON sdk_oauth_attempts(status,expires_at);`)
   const expire = () => db.query(`UPDATE sdk_oauth_attempts SET status='failed', secrets=NULL, ticket_hash=NULL, state_hash=NULL, binding_hash=NULL
     WHERE expires_at<=? AND status IN ('pending','authorizing','exchanging')`).run(now())
-  const consume = (id: string) => { try { db.query(`UPDATE sdk_oauth_attempts SET status='failed', secrets=NULL, ticket_hash=NULL, state_hash=NULL, binding_hash=NULL
-    WHERE id=? AND status IN ('pending','authorizing','exchanging')`).run(id) } catch {} }
+  const consume = (id: string, failure?: string) => { try { db.query(`UPDATE sdk_oauth_attempts SET status='failed', secrets=NULL, ticket_hash=NULL, state_hash=NULL, binding_hash=NULL, failure=?
+    WHERE id=? AND status IN ('pending','authorizing','exchanging')`).run(failure ?? null, id) } catch {} }
   const cookie = (id: string, value: string, age: number) => `inbox_microsoft_oauth_${id}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${age}` +
     (redirect.protocol === 'https:' ? '; Secure' : '') + (age === 0 ? '; Expires=Thu, 01 Jan 1970 00:00:00 GMT' : '')
   const secretsFor = (row: AttemptRow): AttemptSecrets => {
@@ -128,6 +128,7 @@ export function createMicrosoftOAuthCoordinator(options: {
     },
     async complete(callbackUrl: string, cookieHeader: string, currentOwner?: string) {
       let claimed: AttemptRow | null = null
+      let failedAt = 'callback_validation'
       try {
         if (!bounded(callbackUrl, 16_384) || callbackUrl.includes('#') || callbackUrl.slice(0, callbackUrl.indexOf('?')) !== options.config.redirectUri) throw fail()
         const callback = new URL(callbackUrl), state = callback.searchParams.get('state')
@@ -141,24 +142,35 @@ export function createMicrosoftOAuthCoordinator(options: {
         const name = `inbox_microsoft_oauth_${row.id}`, bindings = cookieHeader.split(';').map(item => item.trim()).filter(item => item.split('=', 1)[0] === name), binding = bindings[0]?.slice(name.length + 1)
         if (bindings.length !== 1 || !binding || !token.test(binding) || !row.binding_hash || !timingSafeEqual(Buffer.from(hash(binding), 'hex'), Buffer.from(row.binding_hash, 'hex'))) throw fail()
         const seen = new Set<string>(); for (const [key, value] of callback.searchParams) { if (seen.has(key) || seen.size >= 32 || !bounded(key, 128) || value.length > 8192 || /[\x00-\x1f\x7f]/.test(value)) throw fail(); seen.add(key) }
-        const secrets = secretsFor(row); if (secrets.state !== state || callback.searchParams.has('error') || !bounded(callback.searchParams.get('code'), 8192)) throw fail()
+        const secrets = secretsFor(row); if (secrets.state !== state) throw fail()
+        failedAt = 'authorization_response'
+        if (callback.searchParams.has('error') || !bounded(callback.searchParams.get('code'), 8192)) throw fail()
+        failedAt = 'token_exchange'
         const response = await transport(tokenEndpoint, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: options.config.clientId, grant_type: 'authorization_code', code: callback.searchParams.get('code')!, redirect_uri: options.config.redirectUri, code_verifier: secrets.verifier }) })
         const result = await response.json().catch(() => null) as { access_token?: unknown; refresh_token?: unknown; token_type?: unknown; expires_in?: unknown; scope?: unknown } | null
+        failedAt = 'token_response'
         if (!response.ok || !result || !bounded(result.access_token, 16_384) || !bounded(result.refresh_token, 16_384) || String(result.token_type).toLowerCase() !== 'bearer' || !Number.isInteger(result.expires_in) || Number(result.expires_in) < 1 ||
           result.scope !== undefined && !bounded(result.scope, 8192)) throw fail()
         const granted = result.scope === undefined ? scopes : result.scope.split(' ')
-        if (!scopes.every(scope => granted.includes(scope))) throw fail()
+        // Microsoft proves offline_access by issuing a refresh token; it does not
+        // necessarily echo that OpenID permission in the access-token scope list.
+        const accessScopes = scopes.filter(scope => scope !== 'offline_access')
+        failedAt = 'scope_grant'
+        if (!accessScopes.every(scope => granted.includes(scope))) throw fail()
         const identity: ConnectionIdentity = { issuer, subject: secrets.email, registrationId: options.config.clientId }
+        failedAt = 'connection_guard'
         if (row.reconnect_connection_id) {
           const target = await checkConnection(row.owner, row.reconnect_connection_id)
           if (!secrets.identity || JSON.stringify(secrets.identity) !== JSON.stringify(identity) || target.providerId !== 'exchange-imap' || JSON.stringify(target.identity) !== JSON.stringify(identity) || target.generation !== secrets.generation) throw fail()
         } else if ((await listConnections(row.owner)).some(connection => connection.providerId === 'exchange-imap' && JSON.stringify(connection.identity) === JSON.stringify(identity))) throw fail()
         const expiresAt = new Date(now() + Number(result.expires_in) * 1000).toISOString()
+        failedAt = 'mailbox_verify'
         const connection = await finish(row.owner, { email: secrets.email, clientId: options.config.clientId, accessToken: result.access_token,
-          refreshToken: result.refresh_token, expiresAt, scopes: granted }, identity, row.reconnect_connection_id ?? undefined, secrets.generation)
+          refreshToken: result.refresh_token, expiresAt, scopes: [...new Set([...granted, 'offline_access'])] }, identity, row.reconnect_connection_id ?? undefined, secrets.generation)
+        failedAt = 'completion_record'
         db.query("UPDATE sdk_oauth_attempts SET status='completed', connection_id=? WHERE id=?").run(connection.id, row.id)
         return { connection, setCookie: cookie(row.id, '', 0) }
-      } catch { if (claimed) consume(claimed.id); throw fail() }
+      } catch { if (claimed) consume(claimed.id, failedAt); throw fail() }
     },
   }
 }

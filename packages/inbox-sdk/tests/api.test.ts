@@ -15,6 +15,7 @@ import { CredentialError, InboxError } from '../src/contracts'
 import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from '../server/google-oauth'
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
+import { createMicrosoftOAuthCoordinator } from '../server/microsoft-oauth'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
@@ -1292,6 +1293,35 @@ describe('IMAP host onboarding boundary', () => {
         expect((await host.fetch(new Request(`${base}${path}`, { method, headers, body: '{}' }))).status).toBe(403)
       }
     } finally { host.inbox.createConnection = original }
+  })
+
+  test('Microsoft OAuth accepts a refresh-token grant when offline_access is not echoed in access-token scopes', async () => {
+    const database = new Database(':memory:')
+    let captured: Record<string, unknown> | undefined
+    const oauth = createMicrosoftOAuthCoordinator({
+      database,
+      config: { clientId: '9e5f94bc-e8a4-4e73-b8be-63364c29d753', redirectUri: 'http://localhost:5178/',
+        scopes: ['https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access'] },
+      now: () => EPOCH,
+      encrypt: value => value,
+      decrypt: value => value,
+      fetch: (async () => Response.json({ access_token: 'synthetic-access-token', refresh_token: 'synthetic-refresh-token', token_type: 'Bearer', expires_in: 3600,
+        scope: 'https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send' })) as unknown as typeof fetch,
+      finish: async (_owner, credentials) => { captured = credentials; return { id: 'synthetic-connection' } as Connection },
+      checkConnection: async () => { throw new Error('Reconnect is not expected') },
+      listConnections: async () => [],
+    })
+    try {
+      const attempt = await oauth.start('owner', { email: 'reader@utdallas.edu' })
+      const handoff = new URL(attempt.authorizeUrl!).searchParams.get('ticket')!
+      const authorization = await oauth.authorize(attempt.id, handoff)
+      const state = new URL(authorization.location).searchParams.get('state')!
+      const result = await oauth.complete(`http://localhost:5178/?code=synthetic-code&state=${state}`, authorization.setCookie.split(';')[0]!, 'owner')
+      expect(result.connection.id).toBe('synthetic-connection')
+      expect(captured).toMatchObject({ scopes: expect.arrayContaining([
+        'https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access',
+      ]) })
+    } finally { database.close() }
   })
 })
 
