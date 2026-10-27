@@ -1,12 +1,49 @@
 import { randomBytes } from 'node:crypto'
 import { dlopen, FFIType } from 'bun:ffi'
-import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, constants, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { loadLocalConfig, LocalConfigurationError, ROOT_DIR, type LocalConfig } from './config'
 import { reportStartupError, startLocalServer } from './index'
 
 export function createDesktopBootstrap(): string {
   return randomBytes(32).toString('base64url')
+}
+
+/** One bounded JSON line from the owning supervisor; the pipe remains open as a lease. */
+export function readSupervisorBootstrap(input: NodeJS.ReadableStream, onDisconnect: () => void, timeoutMs = 15_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let buffer = Buffer.alloc(0), complete = false, disconnected = false
+    const fail = () => {
+      if (disconnected) return
+      disconnected = true
+      clearTimeout(timer)
+      if (complete) onDisconnect()
+      else reject(new LocalConfigurationError('LOCAL_SUPERVISOR_CHANNEL', 'The supervisor channel closed or sent an invalid bootstrap.'))
+    }
+    const timer = setTimeout(fail, timeoutMs)
+    input.on('data', (chunk: Buffer | string) => {
+      if (disconnected) return
+      if (complete) { fail(); return }
+      buffer = Buffer.concat([buffer, Buffer.from(chunk)])
+      if (buffer.length > 512) { fail(); return }
+      const newline = buffer.indexOf(10)
+      if (newline < 0) return
+      if (newline !== buffer.length - 1) { fail(); return }
+      try {
+        const value = JSON.parse(buffer.subarray(0, newline).toString('utf8'))
+        if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'bootstrapToken,version' ||
+          value.version !== 1 || typeof value.bootstrapToken !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.bootstrapToken)) { fail(); return }
+        complete = true
+        buffer = Buffer.alloc(0)
+        clearTimeout(timer)
+        resolve(value.bootstrapToken)
+      } catch { fail() }
+    })
+    input.on('end', fail)
+    input.on('error', fail)
+    input.on('close', fail)
+    input.resume()
+  })
 }
 
 /** Exclusive per-profile coordination: a second desktop host with a live owner may not open the same mail data. */
@@ -51,36 +88,6 @@ function buildIdentity(environment: NodeJS.ProcessEnv): string {
   return typeof id === 'string' && id.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) ? id : 'dev'
 }
 
-/** Private readiness handoff for the packaged shell: the actual API port, build and one-time bootstrap token. */
-export function writeDesktopReadiness(config: LocalConfig, port: number, environment: NodeJS.ProcessEnv = process.env): void {
-  const value = { version: 1, apiPort: port, build: buildIdentity(environment), instanceId: config.instanceId, mode: config.mode,
-    bootstrapToken: config.desktopBootstrapToken }
-  const path = join(config.dataDir, 'desktop-readiness.json')
-  mkdirSync(config.dataDir, { recursive: true, mode: 0o700 })
-  const temp = join(config.dataDir, `.desktop-readiness-${randomBytes(12).toString('hex')}.tmp`)
-  let fd: number | undefined
-  try {
-    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
-    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
-    fsyncSync(fd)
-    closeSync(fd); fd = undefined
-    let existing: import('node:fs').Stats | undefined
-    try { existing = lstatSync(path) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-    if (existing?.isSymbolicLink()) throw new LocalConfigurationError('LOCAL_FILE_PERMISSIONS', 'The desktop readiness file must never be replaced through a symlink.')
-    renameSync(temp, path)
-  } catch (error) {
-    if (error instanceof LocalConfigurationError) { try { unlinkSync(temp) } catch {}; throw error }
-    try { unlinkSync(temp) } catch {}
-    throw new LocalConfigurationError('LOCAL_FILE_CREATE_FAILED', 'Could not write the desktop readiness file. Existing files were not replaced.')
-  } finally { if (fd !== undefined) closeSync(fd) }
-}
-
-export function deleteDesktopReadiness(config: LocalConfig): void {
-  try { unlinkSync(join(config.dataDir, 'desktop-readiness.json')) } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
-}
-
 const assetCsp = 'default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\'; img-src \'self\' data: blob:; ' +
   'font-src \'self\'; connect-src \'self\'; media-src \'self\' data:; worker-src \'self\' blob:; frame-src \'self\' data:'
 const assetMime = new Map([['js', 'text/javascript'], ['css', 'text/css'], ['woff2', 'font/woff2'], ['svg', 'image/svg+xml'],
@@ -121,30 +128,48 @@ export function staticAssetResponse(assetsDir: string, request: Request): Respon
   }
 }
 
-/** Packaged entry: one loopback port serves the built UI and the API, with a private readiness file and instance lock. */
+/** Packaged entry: one loopback port, an inherited private channel and an instance lock. */
 export async function runDesktopHost(environment: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const supervised = environment.SUPERLOCAL_DESKTOP_SUPERVISED === '1'
+  let disconnected = false
+  let stop: (() => Promise<void>) | undefined
+  // Startup is bounded even if host initialization stalls. The supervisor owns escalation after readiness.
+  const startupDeadline = supervised ? setTimeout(() => { console.error('[LOCAL_START_TIMEOUT] Desktop host startup timed out.'); process.exit(1) }, 30_000) : undefined
   try {
+    if (!supervised) throw new LocalConfigurationError('LOCAL_SUPERVISOR_REQUIRED', 'Desktop mode requires a supervisor channel.')
+    const bootstrapToken = await readSupervisorBootstrap(process.stdin, () => {
+      disconnected = true
+      if (stop) void stop()
+      else process.exit(1)
+    })
     const base = loadLocalConfig({ environment })
+    if (supervised && base.auth.method !== 'loopback') throw new LocalConfigurationError('LOCAL_DESKTOP_AUTH_UNSUPPORTED', 'Supervised desktop bootstrap requires loopback authentication.')
     const assets = typeof environment.SUPERLOCAL_DESKTOP_ASSETS === 'string' && !environment.SUPERLOCAL_DESKTOP_ASSETS.includes('\0') &&
       environment.SUPERLOCAL_DESKTOP_ASSETS.length <= 1024 && isAbsolute(environment.SUPERLOCAL_DESKTOP_ASSETS)
       ? resolve(environment.SUPERLOCAL_DESKTOP_ASSETS) : join(ROOT_DIR, 'apps', 'web', 'dist')
     const port = base.backend.port
     const config: LocalConfig = { ...base,
       web: { port, origin: `http://localhost:${port}`, allowedOrigins: [`http://localhost:${port}`, `http://127.0.0.1:${port}`] },
-      desktop: true, desktopAssets: assets, desktopBootstrapToken: createDesktopBootstrap() }
+      desktop: true, desktopAssets: assets, desktopBootstrapToken: bootstrapToken }
     const lock = acquireInstanceLock(config)
     let service: Awaited<ReturnType<typeof startLocalServer>>
     try { service = await startLocalServer(config) }
     catch (error) { await lock.release(); throw error }
-    try { writeDesktopReadiness(config, service.server.port ?? config.backend.port, environment) }
+    try {
+      if (supervised) {
+        if (disconnected) throw new LocalConfigurationError('LOCAL_SUPERVISOR_CHANNEL', 'The supervisor channel closed during startup.')
+        process.stdout.write(`${JSON.stringify({ version: 1, pid: process.pid, apiPort: service.server.port, build: buildIdentity(environment), instanceId: config.instanceId, mode: config.mode })}\n`)
+      }
+    }
     catch (error) { await service.close(); await lock.release(); throw error }
-    console.info(`Desktop host ready (build ${buildIdentity(environment)}): http://127.0.0.1:${service.server.port}`)
+    if (startupDeadline) clearTimeout(startupDeadline)
     let stopping: Promise<void> | undefined
-    const stop = () => stopping ??= (async () => {
-      deleteDesktopReadiness(config)
+    stop = () => stopping ??= (async () => {
+      const deadline = supervised ? setTimeout(() => { console.error('[LOCAL_SHUTDOWN_TIMEOUT] Desktop host shutdown timed out.'); process.exit(1) }, 10_000) : undefined
       try { await service.close(); await lock.release() } catch { console.error('[LOCAL_SHUTDOWN_FAILED] Desktop host shutdown failed.'); process.exitCode = 1 }
+      finally { if (supervised) process.stdin.pause(); if (deadline) clearTimeout(deadline) }
     })()
     process.on('SIGINT', stop)
     process.on('SIGTERM', stop)
-  } catch (error) { reportStartupError(error); process.exitCode = 1 }
+  } catch (error) { if (startupDeadline) clearTimeout(startupDeadline); reportStartupError(error); process.exitCode = 1; if (supervised) process.stdin.pause() }
 }

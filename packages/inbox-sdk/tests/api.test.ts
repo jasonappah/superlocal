@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { DomUtils, parseDocument } from 'htmlparser2'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
@@ -21,7 +21,7 @@ import { createGoogleOAuthClient } from '../server/google-client'
 import { createMicrosoftOAuthCoordinator } from '../server/microsoft-oauth'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, LocalConfigurationError, type LocalConfig } from '../../../apps/local-host/src/config'
-import { acquireInstanceLock, createDesktopBootstrap } from '../../../apps/local-host/src/desktop'
+import { acquireInstanceLock, createDesktopBootstrap, readSupervisorBootstrap } from '../../../apps/local-host/src/desktop'
 import { createMcpGrants, createMcpMount } from '../../../apps/local-host/src/mcp-auth'
 import { callSuperlocalTool, TOOL_CATALOG } from '../../../apps/mcp/src/tools'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
@@ -1848,6 +1848,119 @@ describe('IMAP host onboarding boundary', () => {
 })
 
 describe('desktop host lifecycle', () => {
+  test('supervised desktop readiness belongs to the child and EOF shuts down its listener', async () => {
+    const { createServer } = await import('node:net')
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-supervised-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const probe = createServer()
+    await new Promise<void>(resolve => probe.listen(0, '127.0.0.1', resolve))
+    const port = (probe.address() as { port: number }).port
+    await new Promise<void>((resolve, reject) => probe.close(error => error ? reject(error) : resolve()))
+    const token = createDesktopBootstrap()
+    const child = spawn(process.execPath, ['--no-env-file', join(import.meta.dir, '../../../apps/local-host/src/index.ts')], {
+      env: { ...process.env, NODE_ENV: 'test', SUPERLOCAL_DESKTOP: '1', SUPERLOCAL_DESKTOP_SUPERVISED: '1',
+        SUPERLOCAL_CONFIG: join(root, 'local.json'), SUPERLOCAL_DATA_DIR: join(root, 'data'), SUPERLOCAL_API_PORT: String(port) },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const exit = new Promise<{ code: number | null, signal: string | null }>(resolve => child.once('exit', (code, signal) => resolve({ code, signal })))
+    let stderr = ''
+    child.stderr.on('data', chunk => { stderr += String(chunk) })
+    try {
+      child.stdin.write(`${JSON.stringify({ version: 1, bootstrapToken: token })}\n`)
+      const line = await Promise.race([
+        new Promise<string>((resolve, reject) => {
+          let output = ''
+          child.stdout.on('data', chunk => { output += String(chunk); if (output.includes('\n')) resolve(output.trim()) })
+          child.once('exit', () => reject(new Error(`Child exited before readiness: ${stderr}`)))
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Readiness timeout')), 20_000)),
+      ])
+      const ready = JSON.parse(line)
+      expect(ready).toMatchObject({ version: 1, pid: child.pid, apiPort: port, mode: 'mock' })
+      expect(line).not.toContain(token)
+      expect((await fetch(`http://127.0.0.1:${port}/`)).status).toBeLessThan(500)
+      const bootstrap = () => fetch(`http://127.0.0.1:${port}/host/desktop/bootstrap`, { method: 'POST', headers: {
+        Origin: `http://localhost:${port}`, 'X-Superlocal': '1', 'Content-Type': 'application/json',
+      }, body: JSON.stringify({ token }) })
+      expect((await bootstrap()).status).toBe(204)
+      expect((await bootstrap()).status).toBe(409)
+      child.stdin.end()
+      expect(await Promise.race([exit, new Promise(resolve => setTimeout(() => resolve('timeout'), 12_000))])).toEqual({ code: 0, signal: null })
+      expect(stderr).not.toContain(token)
+      await expect(stat(join(root, 'data', 'desktop-readiness.json'))).rejects.toBeDefined()
+      await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toBeDefined()
+    } finally { if (child.exitCode === null) child.kill('SIGKILL'); await exit }
+
+    // SIGTERM must complete even when the supervisor retains its stdin pipe.
+    const signalled = spawn(process.execPath, ['--no-env-file', join(import.meta.dir, '../../../apps/local-host/src/index.ts')], {
+      env: { ...process.env, NODE_ENV: 'test', SUPERLOCAL_DESKTOP: '1', SUPERLOCAL_DESKTOP_SUPERVISED: '1',
+        SUPERLOCAL_CONFIG: join(root, 'local.json'), SUPERLOCAL_DATA_DIR: join(root, 'data'), SUPERLOCAL_API_PORT: String(port) },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const signalExit = new Promise<number | null>(resolve => signalled.once('exit', resolve))
+    try {
+      const ready = new Promise<void>((resolve, reject) => {
+        signalled.stdout.once('data', () => resolve())
+        signalled.once('exit', () => reject(new Error('Child exited before signal test readiness')))
+      })
+      signalled.stdin.write(`${JSON.stringify({ version: 1, bootstrapToken: createDesktopBootstrap() })}\n`)
+      await ready
+      signalled.kill('SIGTERM')
+      expect(await Promise.race([signalExit, new Promise(resolve => setTimeout(() => resolve('timeout'), 12_000))])).toBe(0)
+    } finally { if (signalled.exitCode === null) signalled.kill('SIGKILL'); await signalExit }
+  }, 30_000)
+
+  test('supervised desktop rejects Google authentication before readiness', async () => {
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-google-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const token = createDesktopBootstrap()
+    const child = spawn(process.execPath, ['--no-env-file', join(import.meta.dir, '../../../apps/local-host/src/index.ts')], {
+      env: { ...process.env, NODE_ENV: 'test', SUPERLOCAL_DESKTOP: '1', SUPERLOCAL_DESKTOP_SUPERVISED: '1',
+        SUPERLOCAL_CONFIG: join(root, 'local.json'), SUPERLOCAL_DATA_DIR: join(root, 'data'), SUPERLOCAL_AUTH_METHOD: 'google' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = '', stderr = ''
+    child.stdout.on('data', chunk => { stdout += String(chunk) })
+    child.stderr.on('data', chunk => { stderr += String(chunk) })
+    const exit = new Promise<number | null>(resolve => child.once('exit', resolve))
+    child.stdin.write(`${JSON.stringify({ version: 1, bootstrapToken: token })}\n`)
+    try {
+      expect(await Promise.race([exit, new Promise(resolve => setTimeout(() => resolve('timeout'), 10_000))])).toBe(1)
+      expect(stdout).toBe('')
+      expect(stderr).toContain('LOCAL_DESKTOP_AUTH_UNSUPPORTED')
+      expect(stderr).not.toContain(token)
+    } finally { if (child.exitCode === null) child.kill('SIGKILL'); await exit }
+  }, 15_000)
+
+  test('supervisor bootstrap is bounded, single-frame and holds a lease until EOF', async () => {
+    const { PassThrough } = await import('node:stream')
+    const token = createDesktopBootstrap()
+    const pipe = new PassThrough()
+    let disconnects = 0
+    const result = readSupervisorBootstrap(pipe, () => { disconnects++ })
+    pipe.write(JSON.stringify({ version: 1, bootstrapToken: token }).slice(0, 20))
+    pipe.write(`${JSON.stringify({ version: 1, bootstrapToken: token }).slice(20)}\n`)
+    expect(await result).toBe(token)
+    pipe.end()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(disconnects).toBe(1)
+
+    for (const frame of ['x'.repeat(513), '{}\n', `${JSON.stringify({ version: 1, bootstrapToken: token, extra: 1 })}\n`, `${JSON.stringify({ version: 1, bootstrapToken: token })}\nextra`]) {
+      const invalid = new PassThrough()
+      const pending = readSupervisorBootstrap(invalid, () => {})
+      invalid.write(frame)
+      await expect(pending).rejects.toMatchObject({ code: 'LOCAL_SUPERVISOR_CHANNEL' })
+      invalid.destroy()
+    }
+    const timeout = new PassThrough()
+    await expect(readSupervisorBootstrap(timeout, () => {}, 10)).rejects.toMatchObject({ code: 'LOCAL_SUPERVISOR_CHANNEL' })
+    timeout.destroy()
+    const closed = new PassThrough()
+    const pending = readSupervisorBootstrap(closed, () => {})
+    closed.end()
+    await expect(pending).rejects.toMatchObject({ code: 'LOCAL_SUPERVISOR_CHANNEL' })
+  })
+
   /** Desktop-derived config shape: same single loopback port for web + API, no stored desktop keys. */
   async function desktopFixture(root: string, exchangeImap = false, bootstrapToken = createDesktopBootstrap(), assets: string | null = null) {
     await ensureTempRoot()
@@ -1876,7 +1989,7 @@ describe('desktop host lifecycle', () => {
       host.fetch(new Request(`${base}/host/desktop/bootstrap`, { method: 'POST', headers:
         { Origin: origin, 'X-Superlocal': '1', 'Content-Type': 'application/json', ...overrides }, body: JSON.stringify(body) }))
     const session = async () => await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
-    expect((await session()).headers.get('set-cookie')).toBeTruthy()
+    expect((await session()).status).toBe(401)
     const ok = await bootstrap({ token: bootstrapToken })
     expect(ok.status).toBe(204)
     const cookie = ok.headers.get('set-cookie')!.split(';')[0]!
@@ -1900,7 +2013,9 @@ describe('desktop host lifecycle', () => {
       headers: { Origin: origin, 'X-Superlocal': '1', 'Content-Type': 'application/json' }, body: '' }))
     expect(empty.status).toBe(400)
     expect((await host.fetch(new Request(`${base}/host/desktop/bootstrap`, { headers: { Origin: origin, 'X-Superlocal': '1' } }))).status).toBe(405)
-    expect((await session()).status).toBe(204)
+    const existingSession = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1', Cookie: cookie } }))
+    expect(existingSession.status).toBe(204)
+    expect(existingSession.headers.get('set-cookie')).toBeNull()
   })
 
   test('desktop instance lock rejects a live second writer, takes over a dead one, refuses symlinks and releases idempotently', async () => {
@@ -1969,7 +2084,7 @@ describe('desktop host lifecycle', () => {
     }
     expect((await host.fetch(new Request(`${base}/fonts.css`))).status).toBe(200)
     expect((await host.fetch(new Request(`${base}/fonts.css`))).headers.get('cache-control')).toBe('max-age=3600')
-    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: base, 'X-Superlocal': '1' } }))
+    const session = await host.fetch(new Request(`${base}/host/desktop/bootstrap`, { method: 'POST', headers: { Origin: base, 'X-Superlocal': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ token: 'C'.repeat(43) }) }))
     const cookie = session.headers.get('set-cookie')!.split(';')[0]!
     const missing = await host.fetch(new Request(`${base}/assets/nonexistent.js`, { headers: { Cookie: cookie } }))
     expect(missing.status).toBe(404)
@@ -1980,7 +2095,8 @@ describe('desktop host lifecycle', () => {
   test('desktop Microsoft OAuth callback completes on the root without WebView cookies and fails closed generically', async () => {
     await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-oauth-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
-    const { host, base, origin } = await desktopFixture(root, true)
+    const token = createDesktopBootstrap()
+    const { host, base, origin } = await desktopFixture(root, true, token)
     const bogus = await host.fetch(new Request(`${base}/?code=x&state=y`))
     expect(bogus.status).toBe(200)
     expect(bogus.headers.get('content-type')).toContain('text/html')
@@ -1990,7 +2106,7 @@ describe('desktop host lifecycle', () => {
     expect(failed).not.toContain('state=y')
     expect(failed).not.toContain('code=x')
     expect(await host.inbox.accounts(host.owner)).toEqual([])
-    const started = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const started = await host.fetch(new Request(`${base}/host/desktop/bootstrap`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) }))
     const cookie = started.headers.get('set-cookie')!.split(';')[0]!
     const headers = { Origin: origin, Cookie: cookie, 'Content-Type': 'application/json' }
     const connect = await host.fetch(new Request(`${base}/host/providers/exchange-imap/connect`, { method: 'POST', headers, body: JSON.stringify({ credentials: { email: 'reader@utdallas.edu' } }) }))

@@ -39,6 +39,11 @@ export async function startLocalServer(config: LocalConfig = loadLocalConfig()) 
 }
 
 if (import.meta.main) {
+  // stdout is a private framed protocol in supervised mode, never a log stream.
+  if (process.env.SUPERLOCAL_DESKTOP === '1' && process.env.SUPERLOCAL_DESKTOP_SUPERVISED === '1') {
+    console.log = console.error
+    console.info = console.error
+  }
   if (process.env.SUPERLOCAL_DESKTOP === '1') await runDesktopHost()
   else {
     try {

@@ -270,7 +270,15 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         if (response) return response
       }
     }
-    if (url.pathname === '/session') return url.search ? problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.') : session(request)
+    if (url.pathname === '/session') {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.')
+      if (config.desktop) {
+        if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST to initialize a loopback session.')
+        if (request.headers.get('origin') !== config.web.origin || request.headers.get('x-superlocal') !== '1' || !await currentIdentity(request)) return authRequired()
+        return new Response(null, { status: 204, headers: safeHeaders })
+      }
+      return session(request)
+    }
     if (config.desktop && url.pathname === '/host/desktop/bootstrap') {
       if (!desktopBootstrap) return problem(404, 'NOT_FOUND', 'Route not found.')
       if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for the desktop bootstrap.')
