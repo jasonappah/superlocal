@@ -36,10 +36,12 @@ import {
   type ProviderCredentials,
   type ProviderFolder,
   type ProviderListResult,
+  type SendingIdentity,
   type SendInput,
   type SendResult,
   type SyncCursor,
   type SyncOptions,
+  type SyncContext,
   type SyncResult,
 } from './types'
 
@@ -104,7 +106,6 @@ const GMAIL_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   send: true,
   reply: true,
   threads: true,
-  nativeThreads: true,
   folders: true,
   createFolders: true,
   labels: true,
@@ -115,13 +116,7 @@ const GMAIL_CAPABILITIES: Readonly<ProviderCapabilities> = Object.freeze({
   markUnread: true,
   star: true,
   attachments: true,
-  attachmentDownload: true,
   search: true,
-  drafts: false,
-  scheduledSend: false,
-  snooze: false,
-  readReceipts: false,
-  pushNotifications: false,
 })
 
 const GMAIL_FOLDER_LABELS: Partial<Record<MailFolder, string>> = {
@@ -494,7 +489,6 @@ export class GmailProvider implements InboxProvider {
       send,
       reply: send,
       threads: read,
-      nativeThreads: read,
       folders: read || manageLabels || scopes.includes('https://www.googleapis.com/auth/gmail.metadata'),
       createFolders: manageLabels,
       labels: modify,
@@ -505,7 +499,6 @@ export class GmailProvider implements InboxProvider {
       markUnread: modify,
       star: modify,
       attachments: read,
-      attachmentDownload: read,
       search: read,
     })
     this.accountId = credentials.accountId
@@ -513,14 +506,14 @@ export class GmailProvider implements InboxProvider {
     this.fetcher = credentials.fetch ?? globalThis.fetch
   }
 
-  private request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private request<T>(path: string, init: RequestInit = {}, maxBytes?: number): Promise<T> {
     const headers = new Headers(init.headers)
     headers.set('Authorization', `Bearer ${this.credentials.accessToken}`)
     headers.set('Accept', 'application/json')
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
     return providerJson<T>('gmail', this.fetcher, `${this.baseUrl}${path}`, {
       ...init, headers, signal: init.signal ? AbortSignal.any([init.signal, this.requests.signal]) : this.requests.signal,
-    }, this.credentials.timeoutMs)
+    }, this.credentials.timeoutMs, maxBytes)
   }
 
   private async attachmentData(messageId: string, attachmentId: string): Promise<string> {
@@ -664,6 +657,61 @@ export class GmailProvider implements InboxProvider {
     })
   }
 
+  async identities(): Promise<{ sending: readonly SendingIdentity[] }> {
+    const validAddress = (value: unknown): value is string => {
+      if (typeof value !== 'string' || value.length > 254) return false
+      const parts = value.split('@')
+      const local = parts[0]!
+      const domain = parts[1]
+      return parts.length === 2 && local.length <= 64 &&
+        /^[a-z\d!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z\d!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local) &&
+        Boolean(domain && domain.split('.').every(label =>
+          /^[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?$/i.test(label)))
+    }
+    // OAuth grants can be token-only; Google's authenticated response supplies the primary identity.
+    const primary = this.credentials.email
+    if (primary !== undefined && !validAddress(primary)) throw new ProviderError('gmail', 'VALIDATION', 'Invalid expected primary email address')
+    const result = await this.request<unknown>(
+      '/users/me/settings/sendAs?fields=sendAs(sendAsEmail,isPrimary,isDefault,verificationStatus)',
+      { method: 'GET' }, 64 * 1024,
+    )
+    const invalid = () => new ProviderError('gmail', 'UPSTREAM', 'Gmail returned invalid sending identities')
+    if (!result || typeof result !== 'object' || Array.isArray(result) || !('sendAs' in result) ||
+      !Array.isArray(result.sendAs)) throw invalid()
+    if (result.sendAs.length > 100) throw new ProviderError('gmail', 'UPSTREAM', 'Gmail returned too many sending identities')
+    const seen = new Map<string, { isPrimary: boolean; isDefault: boolean; verificationStatus: unknown }>()
+    const identities: SendingIdentity[] = []
+    let primaryCount = 0
+    let defaultCount = 0
+    for (const row of result.sendAs as unknown[]) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) throw invalid()
+      const entry = row as Record<string, unknown>
+      if (!validAddress(entry.sendAsEmail) ||
+        entry.isPrimary !== undefined && typeof entry.isPrimary !== 'boolean' ||
+        entry.isDefault !== undefined && typeof entry.isDefault !== 'boolean' ||
+        entry.verificationStatus !== undefined && typeof entry.verificationStatus !== 'string') throw invalid()
+      // Gmail may omit false flags. Do not coerce other values or infer primary/default from each other.
+      const isPrimary = entry.isPrimary === true
+      const isDefault = entry.isDefault === true
+      const key = entry.sendAsEmail.toLowerCase()
+      if (primary !== undefined && isPrimary !== (key === primary.toLowerCase())) throw invalid()
+      const previous = seen.get(key)
+      if (previous) {
+        if (previous.isPrimary !== isPrimary || previous.isDefault !== isDefault ||
+          previous.verificationStatus !== entry.verificationStatus) throw invalid()
+        continue
+      }
+      seen.set(key, { isPrimary, isDefault, verificationStatus: entry.verificationStatus })
+      if (isPrimary) primaryCount++
+      if (isDefault && ++defaultCount > 1) throw invalid()
+      if (isPrimary || entry.verificationStatus === 'accepted') identities.push({
+        email: isPrimary ? primary ?? entry.sendAsEmail : entry.sendAsEmail, isPrimary, isDefault,
+      })
+    }
+    if (primaryCount !== 1) throw invalid()
+    return { sending: identities }
+  }
+
   async listFolders(): Promise<ProviderFolder[]> {
     const result = await this.request<{ labels?: Array<{
       id: string
@@ -800,7 +848,8 @@ export class GmailProvider implements InboxProvider {
     }
   }
 
-  async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}): Promise<SyncResult> {
+  async sync(cursor?: SyncCursor | string | null, options: SyncOptions = {}, context?: SyncContext): Promise<SyncResult> {
+    options = { ...context, ...options }
     const current = normalizeCursor('gmail', cursor, 'history')
     if (current && current.kind !== 'history' && current.kind !== 'page') {
       throw new ProviderCursorExpiredError('gmail', 'Gmail synchronization requires a history or page cursor')

@@ -168,6 +168,7 @@ function Calendar({
   const [day, setDay] = useState("2026-09-01");
   const [miniMonth, setMiniMonth] = useState("2026-09-01");
   const [view, setView] = useState<View>(initialView);
+  useEffect(() => setView(initialView), [initialView]);
   const [actionsOpen, setActionsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [meet, setMeet] = useState("");
@@ -197,7 +198,21 @@ function Calendar({
   const [calendarError, setCalendarError] = useState("");
   const [now, setNow] = useState(() => new Date().toISOString());
   const scroller = useRef<HTMLDivElement>(null);
-  const closeEditor = useCallback(() => setEditor(null), []);
+  const actionsTrigger = useRef<HTMLButtonElement>(null);
+  const dismissEditor = useCallback(() => {
+    const trigger = actionsTrigger.current;
+    setEditor(null);
+    // Wait for the editor's autofocus target to detach and backdrop input to settle.
+    requestAnimationFrame(() => {
+      if (
+        trigger?.isConnected &&
+        trigger.getClientRects().length &&
+        document.activeElement === document.body &&
+        !document.querySelector('[role="dialog"], [aria-modal="true"]')
+      )
+        trigger.focus({ preventScroll: true });
+    });
+  }, []);
   const closeSidebarDialog = useCallback(() => {
     setSidebarDialog(null);
     setSidebarTitle("");
@@ -320,8 +335,9 @@ function Calendar({
       if (event.key.toLowerCase() === "b") createEvent();
       else if (!event.shiftKey && event.key === "0") setView("day");
       else if (!event.shiftKey && event.key === "2") setView("week");
-      else if (!event.shiftKey && event.key === "-") navigate(-1);
-      else if (!event.shiftKey && event.key === "=") navigate(1);
+      else if (!event.shiftKey && ["-", "p"].includes(event.key)) navigate(-1);
+      else if (!event.shiftKey && ["=", "n"].includes(event.key)) navigate(1);
+      else if (!event.shiftKey && event.key === "t") setDay(today);
       else if (!event.shiftKey && event.key === "Escape") {
         if (actionsOpen) setActionsOpen(false);
         else if (sidebarOpen) setSidebarOpen(false);
@@ -441,6 +457,7 @@ function Calendar({
           </div>
           <h1>
             <button
+              ref={actionsTrigger}
               aria-label={`${heading}, calendar view and actions`}
               aria-expanded={actionsOpen}
               onClick={() => setActionsOpen(!actionsOpen)}
@@ -1032,7 +1049,7 @@ function Calendar({
           timezone={timezone}
           account={account}
           sources={sources}
-          onClose={closeEditor}
+          onClose={dismissEditor}
           onSave={(event) => {
             saveEvents(
               event.id
@@ -1046,11 +1063,11 @@ function Calendar({
                 ? event.start
                 : wallTime(event.start, timezone).slice(0, 10),
             );
-            closeEditor();
+            setEditor(null);
           }}
           onDelete={() => {
             saveEvents(events.filter((event) => event.id !== editor.id));
-            closeEditor();
+            setEditor(null);
           }}
         />
       )}

@@ -1,12 +1,35 @@
+import { inboxWindowPaths, INBOX_RESPONSE_BYTE_LIMIT, type InboxWindowTransport } from "../../shared/inbox-window";
 import type { SplitPreferences } from "../../shared/splits";
 import type { MailboxMembership } from "inbox-sdk/types";
 import { configurePerformanceLogging, measureRequest } from "./browser-logs";
 import { privateFetch } from "./application-auth";
-import type { AiTriageActions, AiTriageState, AiDecisionPage, AiHistoryJob, AiDecision } from "../../shared/ai-triage";
+import type { AiTriageActions, AiTriageState, AiDecisionPage, AiHistoryJob, AiDecision, AiTeachResult } from "../../shared/ai-triage";
+import { CATEGORY_BATCH_LIMIT, CATEGORY_RESPONSE_LIMIT, categoryErrorMessages, isCategoryEntry, type CategoryErrorCode, type CategoryEntry, type CategoryPage, type CategoryReceipt, type CategoryTransport } from "../../shared/attention-overrides";
 export type SavedSplitPreferences = SplitPreferences & { revision: number };
 export type AttentionFeedback = { id: string; createdAt: string; status: "pending" | "active" | "retracting" | "retracted" | "failed"; count: number; problem?: string; states?: MailboxMembership[] };
 export type AttentionFeedbackTarget = { sourceId: string; messageId: string; mailboxId: string; messageRevision: number; revision: number };
 
+/** Mirrors the local host's `HostProvider`: SDK onboarding copy plus host readiness, presets and connections. */
+export type HostProviderCredentialHelp = { text: string; url: string; linkLabel: string };
+export type HostProviderOption = {
+  value: string;
+  label: string;
+  summary?: string;
+  /** Labels that replace a field's own label while this option is selected. */
+  fieldLabels?: Record<string, string>;
+  /** Fields that do not apply while this option is selected. */
+  hiddenFields?: string[];
+  credentialHelp?: HostProviderCredentialHelp;
+};
+export type HostProviderField = {
+  name: string;
+  label: string;
+  type: "password" | "text" | "email" | "select";
+  required: boolean;
+  advanced?: boolean;
+  defaultValue?: string;
+  options?: HostProviderOption[];
+};
 export type HostProvider = {
   id: string;
   name: string;
@@ -14,10 +37,13 @@ export type HostProvider = {
   enabled: boolean;
   ready: boolean;
   setupMessage?: string;
+  summary?: string;
   actionLabel?: string;
-  fields?: Array<{ name: string; label: string; type: "password" | "text" | "email" | "select"; required: boolean; advanced?: boolean; defaultValue?: string; options?: Array<{ value: string; label: string }> }>;
+  redirectNote?: string;
+  fields?: HostProviderField[];
   mailboxSelection?: "automatic" | "manual";
-  credentialHelp?: { text: string; url: string };
+  credentialHelp?: HostProviderCredentialHelp;
+  advancedNote?: string;
   reconnect?: boolean;
   connectionIds: string[];
 };
@@ -28,6 +54,8 @@ export type HostConfiguration = {
   preferenceScope?: string;
   performanceLogging?: boolean;
   aiTriage?: boolean;
+  attentionOverrides?: boolean;
+  inboxWindow?: boolean;
   providers: HostProvider[];
 };
 
@@ -36,6 +64,7 @@ export type InboxViewPreferences = {
   unifiedMode: "all" | "selected";
   includedMailboxIds: string[];
   pinnedMailboxIds: string[];
+  hideForwardedDuplicates?: boolean;
 };
 
 export class InboxViewPreferencesError extends Error {
@@ -93,10 +122,11 @@ export async function completeMicrosoftOAuth(search: string, signal: AbortSignal
 function isInboxViewPreferences(value: unknown): value is InboxViewPreferences {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
-  const fields = ["revision", "unifiedMode", "includedMailboxIds", "pinnedMailboxIds"];
+  const fields = ["revision", "unifiedMode", "includedMailboxIds", "pinnedMailboxIds", "hideForwardedDuplicates"];
   const ids = (value: unknown, maximum: number) => Array.isArray(value) && value.length <= maximum &&
     value.every(id => typeof id === "string" && id.length > 0 && id.length <= 512 && id.trim() === id && !/[\x00-\x1f\x7f/\\]/.test(id)) && new Set(value).size === value.length;
-  return Object.keys(input).length === fields.length && Object.keys(input).every(key => fields.includes(key)) &&
+  return Object.keys(input).every(key => fields.includes(key)) &&
+    (!Object.hasOwn(input, "hideForwardedDuplicates") || typeof input.hideForwardedDuplicates === "boolean") &&
     typeof input.revision === "number" && Number.isSafeInteger(input.revision) && input.revision >= 1 &&
     (input.unifiedMode === "all" || input.unifiedMode === "selected") && ids(input.includedMailboxIds, 5000) && ids(input.pinnedMailboxIds, 9);
 }
@@ -117,7 +147,7 @@ async function requestInboxViewPreferences(signal: AbortSignal, input?: InboxVie
     throw new InboxViewPreferencesError(typeof result?.error === "string" && result.error.length <= 512 ? result.error : fallback, response.status, code);
   }
   if (!isInboxViewPreferences(result)) throw new InboxViewPreferencesError("The host returned invalid inbox preferences.", response.status, "HOST_INBOX_PREFERENCES_INVALID_RESPONSE");
-  return result;
+  return { ...result, hideForwardedDuplicates: result.hideForwardedDuplicates ?? true };
 }
 
 export function readInboxViewPreferences(signal: AbortSignal): Promise<InboxViewPreferences> {
@@ -147,6 +177,92 @@ export async function recordAttentionFeedback(input: { id: string; targets: Atte
   }
 }
 export const retractAttentionFeedback = (id: string, signal: AbortSignal) => appRequest<AttentionFeedback>(`/host/attention-feedback/${encodeURIComponent(id)}/undo`, signal, "POST");
+
+export class CategoryRequestError extends InboxViewPreferencesError {
+  declare readonly code: CategoryErrorCode;
+  constructor(code: CategoryErrorCode, status: number) { super(categoryErrorMessages[code], status, code); }
+}
+
+/** Local choices use the store's immutable owner transport, never AI settings. */
+export function createCategoryTransport(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): CategoryTransport {
+  async function call(path: string, method = "GET", input?: unknown): Promise<Record<string, unknown>> {
+    const requestSignal = signal(), finish = measureRequest(`/host/attention-overrides${path}`, method);
+    let response: Response;
+    try {
+      response = await fetcher(`/host/attention-overrides${path}`, { method, signal: requestSignal, credentials: "include", cache: "no-store",
+        ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input ?? {}) }) });
+      finish(response.status);
+    } catch (error) { finish(0); throw error; }
+    const text = await response.text(); requestSignal.throwIfAborted();
+    if (new TextEncoder().encode(text).length > CATEGORY_RESPONSE_LIMIT) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+    const result = (() => { try { return JSON.parse(text); } catch { return null; } })();
+    if (!response.ok) {
+      const code = result && typeof result.code === "string" && Object.hasOwn(categoryErrorMessages, result.code) ? result.code as CategoryErrorCode : "HOST_CATEGORY_UNAVAILABLE";
+      throw new CategoryRequestError(code, response.status);
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result) || !Array.isArray(result.entries) || result.entries.length > CATEGORY_BATCH_LIMIT || !result.entries.every(isCategoryEntry)) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+    return result;
+  }
+  const receipt = async (path: string, id: string, input?: unknown): Promise<CategoryReceipt> => {
+    const result = await call(path, "POST", input);
+    if (result.id !== id || typeof result.retracted !== "boolean" || !(result.entries as unknown[]).length) throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+    return result as CategoryReceipt;
+  };
+  return {
+    changes: async after => {
+      const result = await call(`?after=${after}`);
+      if (!Number.isSafeInteger(result.cursor) || Number(result.cursor) < 0 || typeof result.hasMore !== "boolean" || typeof result.resetRequired !== "boolean") throw new CategoryRequestError("HOST_CATEGORY_UNAVAILABLE", 503);
+      return result as CategoryPage;
+    },
+    lookup: async keys => {
+      const result = await call("/lookup", "POST", { keys });
+      return { entries: result.entries as CategoryEntry[] };
+    },
+    classify: input => receipt("", input.id, input),
+    undo: id => receipt(`/${encodeURIComponent(id)}/undo`, id),
+  };
+}
+
+/** Application windows are authenticated host operations, not invented SDK aliases. */
+export function createInboxWindowTransport(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): InboxWindowTransport {
+  async function call<T>(name: keyof typeof inboxWindowPaths, input: unknown): Promise<T> {
+    const requestSignal = signal(), path = inboxWindowPaths[name], finish = measureRequest(path, "POST");
+    let response: Response;
+    try {
+      response = await fetcher(path, { method: "POST", credentials: "include", cache: "no-store", signal: requestSignal,
+        headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input) });
+      finish(response.status);
+    } catch (error) { finish(0); throw error; }
+    // Enforce the wire bound while reading, before allocating an unbounded JSON string.
+    const reader = response.body?.getReader(), chunks: Uint8Array[] = [];
+    let size = 0;
+    if (reader) try {
+      for (;;) {
+        const part = await reader.read(); requestSignal.throwIfAborted();
+        if (part.done) break;
+        size += part.value.byteLength;
+        if (size > INBOX_RESPONSE_BYTE_LIMIT) throw new InboxViewPreferencesError("This inbox page exceeds the safe loading limit.", 413, "HOST_INBOX_TOO_LARGE");
+        chunks.push(part.value);
+      }
+    } finally { await reader.cancel().catch(() => {}); }
+    const bytes = new Uint8Array(size); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const result = (() => { try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return null; } })();
+    requestSignal.throwIfAborted();
+    if (!response.ok || !result || typeof result !== "object") throw new InboxViewPreferencesError(
+      typeof result?.error === "string" ? result.error : "This inbox window could not be loaded. Retry the current view.",
+      response.status, typeof result?.code === "string" ? result.code : "HOST_INBOX_UNAVAILABLE");
+    return result as T;
+  }
+  return {
+    query: input => call("query", input), page: input => call("page", input), counts: input => call("counts", input),
+    lookup: input => call("lookup", input), changes: input => call("changes", input), messages: input => call("messages", input),
+    sender: input => call("sender", input), contacts: input => call("contacts", input),
+    selectionCreate: input => call("selectionCreate", input), selectionPage: input => call("selectionPage", input),
+    zeroCreate: input => call("zeroCreate", input), zeroResume: input => call("zeroResume", input), zeroPage: input => call("zeroPage", input),
+    zeroProgress: input => call("zeroProgress", input), zeroUndo: input => call("zeroUndo", input),
+  };
+}
 
 /** Each store supplies its immutable owner transport and current abort signal. */
 export function createAiTriageClient(signal: () => AbortSignal, fetcher: typeof privateFetch = privateFetch): AiTriageActions {
@@ -180,8 +296,22 @@ export function createAiTriageClient(signal: () => AbortSignal, fetcher: typeof 
     changes: after => call<AiDecisionPage>(`/changes?after=${encodeURIComponent(after)}`),
     results: after => call<AiDecisionPage>(after === undefined ? "/results" : `/results?after=${encodeURIComponent(after)}`),
     feedback: input => call<AiDecision>("/feedback", "POST", input),
+    teach: input => call<AiTeachResult>("/teach", "POST", input),
     reading: async input => { await call("/reading", "POST", input); },
     clearReading: async () => { await call("/reading", "DELETE"); },
     diagnostics: () => call<Awaited<ReturnType<AiTriageActions["diagnostics"]>>>("/diagnostics"),
   };
+}
+
+export type ZeroSweepInput = { account: string; olderThanDays: number; keepUnread: boolean; keepStarred: boolean };
+export type ZeroSweepPreview = { token: string; conversations: number; messages: number; cutoff: string; complete: boolean };
+export type ZeroSweepRun = { id: string; account: string; at: string; cutoff: string; conversations: number; messages: number; skipped: number; undone: boolean; receipts: number };
+/** Get me to zero: host-side bulk Done for inbox conversations older than a cutoff, with a 7-day undo. */
+export async function zeroSweep<T>(path: "/preview" | "/apply" | "/undo" | "", input: unknown, signal: AbortSignal): Promise<T> {
+  const response = await hostFetch(`/host/zero-sweep${path}`, { method: path ? "POST" : "GET", credentials: "include", cache: "no-store", signal,
+    ...(path ? { headers: { "Content-Type": "application/json", "X-Superlocal": "1" }, body: JSON.stringify(input) } : {}) });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(result?.code === "HOST_ZERO_PREVIEW_EXPIRED" ? "That count is out of date. Check it again before confirming." : result?.code === "HOST_ZERO_UNDO_EXPIRED" ? "Undo is only available for 7 days." : "Get me to zero could not be completed. Try again.");
+  if (result === null || typeof result !== "object") throw new Error("The host returned an invalid response.");
+  return result as T;
 }

@@ -558,14 +558,22 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--muted);
+  --label-hue: 250;
+  color: oklch(0.88 0.08 var(--label-hue));
+  background: oklch(0.38 0.1 var(--label-hue));
   font-size: 10px;
-  border: 1px solid var(--border);
   border-radius: 3px;
-  padding: 1px 5px;
+  padding: 2px 5px;
+}
+[data-theme="light"] .row-label {
+  color: oklch(0.42 0.14 var(--label-hue));
+  background: oklch(0.92 0.06 var(--label-hue));
 }
 .starred-icon {
   color: #e4c377;
+}
+.reminded-icon {
+  color: #d1b1cf;
 }
 .row-actions {
   display: none;
@@ -1496,6 +1504,16 @@ kbd {
   font-size: 14px;
   padding: 24px 36px;
 }
+.teach-hint {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+  padding: 16px 36px 20px;
+}
+.teach-hint[role="alert"] {
+  color: var(--text);
+}
 .simple-modal-header {
   padding: 24px 28px;
   display: flex;
@@ -1764,6 +1782,11 @@ kbd {
     position: absolute;
   }
 }
+@media (min-width: 701px) and (max-width: 819px) {
+  /* Keep the 40px rail and 260px sidebar visible below the desktop 820px minimum. */
+  .mail-workspace { min-width: 0; }
+  .selection-toolbar { flex-wrap: wrap; }
+}
 @media (max-width: 700px) {
   .app { overflow: hidden; }
   .mail-workspace { min-width: 0; }
@@ -1867,4 +1890,65 @@ kbd {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* Explicit bulk work stays available while the inbox remains interactive. */
+.important-done-status {
+  flex: 0 0 auto;
+  padding: 12px var(--sidebar-gutter) 0;
+  font-size: var(--ui-small);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.important-done-status p { margin: 4px 0 0; color: var(--muted); }
+.important-done-status strong { font-weight: 500; }
+.important-done-actions { display: flex; gap: 16px; flex-wrap: wrap; }
+.important-done-actions button { min-height: 40px; }
+.app:not(.settings-open):has(.empty-mailbox.inbox-zero):not(.mobile-sidebar-open) > .right-sidebar:has(.important-done-status) {
+  height: auto;
+  background: var(--sidebar);
+}
+.zero-form .zero-lead {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.6;
+}
+.zero-lead select {
+  margin: 0 6px;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.zero-options {
+  display: grid;
+  gap: 8px;
+}
+.zero-check {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 10px !important;
+  color: var(--text) !important;
+}
+.zero-check input { width: auto; }
+.zero-count {
+  margin: 0;
+  color: var(--muted);
+  min-height: 21px;
+}
+.zero-recent {
+  width: 100%;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+}
+.zero-recent p {
+  margin: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
 }

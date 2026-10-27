@@ -5,18 +5,17 @@ import type {
   MailAccount,
   MailFolder,
   MailMessage,
-  MailboxProviderDescriptor,
   MailThread,
   Participant,
   ProviderCapabilities,
 } from '../../src/types'
 
 export type {
+  MailScope,
   Attachment,
   MailAccount,
   MailFolder,
   MailMessage,
-  MailboxProviderDescriptor,
   MailThread,
   Participant,
   ProviderCapabilities,
@@ -47,10 +46,15 @@ export interface SyncCursor {
 
 /** SDK runtime hints; separate from a provider's validated operation options. */
 export interface SyncContext {
-  /** Previously stored native identities, for providers without durable deletion history. */
+  /** Latest refreshes start at the head; backfill resumes a durable older-page cursor. */
+  lane?: 'latest' | 'backfill'
+  /** This exact checkpoint scope already completed its older-history walk. */
+  snapshotComplete?: boolean
+  /** Previously stored native identities, not proof of absence from a partial listing.
+   * Providers may intersect this untruncated hint with a bounded page instead of copying it all. */
   knownMessageIds?: string[]
-  /** Last confirmed upstream flags, not optimistic state or mailbox-local Done/snooze. */
-  knownMessageStates?: Array<{ id: string; isRead: boolean; isStarred: boolean }>
+  /** Last confirmed upstream flags/folder, not optimistic state or mailbox-local Done/snooze. */
+  knownMessageStates?: Array<{ id: string; isRead: boolean; isStarred: boolean; folder?: MailFolder }>
 }
 
 export interface SyncOptions extends SyncContext {
@@ -63,11 +67,18 @@ export interface SyncResult {
   messages: MailMessage[]
   threads: MailThread[]
   deletedMessageIds: string[]
+  /** Durable continuation for backfill or native incremental history. */
   cursor: SyncCursor | null
   hasMore: boolean
   fullSync: boolean
+  /** Native history boundary for the next latest poll, independent of older backfill pages.
+   * Without one, a fullSync latest refresh starts at the head every poll and follows hasMore
+   * only within that bounded poll. Return no changed messages and hasMore:false at a known,
+   * unchanged head to become quiet; never depend on an instance-local snapshot token. */
   recentCursor?: SyncCursor | null
   removedMessageIds?: string[]
+  /** Older-history coverage, not whether a latest head refresh has more changed pages.
+   * A page-only latest refresh preserves SyncContext.snapshotComplete after backfill finishes. */
   snapshotComplete?: boolean
   /** Mailbox-scoped instances that no longer exist, not a claim of global message deletion. */
   retiredMessageIds?: string[]
@@ -163,11 +174,20 @@ export interface AttachmentData {
   contentType: string
 }
 
+export interface SendingIdentity {
+  email: string
+  isPrimary: boolean
+  isDefault: boolean
+}
+
 export interface InboxProvider {
   readonly type: InboxProviderType
   readonly accountId: string
   readonly capabilities: Readonly<ProviderCapabilities>
   getAccount(): Promise<MailAccount>
+  /** Verified senders and optional selectable receiving scopes; omitted receiving means the whole source.
+   * Without this hook the SDK uses getAccount().email and aliases as the sending catalog. */
+  identities?(): Promise<{ sending: readonly SendingIdentity[]; receiving?: readonly MailScope[] }>
   listFolders(): Promise<ProviderFolder[]>
   createFolder(name: string): Promise<ProviderFolder>
   listMessages(options?: ListOptions): Promise<ProviderListResult<MailMessage>>
@@ -467,6 +487,7 @@ export async function providerRequest(
   url: string,
   init: RequestInit = {},
   timeoutMs = 30_000,
+  maxBytes?: number,
 ): Promise<Response> {
   let response: Response
   try {
@@ -485,7 +506,7 @@ export async function providerRequest(
 
   if (response.ok) return response
 
-  const text = new TextDecoder().decode(await providerBytes(provider, response))
+  const text = new TextDecoder().decode(await providerBytes(provider, response, maxBytes))
   let details: unknown = text
   if (text) {
     try {
@@ -530,10 +551,11 @@ export async function providerJson<T>(
   url: string,
   init: RequestInit = {},
   timeoutMs?: number,
+  maxBytes?: number,
 ): Promise<T> {
-  const response = await providerRequest(provider, fetcher, url, init, timeoutMs)
-  if (response.status === 204 || response.headers.get('content-length') === '0') return undefined as T
-  const body = new TextDecoder().decode(await providerBytes(provider, response))
+  const response = await providerRequest(provider, fetcher, url, init, timeoutMs, maxBytes)
+  if (response.status === 204 || maxBytes === undefined && response.headers.get('content-length') === '0') return undefined as T
+  const body = new TextDecoder().decode(await providerBytes(provider, response, maxBytes))
   if (!body.trim()) return undefined as T
   try {
     return JSON.parse(body) as T
@@ -545,10 +567,31 @@ export async function providerJson<T>(
   }
 }
 
-export async function providerBytes(provider: InboxProviderType, response: Response): Promise<Uint8Array> {
+export async function providerBytes(provider: InboxProviderType, response: Response, maxBytes?: number): Promise<Uint8Array> {
   try {
-    return new Uint8Array(await response.arrayBuffer())
+    if (maxBytes === undefined) return new Uint8Array(await response.arrayBuffer())
+    const reader = response.body?.getReader()
+    if (!reader) return new Uint8Array()
+    const chunks: Uint8Array[] = []
+    let size = 0
+    try {
+      for (;;) {
+        const next = await reader.read()
+        if (next.done) break
+        size += next.value.byteLength
+        if (size > maxBytes) {
+          await reader.cancel().catch(() => {})
+          throw new ProviderError(provider, 'UPSTREAM', `${provider} response exceeds the supported size limit`, { status: response.status })
+        }
+        chunks.push(next.value)
+      }
+    } finally { reader.releaseLock() }
+    const bytes = new Uint8Array(size)
+    let offset = 0
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+    return bytes
   } catch (cause) {
+    if (maxBytes !== undefined && cause instanceof ProviderError) throw cause
     throw new ProviderError(provider, 'NETWORK', `${provider} response body was interrupted`, {
       status: response.status,
       retryable: true,

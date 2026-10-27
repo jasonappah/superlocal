@@ -4,7 +4,7 @@ Desktop-focused email, backed by a provider-agnostic Inbox SDK. Bring your mailb
 
 > **Personal fork note:** This fork adds local Microsoft 365 / Exchange OAuth 2.0 IMAP and SMTP support for personal use. I may propose the work upstream later; for now, this fork exists to scratch my own itch.
 
-![Unified inbox showing the included fictional mailboxes](docs/screenshots/unified-inbox.png)
+![Superlocal inbox demo](docs/screenshots/superlocal-demo.gif)
 
 ## Run locally
 

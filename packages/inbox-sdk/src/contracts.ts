@@ -1,10 +1,16 @@
 import type { Database } from 'bun:sqlite'
-import type { InboxProvider, ProviderCredentials, MessageMutation, SyncCursor } from '../server/sdk/types'
+import type { InboxProvider, ProviderCredentials, MessageMutation, SyncCursor, SendingIdentity } from '../server/sdk/types'
 import type { Participant, ProviderCapabilities } from './types'
-import type { ConnectionSources } from '../server/sdk/mail-sources'
 
 export const API_VERSION = '1' as const
-export type { Participant, ProviderCapabilities }
+export type { Participant, ProviderCapabilities, SendingIdentity }
+
+export interface SendingIdentities {
+  sourceId: string
+  identities: SendingIdentity[]
+  /** Provider lookup completion time; null for legacy provider metadata. */
+  checkedAt: string | null
+}
 
 export class InboxError extends Error {
   readonly name = 'InboxError'
@@ -69,20 +75,70 @@ export interface MediaOptions {
 
 export interface MediaContent { contentType: string; content: Uint8Array; noStore?: boolean }
 
+/** A choice offered by a select field. Optional overrides adapt the other fields to that choice. */
+export interface ProviderOnboardingOption {
+  value: string
+  label: string
+  /** Replacement method summary when this option stands alone or is selected. */
+  summary?: string
+  /** Replacement labels for named fields while this option is selected. */
+  fieldLabels?: Readonly<Record<string, string>>
+  /** Fields that do not apply while this option is selected; they are not collected. */
+  hiddenFields?: readonly string[]
+  credentialHelp?: ProviderCredentialHelp
+}
+
+export interface ProviderOnboardingField {
+  name: string
+  label: string
+  type: 'text' | 'password' | 'email' | 'select'
+  required: boolean
+  /** Shown only in the collapsed advanced section. */
+  advanced?: boolean
+  defaultValue?: string
+  options?: readonly ProviderOnboardingOption[]
+}
+
+export interface ProviderCredentialHelp { text: string; url: string; linkLabel: string }
+
+/**
+ * Descriptor-driven onboarding: everything a host UI needs to collect a provider's credentials
+ * without provider-specific code. Hosts add readiness, secrets and presets; they do not author copy.
+ */
+export interface ProviderOnboarding {
+  /** Short method summary shown in the provider list, e.g. "Email and app-specific password". */
+  summary?: string
+  /** Submit label for a new connection; hosts fall back to "Connect <name>". */
+  actionLabel?: string
+  /** Shown before an OAuth redirect starts, e.g. where the user is sent and that they return here. */
+  redirectNote?: string
+  /** Credential fields collected by the host, in display order. Ignored for OAuth providers. */
+  fields?: readonly ProviderOnboardingField[]
+  /** Guidance for obtaining the credential, with a link the user can follow. */
+  credentialHelp?: ProviderCredentialHelp
+  /** Explains the collapsed advanced section when advanced fields exist. */
+  advancedNote?: string
+  /** Default explanation when the host cannot offer this provider yet; hosts override with specifics. */
+  setupMessage?: string
+}
+
 export interface ProviderDefinition {
   id: string
   name: string
   /** Translate retained native folder roles into upstream category facts, without opening a provider connection. */
   nativeCategoryRoles?: Readonly<Record<string, string>>
+  /** Defaults to true. False omits knownMessageIds/knownMessageStates only; use it only if sync never consumes them. */
+  syncHints?: boolean
   connection?: 'oauth' | 'credentials'
   scopes?: string[]
   /** Runtime cancellation is separate from provider-validated credential fields. */
   create(credentials: ProviderCredentials & Record<string, unknown>, context?: { signal: AbortSignal }): InboxProvider | Promise<InboxProvider>
   refresh?(credentials: Record<string, unknown>, signal: AbortSignal, context?: CredentialContext): Promise<Record<string, unknown>>
-  discover?(provider: InboxProvider): Promise<ConnectionSources>
   mailboxSelection?: 'automatic' | 'manual'
   /** False when the provider cannot prove that replacement credentials address the same store. */
   credentialReconnect?: boolean
+  /** Host-independent onboarding descriptor. Without it, hosts show only the provider name. */
+  onboarding?: ProviderOnboarding
 }
 
 export interface InboxOptions {
@@ -175,6 +231,8 @@ export interface MailboxMembership {
   revision: number
   done: boolean
   snoozedUntil: string | null
+  /** Due instant of the reminder that most recently woke this membership; internal to the SDK store, cleared by the next explicit state change. */
+  wokeAt?: string | null
 }
 
 export interface MailboxMessageSummary extends Omit<MessageSummary, 'snoozedUntil'> {
@@ -197,6 +255,8 @@ export interface MailboxSyncStatus {
   /** Opaque binding to the current effective source selection, not an individual mailbox view. */
   scopeKey: string
   state: 'syncing' | 'waiting' | 'error' | 'paused' | 'idle'
+  /** Persisted source coverage; optional for compatibility with older SDK hosts. */
+  coverage?: Account['sync']['coverage']
   activeLanes: Array<'latest' | 'backfill'>
   /** Earliest permitted retry, not a promise that a worker will run then. */
   retryAt: string | null
@@ -205,6 +265,95 @@ export interface MailboxSyncStatus {
   lastBatch: { lane: 'latest' | 'backfill'; processed: number; completedAt: string; hasMore: boolean } | null
   /** Persisted source timestamp, including native folders; not proof this selection or inbox completed. */
   lastSyncAt: string | null
+}
+
+export interface MailboxThreadKey { sourceId: string; threadId: string }
+export interface MailboxMessagePageInput { mailboxIds: string[]; limit?: number; cursor?: string; sourceId?: string; threadId?: string }
+/** Live descending receivedAt/id keyset. Reconcile from the first state after paging; not a frozen inventory. */
+export interface MailboxMessagePage { items: MailboxMessageSummary[]; nextCursor: string | null; state: string; scopeState: string }
+export type MailboxConversationQuery = Omit<MailboxQuery, 'mailboxIds' | 'cursor' | 'limit' | 'sort'> & {
+  /** Exact cached header predicate, distinct from legacy substring from/to. To excludes Cc/Bcc.
+   * Address matching trims and folds ASCII case; domains include exact-boundary subdomains. */
+  participant?: { field: 'from' | 'to'; match: 'address' | 'domain'; value: string }
+}
+/** Cursors are bidirectional leader boundaries, bound to the same selection/query/limit and first state.
+ * Default older traverses DESC; a fresh newer read starts at the oldest latest-message leaders, ASC. */
+export interface MailboxConversationsInput { mailboxIds: string[]; limit?: number; cursor?: string; direction?: 'older' | 'newer'; keys?: MailboxThreadKey[]; query?: MailboxConversationQuery }
+export interface MailboxConversation extends MailboxThreadKey {
+  /** Attested boundary at this row's latest selected leader, reusable in either direction.
+   * New SDK responses always include it, even on terminal pages; optional for older servers. */
+  cursor?: string
+  /** Oldest selected message's subject/identity, ordered by receivedAt ASC then id ASC. */
+  subject: string
+  firstMessageId: string
+  /** Aggregates cover every selected message, not only the query's matching messages or previews. */
+  messageCount: number
+  membershipCount: number
+  doneMembershipCount: number
+  /** Unique primary-inbox messages with any selected !done membership whose snooze is absent or <= read time. */
+  awakeInboxMessageCount: number
+  /** Latest awake primary-inbox receipt across the selected scope, including off-preview messages. */
+  latestAwakeInboxAt?: string | null
+  /** Minimum future snooze among all selected memberships, including Done memberships; otherwise null. */
+  earliestSnoozedUntil: string | null
+  /** Latest reminder due instant among awake (not done, not snoozed) primary-inbox memberships; null when none returned from a reminder. */
+  latestWokeAt?: string | null
+  lastMessageAt: string
+  isRead: boolean
+  isStarred: boolean
+  hasAttachments: boolean
+  /** Complete selected-message counts by exact primary folder, not role/label presence.
+   * Other primary folders remain outside this map; messageCount is the denominator.
+   * New SDK responses always include these counts; optional for older servers. */
+  primaryFolderCounts?: { inbox: number; archive: number; sent: number; drafts: number; spam: number; trash: number }
+  /** Native primary folder or native folder-role presence, across the complete selected conversation. */
+  nativeFolders: { inbox: boolean; archive: boolean; sent: boolean; drafts: boolean; spam: boolean; trash: boolean }
+  mailboxStates: Array<{ mailboxId: string; messageCount: number; doneCount: number; snoozedCount: number }>
+  /** Newest up to 50 cached summaries; fetch deeper messages using mailboxMessagePage. */
+  messages: MailboxMessageSummary[]
+  messagesComplete: boolean
+  /** Captured conditional-action references, up to 500. Never infer targets for later replies. */
+  targets: MailboxStateTarget[]
+  targetsComplete: boolean
+}
+export interface MailboxConversationsPage { items: MailboxConversation[]; nextCursor: string | null; state: string; scopeState: string }
+export interface MailboxCountsInput { mailboxIds: string[]; query?: MailboxConversationQuery }
+/** Exact cached matching messages and distinct matching source/thread keys; overlapping mailboxes are deduplicated. */
+export interface MailboxCounts { messages: number; conversations: number; asOfState: string; scopeState: string }
+
+export interface MailboxContactsInput { mailboxIds: string[]; query: string; limit?: number }
+/** Top cached correspondents, not a provider-complete address book. Literal address/name substring;
+ * default 20, maximum 100. Addresses are case-insensitive and use their most recent cached name. */
+export interface MailboxContacts { items: Array<{ name: string; email: string }>; state: string; scopeState: string }
+export interface MailboxCorrespondenceInput {
+  mailboxIds: string[]
+  email: string
+  /** Optional exact domain or parent of the email's hostname; includes that domain's children. */
+  domain?: string
+  /** ISO timestamp anchoring the period bins, not a filter on all-time cached metrics. */
+  since: string
+  /** Integer milliseconds, between one hour and 365 days. */
+  bucketMs: number
+  /** Between 1 and 64 bins. */
+  bucketCount: number
+  /** Default 5, maximum 50 distinct source/thread keys. */
+  recentLimit?: number
+}
+/** Selected cached history only, never provider-complete. Excludes trash, spam, unsent, invalid
+ * and future messages. Received means From; sent means To/CC on confirmed Sent mail, not queued work.
+ * Overlapping mailboxes and multiple matching recipients contribute once per message/direction. */
+export interface MailboxCorrespondence {
+  state: string
+  scopeState: string
+  received: number
+  sent: number
+  conversations: number
+  twoWay: number
+  firstMessageAt: string | null
+  lastMessageAt: string | null
+  lastSentAt: string | null
+  periods: Array<{ start: string; received: number; sent: number }>
+  recent: MailboxThreadKey[]
 }
 
 export interface MailboxSnapshotInput { mailboxIds: string[]; cursor?: string; limit?: number }
@@ -217,8 +366,13 @@ export interface MailboxSnapshotPage {
   scopeState: string
   expiresAt: string
 }
+export interface MailboxForwardedCopiesInput { mailboxIds: string[]; messageIds: string[] }
+/** Proven cached copy within one request batch. Canonical messages and workflow states remain independent. */
+export interface MailboxForwardedCopy { messageId: string; originalMessageId: string; originalSourceId: string; originalThreadId: string }
 export interface MailboxChangesInput { mailboxIds: string[]; since: string; scopeState: string; limit?: number }
 export interface MailboxChangesPage extends ChangePage {
+  /** Includes retained identities of deleted/unselected messages. Empty on scope/history reset. */
+  affectedThreads: MailboxThreadKey[]
   upserts: MailboxMessageSummary[]
   /** unselected removes only this scope's membership, not the canonical message. */
   removed: Array<{ sourceId: string; messageId: string; reason: 'deleted' | 'unselected'; revision: number | null }>
@@ -339,6 +493,8 @@ export interface Folder {
   role: string
   kind: 'folder' | 'label'
   scope: 'provider'
+  /** Provider-attested custom resource. Missing legacy metadata is not proof of a user label. */
+  custom?: boolean
 }
 
 export interface Label {
@@ -374,8 +530,13 @@ export interface Draft extends Required<Omit<DraftInput, 'sourceMessageId' | 'ma
 }
 
 export interface Changes extends MessageMutation {
+  /** SDK-local labels, never forwarded to a provider. */
   addLabelIds?: string[]
   removeLabelIds?: string[]
+  /** Canonical SDK Folder IDs for current, owned kind=label/custom=true resources; at most 100 unique IDs.
+   * Unlike the legacy raw addLabels/removeLabels fields, these are resolved inside provider dispatch. */
+  addProviderLabelIds?: string[]
+  removeProviderLabelIds?: string[]
   folderId?: string
 }
 
@@ -436,6 +597,7 @@ export interface Inbox {
   disconnect(owner: string, id: string): Promise<void>
   accounts(owner: string): Promise<Account[]>
   account(owner: string, id: string): Promise<Account>
+  sendingIdentities(owner: string, sourceId: string, input?: { refresh?: boolean }): Promise<SendingIdentities>
   connections(owner: string): Promise<Connection[]>
   connection(owner: string, id: string): Promise<Connection>
   /** identity is a trusted server-side assertion, never accepted from an unauthenticated request body. */
@@ -449,16 +611,28 @@ export interface Inbox {
   createMailbox(owner: string, input: MailboxInput): Promise<Mailbox>
   updateMailbox(owner: string, id: string, input: { name?: string; status?: Mailbox['status']; defaultSender?: string | null }, revision: number): Promise<Mailbox>
   mailboxMessages(owner: string, query: MailboxQuery): Promise<Page<MailboxMessageSummary>>
+  mailboxMessagePage(owner: string, input: MailboxMessagePageInput): Promise<MailboxMessagePage>
+  mailboxConversations(owner: string, input: MailboxConversationsInput): Promise<MailboxConversationsPage>
+  mailboxCounts(owner: string, input: MailboxCountsInput): Promise<MailboxCounts>
+  /** Read-only top-N contacts from selected cached metadata; never loads bodies or calls a provider. */
+  mailboxContacts(owner: string, input: MailboxContactsInput): Promise<MailboxContacts>
+  /** Read-only correspondence aggregates over selected cached metadata, independent of app labels/settings. */
+  mailboxCorrespondence(owner: string, input: MailboxCorrespondenceInput): Promise<MailboxCorrespondence>
   /** Read-only primary-inbox activity, grouped by source; excludes detached mailbox selections. */
   mailboxSyncStatus(owner: string, input: { mailboxIds: string[] }): Promise<MailboxSyncStatus[]>
   mailboxSnapshot(owner: string, input: MailboxSnapshotInput): Promise<MailboxSnapshotPage>
+  /** At most 500 requested IDs; both copy and original must be in this authorized current-generation batch. */
+  mailboxForwardedCopies(owner: string, input: MailboxForwardedCopiesInput): Promise<MailboxForwardedCopy[]>
   mailboxChanges(owner: string, input: MailboxChangesInput): Promise<MailboxChangesPage>
   /** Cached metadata only; never reads a body, including legacy fact enrichment. */
   mailboxMessageSummary(owner: string, mailboxId: string, messageId: string): Promise<MailboxMessageSummary>
   mailboxMessage(owner: string, mailboxId: string, messageId: string): Promise<Message & { sourceId: string; memberships: MailboxMembership[] }>
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
-  /** Atomic local-only state change with a durable idempotency receipt; no provider mutation. */
-  setMailboxStates(owner: string, input: { id: string; targets: MailboxStateTarget[]; done: boolean }): Promise<MailboxStateReceipt>
+  /** Atomic local-only state change with a durable idempotency receipt; no provider mutation.
+   * At least one change is required. Snooze-only preserves Done; Done-only clears snooze as before. */
+  setMailboxStates(owner: string, input: { id: string; targets: MailboxStateTarget[]; done?: boolean; snoozedUntil?: string | null }): Promise<MailboxStateReceipt>
+  /** Read the owned historical receipt, even after its source is detached; never changes mailbox state. */
+  mailboxStateReceipt(owner: string, id: string): Promise<MailboxStateReceipt>
   undoMailboxStates(owner: string, id: string): Promise<MailboxStateReceipt>
   syncMailbox(owner: string, mailboxId: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>
   sync(owner: string, id: string, options?: SyncRequest): Promise<{ synchronized: number; hasMore: boolean; state: string }>

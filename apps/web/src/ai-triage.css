@@ -19,6 +19,38 @@
   line-height: 1.55;
   max-width: 78ch;
 }
+.ai-disclosure-body {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding-top: 12px;
+}
+.ai-triage-settings > .settings-checkbox-row {
+  min-height: 44px;
+}
+.ai-settings-disclosure > summary {
+  cursor: pointer;
+  min-height: 44px;
+  align-content: center;
+}
+.ai-settings-disclosure > summary:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 3px;
+}
+.icon-button[data-sorting-issue] {
+  position: relative;
+}
+.icon-button[data-sorting-issue]::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  pointer-events: none;
+}
 .ai-refresh {
   justify-self: start;
 }
@@ -46,8 +78,12 @@
 }
 .ai-settings-form fieldset {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   margin: 0;
+}
+.ai-settings-form fieldset > * {
+  min-width: 0;
 }
 .ai-triage-settings p,
 .conversation-triage-dialog p {
@@ -70,6 +106,16 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 12px;
+}
+.ai-history-controls > select,
+.ai-history-controls > button {
+  box-sizing: border-box;
+  height: 40px;
+  margin-block: 0;
+}
+.ai-history-confirmation {
+  display: grid;
+  gap: 10px;
 }
 .ai-triage-settings select {
   min-width: 0;
@@ -184,11 +230,169 @@
   outline: none;
 }
 .conversation-triage-dialog {
+  width: 640px;
+  display: flex;
+  flex-direction: column;
   text-align: left;
+  overflow: hidden;
+}
+.conversation-triage-dialog .settings-dialog-header {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.conversation-triage-dialog h2 {
+  margin: 0;
+  font: inherit;
+  font-weight: 600;
+}
+.conversation-triage-dialog .settings-dialog-body {
+  display: grid;
+  gap: 16px;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+}
+.conversation-triage-dialog .ai-feedback {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.conversation-triage-dialog .settings-field {
+  display: grid;
+  gap: 8px;
+}
+.conversation-triage-dialog .ai-actions button,
+.conversation-triage-dialog .settings-dialog-header button {
+  min-height: 40px;
+  min-width: 40px;
+}
+.conversation-triage-dialog .ai-details > summary,
+.ai-triage-settings .ai-details > summary {
+  min-height: 40px;
+  align-content: center;
+}
+.conversation-triage-dialog .ai-details > summary:focus-visible,
+.ai-triage-settings .ai-details > summary:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 3px;
+}
+.ai-evidence {
+  display: grid;
+  gap: 12px;
+}
+@media (max-width: 700px) {
+  .conversation-triage-dialog .ai-details > summary,
+  .ai-triage-settings .ai-details > summary {
+    min-height: 44px;
+  }
+  .conversation-triage-dialog .ai-actions button,
+  .conversation-triage-dialog .settings-dialog-header button {
+    min-height: 44px;
+    min-width: 44px;
+  }
 }
 .conversation-triage-dialog .ai-feedback textarea {
   min-height: 64px;
 }
 .ai-score-reasons {
   padding-left: 18px;
+}
+
+.ai-rule-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.ai-rule-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.ai-rule-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ai-rule-category {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Three-way sorting mode: one control replaces the old checkbox plus hidden mode select. */
+.ai-mode {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+  justify-self: start;
+}
+.ai-mode-option {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 12px;
+  min-height: 32px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ai-mode-option:hover:not(:disabled) {
+  color: var(--text);
+}
+.ai-mode-option.is-selected {
+  background: var(--panel);
+  color: var(--text);
+}
+.ai-mode-option:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.ai-mode-option:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
+}
+.ai-mode-copy {
+  margin: 0;
+  max-width: 72ch;
+  line-height: 1.55;
+  color: var(--muted);
+}
+.ai-mode-copy strong {
+  color: var(--text);
+  font-weight: 500;
+}
+.ai-triage-settings kbd {
+  font: inherit;
+  font-size: 12px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.ai-job {
+  display: grid;
+  gap: 6px;
+}
+.ai-job-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 13px;
+}
+.ai-history-confirmation p {
+  margin: 0;
+  max-width: 72ch;
+  line-height: 1.5;
 }

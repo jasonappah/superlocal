@@ -15,6 +15,7 @@ import {
   type Preferences,
   type SendOptions,
   type MailboxOption,
+  type LoadSendingIdentities,
 } from "./data";
 import "./message.css";
 import { escapeHTML, plainText } from "./mail-text";
@@ -29,7 +30,9 @@ type ComposerProps = {
   draft: Draft;
   preferences: Preferences;
   accounts: MailboxOption[];
+  loadSendingIdentities: LoadSendingIdentities;
   contacts?: Array<{ name: string; email: string }>;
+  loadContacts?: (query: string) => Promise<Array<{ name: string; email: string }>>;
   onChange: (draft: Draft) => void;
   onSend: (draft: Draft, when?: string, options?: SendOptions) => Promise<boolean>;
   onDiscard: () => Promise<boolean>;
@@ -48,6 +51,26 @@ type ComposerProps = {
   onFocusChange?: (focused: boolean) => void;
 };
 
+/** Receiving views can overlap; expose each authorized source/address once. */
+export function sendingAddressGroups(accounts: MailboxOption[], catalog: Record<string, readonly { email: string }[] | undefined>, preferredMailbox: string) {
+  const groups = accounts.map(account => ({ account, identities: (catalog[account.id] ?? (account.email ? [{ email: account.email }] : []))
+    .filter(identity => account.selectorKind === "address" ? identity.email.toLowerCase() === (account.selectorValue ?? account.email).toLowerCase()
+      : account.selectorKind === "domain" ? identity.email.split("@").at(-1)?.toLowerCase() === account.selectorValue?.toLowerCase() : true)
+    .map(identity => ({ account: account.id, email: identity.email, value: JSON.stringify([account.id, identity.email]) })) }));
+  const owners = new Map<string, string>();
+  for (const group of groups) for (const identity of group.identities) {
+    const key = `${group.account.sourceId}\0${identity.email.toLowerCase()}`;
+    if (!owners.has(key) || group.account.id === preferredMailbox) owners.set(key, group.account.id);
+  }
+  let offset = 0;
+  return groups.flatMap(group => {
+    const identities = group.identities.filter(identity => owners.get(`${group.account.sourceId}\0${identity.email.toLowerCase()}`) === group.account.id);
+    const result = { ...group, identities, offset };
+    offset += identities.length;
+    return identities.length ? [result] : [];
+  });
+}
+
 const addresses = (value: string) =>
   value
     .split(/[,;\n]+/)
@@ -63,6 +86,7 @@ function RecipientField({
   value,
   onChange,
   onExpand,
+  loadContacts,
   contacts,
 }: {
   label: string;
@@ -70,6 +94,7 @@ function RecipientField({
   onChange: (value: string) => void;
   onExpand: () => void;
   contacts: Array<{ name: string; email: string }>;
+  loadContacts?: ComposerProps["loadContacts"];
 }) {
   const id = useId();
   const input = useRef<HTMLInputElement>(null);
@@ -80,7 +105,14 @@ function RecipientField({
   const chips = query.trim()
     ? all.slice(0, Math.max(0, all.length - addresses(query).length))
     : all;
-  const results = contacts
+  const [found, setFound] = useState<{ query: string; contacts: typeof contacts } | null>(null);
+  useEffect(() => {
+    if (!loadContacts || !focused || !query.trim()) return;
+    let stopped = false;
+    const timer = setTimeout(() => { void loadContacts(query).then(contacts => { if (!stopped) setFound({ query, contacts }); }).catch(() => {}); }, 150);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [loadContacts, focused, query]);
+  const results = (loadContacts ? found?.query === query ? found.contacts : [] : contacts)
     .filter(
       (contact) =>
         `${contact.name} ${contact.email}`
@@ -255,7 +287,9 @@ export default function Composer({
   draft,
   preferences,
   accounts,
+  loadSendingIdentities,
   contacts = [],
+  loadContacts,
   onChange,
   onSend,
   onDiscard,
@@ -320,6 +354,77 @@ export default function Composer({
   const signatures = preferences.signaturesByAccount as
     Record<string, string> | undefined;
   const signature = signatures?.[draft.account] ?? preferences.signature;
+  const mailbox = accounts.find(account => account.id === draft.account);
+  const sourceLocked = draft.mode !== "new" || !!draft.sourceMessageId;
+  const replyMailbox = mailbox && (!draft.sourceId || mailbox.sourceId === draft.sourceId) ? mailbox
+    : accounts.find(account => account.canSend && account.sourceId === draft.sourceId);
+  const sendingAccounts = accounts.filter(account => account.canSend && (!sourceLocked || account.id === replyMailbox?.id));
+  const sourceBinding = JSON.stringify(sendingAccounts.map(account => [account.id, account.sourceId, account.sourceGeneration, account.email, account.selectorKind, account.selectorValue]));
+  // Switching From within a new draft does not discard other accounts' pending or loaded identities.
+  const identityOwner = `${draft.id}\0${draft.mode}\0${draft.sourceMessageId ?? ""}\0${sourceBinding}`;
+  const identityOwnerRef = useRef(identityOwner);
+  identityOwnerRef.current = identityOwner;
+  const identityRequest = useRef(0);
+  const previousSource = useRef(sourceBinding);
+  const identityStatusId = useId();
+  type IdentityState = { loading: boolean; value?: Awaited<ReturnType<LoadSendingIdentities>>; error?: string };
+  const [identityLoad, setIdentityLoad] = useState<{ owner: string; accounts: Record<string, IdentityState> }>({ owner: identityOwner, accounts: {} });
+  const identityStates: Record<string, IdentityState> = identityLoad.owner === identityOwner ? identityLoad.accounts : {};
+  const identityState = identityStates[draft.account];
+  const identitiesLoading = sendingAccounts.some(account => !identityStates[account.id] || identityStates[account.id].loading);
+  const currentLoading = sendingAccounts.some(account => account.id === draft.account) && (!identityState || identityState.loading);
+  const senderGroups = sendingAddressGroups(sendingAccounts,
+    Object.fromEntries(sendingAccounts.map(account => [account.id, identityStates[account.id]?.value?.identities])), draft.account);
+  const identities = senderGroups.flatMap(group => group.identities);
+  const from = draft.from ?? mailbox?.email ?? "";
+  const listedFrom = identities.find(identity => identity.account === draft.account && identity.email.toLowerCase() === from.toLowerCase());
+  const missingFrom = !sendingAccounts.some(account => account.id === draft.account) || !!identityState?.value && !listedFrom;
+  const [senderOpen, setSenderOpen] = useState(false);
+  const [senderHighlight, setSenderHighlight] = useState(0);
+  const senderAnchor = useRef<HTMLDivElement>(null);
+  const senderTrigger = useRef<HTMLButtonElement>(null);
+  const senderTypeahead = useRef({ text: "", at: 0 });
+  const senderListId = useId();
+  const activeSender = identities.length ? Math.min(senderHighlight, identities.length - 1) : -1;
+  const openSenders = (last = false) => {
+    setSenderHighlight(last ? Math.max(0, identities.length - 1) : Math.max(0, identities.findIndex(identity => identity.value === listedFrom?.value)));
+    setSenderOpen(true);
+  };
+  const chooseSender = (value: string) => {
+    const identity = identities.find(identity => identity.value === value);
+    if (!identity || sending) return;
+    update({ account: identity.account, from: identity.email });
+    setSenderOpen(false);
+    senderTrigger.current?.focus();
+  };
+  useEffect(() => { setSenderOpen(false); }, [identityOwner, sending]);
+  useEffect(() => {
+    if (!senderOpen) return;
+    const close = (event: PointerEvent) => {
+      if (!senderAnchor.current?.contains(event.target as Node)) setSenderOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [senderOpen]);
+  useEffect(() => {
+    if (senderOpen) document.getElementById(`${senderListId}-${activeSender}`)?.scrollIntoView({ block: "nearest" });
+  }, [senderOpen, activeSender, senderListId]);
+  const loadIdentities = useCallback(async (refresh = false) => {
+    const request = ++identityRequest.current;
+    setIdentityLoad({ owner: identityOwner, accounts: Object.fromEntries(sendingAccounts.map(account => [account.id, { loading: true }])) });
+    await Promise.all(sendingAccounts.map(async account => {
+      let state: IdentityState;
+      try {
+        const value = await loadSendingIdentities(account.id, { refresh });
+        if (value.sourceId !== account.sourceId) throw new Error("The sending mailbox changed. Retry to load its senders.");
+        state = { loading: false, value };
+      } catch (cause) {
+        state = { loading: false, error: cause instanceof Error && !(cause instanceof TypeError) ? cause.message : "Could not load sending addresses." };
+      }
+      if (mounted.current && identityOwnerRef.current === identityOwner && identityRequest.current === request)
+        setIdentityLoad(previous => previous.owner === identityOwner ? { ...previous, accounts: { ...previous.accounts, [account.id]: state } } : previous);
+    }));
+  }, [identityOwner, loadSendingIdentities]);
 
   useEffect(() => {
     mounted.current = true;
@@ -327,6 +432,13 @@ export default function Composer({
       mounted.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    const refresh = previousSource.current !== sourceBinding;
+    previousSource.current = sourceBinding;
+    void loadIdentities(refresh);
+    return () => { identityRequest.current++; };
+  }, [loadIdentities, sourceBinding]);
 
   function update(patch: Partial<Draft>) {
     if (patch.body !== undefined) setPreviewReply(null);
@@ -517,7 +629,10 @@ export default function Composer({
     setSending(true);
     try {
       if (await onSend(next, when ? new Date(when).toISOString() : undefined, options)) setMenu(null);
-    } catch (error) { setError(error instanceof Error ? error.message : "The send could not be queued. Your draft has been kept."); }
+    } catch (error) {
+      if (mounted.current && current.current.id === next.id && current.current.account === next.account && current.current.from === next.from)
+        setError(error instanceof Error ? error.message : "The send could not be queued. Your draft has been kept.");
+    }
     finally { submitting.current = false; if (mounted.current) setSending(false); }
   }
 
@@ -660,7 +775,7 @@ export default function Composer({
                 : matches("b", "KeyB")
                   ? "Bcc"
                   : matches("f", "KeyF")
-                    ? "From account"
+                    ? "From"
                     : matches("s", "KeyS")
                       ? "Subject"
                       : null;
@@ -673,7 +788,9 @@ export default function Composer({
                     ?.focus(),
                 );
               };
-            } else if (matches("u", "KeyU") && fileInput.current) {
+            } else if (matches("m", "KeyM")) {
+              action = () => editor.current?.focus();
+            } else if ((matches("a", "KeyA") || matches("u", "KeyU")) && fileInput.current) {
               action = () => fileInput.current?.click();
             } else if (matches(",", "Comma")) {
               action = onDiscard;
@@ -915,6 +1032,7 @@ export default function Composer({
               <RecipientField
                 key={`${draft.id}-to`}
                 contacts={contacts}
+                loadContacts={loadContacts}
                 label="To"
                 value={draft.to}
                 onChange={(to) => update({ to })}
@@ -925,6 +1043,7 @@ export default function Composer({
                   <RecipientField
                     key={`${draft.id}-cc`}
                     contacts={contacts}
+                loadContacts={loadContacts}
                     label="Cc"
                     value={draft.cc}
                     onChange={(cc) => update({ cc })}
@@ -933,32 +1052,84 @@ export default function Composer({
                   <RecipientField
                     key={`${draft.id}-bcc`}
                     contacts={contacts}
+                loadContacts={loadContacts}
                     label="Bcc"
                     value={draft.bcc}
                     onChange={(bcc) => update({ bcc })}
                     onExpand={() => setExpanded(true)}
                   />
-                  <label className="compose-recipient-row compose-from">
-                    <span>From</span>
-                    <select
-                      aria-label="From account"
-                      value={draft.account}
-                      onChange={(event) =>
-                        update({ account: event.target.value })
-                      }
-                    >
-                      {accounts.filter(account => account.canSend || account.id === draft.account).map(
-                        (account) => (
-                          <option key={account.id} value={account.id}>{account.email || account.name}</option>
-                        ),
-                      )}
-                    </select>
-                    <Icon name="ChevronDown" size={12} />
-                  </label>
                 </>
               )}
             </div>
           )}
+          <div className="compose-recipient-row compose-from">
+            <span>From</span>
+            <div className="compose-sender-picker" ref={senderAnchor} onBlur={event => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSenderOpen(false);
+            }}>
+            <button
+              type="button"
+              ref={senderTrigger}
+              className="compose-sender-trigger"
+              role="combobox"
+              aria-label="From"
+              aria-haspopup="listbox"
+              aria-expanded={senderOpen}
+              aria-controls={senderListId}
+              aria-activedescendant={senderOpen && activeSender >= 0 ? `${senderListId}-${activeSender}` : undefined}
+              aria-describedby={identityStatusId}
+              aria-busy={identitiesLoading}
+              value={listedFrom?.value ?? JSON.stringify([draft.account, from])}
+              disabled={sending}
+              onClick={() => senderOpen ? setSenderOpen(false) : openSenders()}
+              onKeyDown={event => {
+                if (event.nativeEvent.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
+                const key = event.key;
+                if (key === "Tab") { setSenderOpen(false); return; }
+                if (key === "Escape") {
+                  if (!senderOpen) return;
+                  setSenderOpen(false);
+                } else if (key === "ArrowDown" || key === "ArrowUp") {
+                  if (!senderOpen) openSenders(key === "ArrowUp");
+                  else setSenderHighlight((activeSender + (key === "ArrowDown" ? 1 : -1) + identities.length) % Math.max(1, identities.length));
+                } else if (key === "Home" || key === "End") {
+                  setSenderOpen(true); setSenderHighlight(key === "Home" ? 0 : Math.max(0, identities.length - 1));
+                } else if (key === "Enter" || key === " ") {
+                  if (!senderOpen) openSenders();
+                  else if (activeSender >= 0) chooseSender(identities[activeSender].value);
+                } else if (key.length === 1) {
+                  const now = Date.now(), previous = senderTypeahead.current;
+                  const text = (now - previous.at < 600 ? previous.text : "") + key.toLowerCase();
+                  senderTypeahead.current = { text, at: now };
+                  const index = identities.findIndex(identity => identity.email.toLowerCase().startsWith(text));
+                  setSenderOpen(true); if (index >= 0) setSenderHighlight(index);
+                } else return;
+                event.preventDefault(); event.stopPropagation();
+              }}
+            >
+              <span>{from || "Choose a sending address"}{missingFrom && from ? " (Unavailable)" : ""}</span>
+              <Icon name="ChevronDown" size={12} />
+            </button>
+            <div id={senderListId} role="listbox" aria-label="Sending addresses" className="compose-sender-options" hidden={!senderOpen}>
+              {senderGroups.map(({ account, identities, offset }) => {
+                return identities.length > 0 && <div key={account.id} role="group" aria-label={account.email || account.name}>
+                  {senderGroups.length > 1 && <div className="compose-sender-group">{account.email || account.name}</div>}
+                  {identities.map((identity, index) => <button key={identity.value} type="button" role="option" tabIndex={-1}
+                    id={`${senderListId}-${offset + index}`} value={identity.value} aria-label={identity.email}
+                    aria-selected={identity.value === listedFrom?.value} className={offset + index === activeSender ? "is-active" : undefined}
+                    onMouseDown={event => event.preventDefault()} onMouseEnter={() => setSenderHighlight(offset + index)} onClick={() => chooseSender(identity.value)}>
+                    <span>{identity.email}</span>{identity.value === listedFrom?.value && <Icon name="Check" size={14} />}
+                  </button>)}
+                </div>;
+              })}
+              {identities.length === 0 && <div className="compose-sender-group">{identitiesLoading ? "Loading sending addresses…" : "No sending addresses available"}</div>}
+            </div>
+            </div>
+          </div>
+          <div id={identityStatusId} className={`compose-sender-status ${identityState?.error || missingFrom ? "is-error" : ""}`} aria-live="polite">
+            {currentLoading ? "Loading sending addresses…" : identityState?.error || (missingFrom ? "This address is not in the available senders." : "")}
+            {!currentLoading && (identityState?.error || missingFrom || draft.sendError) && <button type="button" onClick={() => void loadIdentities(true)}>Retry sending addresses</button>}
+          </div>
           {(!inline || expanded) && (
             <input
               className="compose-subject"
@@ -1145,9 +1316,9 @@ export default function Composer({
               </button>
             </div>
           )}
-          {(error || draft.saveError) && (
+          {(error || draft.saveError || draft.sendError) && (
             <div className="compose-error" role="alert">
-              {error || draft.saveError}
+              {error || draft.saveError || draft.sendError?.message}
               {draft.saveError && onReload && <button type="button" onClick={onReload}>Reload saved draft</button>}
             </div>
           )}
@@ -1157,9 +1328,6 @@ export default function Composer({
             </div>
           )}
           <footer className="compose-footer">
-            <div className="compose-status" role="status">
-              {draft.saveError ? "Draft not saved" : draft.saving ? "Saving draft…" : draft.dirty ? "Unsaved recipient changes" : "Draft saved"}
-            </div>
             <div className="compose-send-actions">
               <button
                 type="button"
@@ -1373,7 +1541,7 @@ export default function Composer({
               </div>
               <IconButton
                 name="Paperclip"
-                title="Attach file (Command Shift U)"
+                title="Attach file (Command Shift A)"
                 onClick={() => fileInput.current?.click()}
               />
               <div className="compose-menu-anchor">

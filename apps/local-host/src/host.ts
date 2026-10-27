@@ -1,40 +1,43 @@
 import { createHmac, randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
-import { createMockHost, type MockHost } from '@superlocal/mock-api'
+import { createMockHost, createMockProviderDefinition, type MockHost } from '@superlocal/mock-api'
 import { createInbox, InboxError, type Inbox } from 'inbox-sdk'
 import { createInboxApi } from 'inbox-sdk/http'
 import { loadLocalConfig, object, type LocalConfig } from './config'
 import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
-import { createRealRegistrations, type HostProvider, type HostProviderRegistration } from './providers'
+import { connectFailure, createRealRegistrations, describeProvider, type HostExtension, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
 import { createSenderDomainHost } from './sender-domains'
 import { createSplitPreferencesStore } from './split-preferences'
 import { createAttentionFeedbackStore } from './attention-feedback'
+import { createAttentionOverridesStore } from './attention-overrides'
 import { isPerformanceSample } from '../../shared/performance'
 import { createPerformanceLog } from './performance-log'
 import { assertApplicationAuthRuntime, createApplicationAuth } from './application-auth'
 import { loadAiInferenceConfig, type AiInferenceConfig } from './ai-inference'
 import { createAiTriageService } from './ai-triage'
-import type { AiSettings, AiFeedbackInput, AiReadingInput, AiThreadKey } from '../../shared/ai-triage'
+import { createInboxWindowService } from './inbox-window'
+import { createZeroSweepService } from './zero-sweep'
+import type { AiSettings, AiFeedbackInput, AiReadingInput, AiTeachInput, AiThreadKey } from '../../shared/ai-triage'
 
 const safeHeaders = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', Vary: 'Origin, Cookie' }
 function problem(status: number, code: string, error: string): Response {
   return Response.json({ code, error, retryable: status >= 500 }, { status, headers: safeHeaders })
 }
 
-async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' = 'connection'): Promise<Record<string, unknown>> {
-  const limit = kind === 'triage' ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
-  const description = kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
+async function jsonBody(request: Request, kind: 'connection' | 'preferences' | 'performance' | 'triage' | 'category' | 'inbox' | 'inboxChanges' = 'connection'): Promise<Record<string, unknown>> {
+  const limit = kind === 'inboxChanges' ? 256 * 1024 : (kind === 'triage' || kind === 'category' || kind === 'inbox') ? 64 * 1024 : kind === 'performance' ? 32 * 1024 : kind === 'preferences' ? INBOX_PREFERENCES_BODY_LIMIT : 16_384
+  const description = kind === 'inbox' || kind === 'inboxChanges' ? 'Inbox' : kind === 'category' ? 'Category' : kind === 'triage' ? 'Triage' : kind === 'performance' ? 'Performance' : kind === 'preferences' ? 'Preferences' : 'Connection'
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get('content-type') ?? '')) throw new InboxError('HOST_JSON_REQUIRED', 'Use application/json.', 415)
   const length = request.headers.get('content-length')
   if (length && (!/^\d+$/.test(length) || Number(length) > limit)) throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
-  if (request.headers.has('content-encoding') && (kind === 'performance' || kind === 'triage' || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
+  if (request.headers.has('content-encoding') && (kind === 'performance' || (kind === 'triage' || kind === 'category' || kind === 'inbox' || kind === 'inboxChanges') || request.headers.get('content-encoding') !== 'identity')) throw new InboxError('HOST_ENCODING_FORBIDDEN', `Encoded ${kind} input is not supported.`, 415)
   if (!request.body) throw new InboxError('HOST_INVALID_INPUT', 'A JSON object is required.', 400)
   const reader = request.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
   let expired = false
-  const timer = kind === 'performance' || kind === 'triage' ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
+  const timer = kind === 'performance' || (kind === 'triage' || kind === 'category' || kind === 'inbox' || kind === 'inboxChanges') ? setTimeout(() => { expired = true; void reader.cancel().catch(() => {}) }, 2000) : undefined
   try {
     while (true) {
       const { value, done } = await reader.read()
@@ -42,7 +45,7 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
       if (done) break
       size += value.byteLength
       if (size > limit) {
-        if (kind === 'performance' || kind === 'triage') void reader.cancel().catch(() => {})
+        if (kind === 'performance' || (kind === 'triage' || kind === 'category' || kind === 'inbox' || kind === 'inboxChanges')) void reader.cancel().catch(() => {})
         else await reader.cancel()
         throw new InboxError('HOST_BODY_TOO_LARGE', `${description} input exceeds the size limit.`, 413)
       }
@@ -58,16 +61,22 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
 
 function credentialsFor(provider: HostProviderRegistration, input: Record<string, unknown>): Record<string, string> {
   const invalid = () => new InboxError('HOST_INVALID_CREDENTIALS', 'Only the declared provider credential fields are accepted.', 400)
-  if (provider.onboarding.connection === 'none') {
+function credentialsFor(provider: HostProviderRegistration, input: Record<string, unknown>): Record<string, string> {
+  const invalid = () => new InboxError('HOST_INVALID_CREDENTIALS', 'Only the declared provider credential fields are accepted.', 400)
+  if (provider.descriptor.connection !== 'credentials') {
     if (Object.keys(input).length) throw invalid()
     return {}
   }
   if (Object.keys(input).join(',') !== 'credentials' || !object(input.credentials)) throw invalid()
-  const fields = provider.onboarding.fields ?? []
+  const fields = provider.descriptor.fields ?? []
   if (Object.keys(input.credentials).some(name => !fields.some(field => field.name === name))) throw invalid()
   const credentials: Record<string, string> = Object.create(null)
+  // A selected option may hide fields; they are not declared for that choice and are refused like unknown names.
+  const chosen = input.credentials
+  const hidden = new Set(fields.flatMap(field => field.type === 'select' ? field.options?.find(option => option.value === (chosen[field.name] ?? field.defaultValue))?.hiddenFields ?? [] : []))
   for (const field of fields) {
     const value = input.credentials[field.name]
+    if (hidden.has(field.name)) { if (value !== undefined) throw invalid(); continue }
     if (value === undefined && !field.required) continue
     // Mail passwords are opaque. Spaces are significant; never trim or normalize them.
     if (typeof value !== 'string' || value.length > 4096 || field.type !== 'password' && (value.trim() !== value || /[\x00-\x1f\x7f]/.test(value)) || field.required && !value) throw invalid()
@@ -92,6 +101,9 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         token: createHmac('sha256', runtime.sessionKey).update('unused-private-mock-bearer').digest('hex'), allowProviderWrites: config.allowProviderWrites })
       inbox = mock.inbox
       owner = mock.owner
+      // The mock host already registered this definition with its inbox; the browser only sees its descriptor.
+      const definition = createMockProviderDefinition(mock.store)
+      registrations = [{ definition, descriptor: describeProvider(definition, { connectable: false }) }]
     } else {
       const real = createRealRegistrations(config, runtime, environment)
       registrations = real.registrations
@@ -118,7 +130,10 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     inboxPreferences: ReturnType<typeof createInboxViewPreferencesStore>
     splitPreferences: ReturnType<typeof createSplitPreferencesStore>
     attentionFeedback: ReturnType<typeof createAttentionFeedbackStore>
+    attentionOverrides: ReturnType<typeof createAttentionOverridesStore>
     senderDomains: ReturnType<typeof createSenderDomainHost>
+    inboxWindow: ReturnType<typeof createInboxWindowService>
+    zeroSweep: ReturnType<typeof createZeroSweepService>
   }>()
   function contextFor(owner: string) {
     if (closed) throw new InboxError('HOST_CLOSED', 'The local host is shutting down.', 503)
@@ -126,12 +141,16 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     if (!context) {
       // Auth admission is capped at 256 durable identities. Never evict a live owner's queue.
       if (ownerContexts.size >= 256) throw new InboxError('HOST_OWNER_LIMIT', 'This host has reached its active-user limit.', 503)
-      context = {
+      const services = {
         inboxPreferences: createInboxViewPreferencesStore(runtime.database, liveInbox, owner),
         splitPreferences: createSplitPreferencesStore(runtime.database, owner),
         attentionFeedback: createAttentionFeedbackStore(runtime.database, liveInbox, owner),
+        attentionOverrides: createAttentionOverridesStore(runtime.database, liveInbox, owner),
         senderDomains: createSenderDomainHost({ inbox: liveInbox, owner, offline: config.mode === 'mock' }),
       }
+      context = { ...services, inboxWindow: createInboxWindowService({ database: runtime.database, inbox: liveInbox, owner,
+        sessionKey: runtime.sessionKey, allowProviderWrites: config.allowProviderWrites, ai: aiTriage, ...services }),
+        zeroSweep: createZeroSweepService({ database: runtime.database, inbox: liveInbox, owner }) }
       ownerContexts.set(owner, context)
     }
     return context
@@ -161,6 +180,16 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const origin = request.headers.get('origin')
     return session && session.expires > Date.now() && (!origin || origin === session.origin) ? { id: owner } : null
   }
+  // Provider extensions (OAuth callbacks/handoffs) are mounted below with `authenticate`; requests arrive only afterwards.
+  let extensions: HostExtension[] = []
+  /** Native navigations declared by a mounted provider extension: its callback and its owner-checked authorization handoff. */
+  const mailboxAuthorization = (path: string) => {
+    for (const extension of extensions) {
+      const id = extension.authorization?.attemptId(path)
+      if (id !== undefined) return { extension, id }
+    }
+    return undefined
+  }
   function scopeMatches(request: Request, scope: string | undefined): boolean {
     if (!applicationAuth) return true
     const supplied = request.headers.get('x-superlocal-scope')
@@ -169,23 +198,21 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     // Only native element/download URLs have no custom header. Their opaque IDs remain
     // owner-checked by the SDK; never exempt a generic JSON GET or an encoded path alias.
     return ['GET', 'HEAD'].includes(request.method) && (/^\/v1\/messages\/[^/%]+\/media\/[^/%]+$/.test(path) || /^\/v1\/blobs\/[^/%]+$/.test(path)) ||
-      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || path === '/v1/oauth/google/callback' || !!mailboxAuthorizationId(request))
+      request.method === 'GET' && (/^\/host\/sender-domains\/[^/%]+\/icon$/.test(path) || extensions.some(extension => extension.callbackPath === path) || !!mailboxAuthorization(path))
   }
-  const mailboxAuthorizationId = (request: Request) => request.method === 'GET' ? /^\/v1\/oauth\/google\/authorize\/([^/%]+)$/.exec(new URL(request.url).pathname)?.[1] : undefined
   function ownsMailboxAuthorization(request: Request, owner: string): boolean {
-    const id = mailboxAuthorizationId(request)
-    if (!applicationAuth || !id) return true
-    // The SDK's redirect handoff consumes a one-use ticket; check its owner before
-    // consumption, including native navigations that cannot supply the document scope.
-    return !!runtime.database.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sdk_oauth_attempts'").get() &&
-      !!runtime.database.query('SELECT 1 FROM sdk_oauth_attempts WHERE id=? AND owner=?').get(id, owner)
+    const handoff = request.method === 'GET' ? mailboxAuthorization(new URL(request.url).pathname) : undefined
+    if (!applicationAuth || !handoff) return true
+    // The extension consumes a one-use ticket on this navigation; confirm its owner first,
+    // including native navigations that cannot supply the document scope.
+    return handoff.extension.authorization!.owns(handoff.id, owner)
   }
   const authenticate = async (request: Request): Promise<{ id: string } | null> => {
     const identity = await currentIdentity(request)
     return identity && scopeMatches(request, identity.scope) && ownsMailboxAuthorization(request, identity.id) ? { id: identity.id } : null
   }
   const api = createInboxApi({ inbox: liveInbox, authenticate, allowedOrigins })
-  const extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
+  extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
 
   function session(request: Request): Response {
     if (applicationAuth) return authRequired()
@@ -215,7 +242,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     // Never route encoded or trailing-slash auth aliases through a more permissive handler.
     let normalized: string
     try { normalized = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch { return problem(400, 'HOST_INVALID_PATH', 'Invalid request path.') }
-    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && normalized.startsWith('/v1/oauth/google/authorize/'))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
+    if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && !!mailboxAuthorization(normalized))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
     if (url.pathname === '/session') return url.search ? problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.') : session(request)
     if (url.pathname === '/health' && request.method === 'GET') return Response.json({ ok: true }, { headers: safeHeaders })
     if (url.pathname.startsWith('/api/auth')) return applicationAuth && url.pathname === '/api/auth/callback/google' ? applicationAuth.handle(request) : problem(404, 'NOT_FOUND', 'Route not found.')
@@ -243,8 +270,13 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     }
     if (!ownsMailboxAuthorization(request, identity.id)) return problem(404, 'NOT_FOUND', 'OAuth attempt not found.')
     const owner = identity.id
-    const { inboxPreferences, splitPreferences, attentionFeedback, senderDomains } = contextFor(owner)
+    const { inboxPreferences, splitPreferences, attentionFeedback, attentionOverrides, senderDomains, inboxWindow } = contextFor(owner)
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && (!origin || !origins.has(origin))) return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'An exact allowed Origin is required for changes.')
+    if (url.pathname.startsWith('/host/inbox/')) {
+      if (url.search) return problem(400, 'HOST_INBOX_INVALID', 'Inbox input belongs in the JSON body.')
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for inbox queries.')
+      return Response.json(await inboxWindow.dispatch(url.pathname, await jsonBody(request, url.pathname === '/host/inbox/changes' ? 'inboxChanges' : 'inbox')), { headers: safeHeaders })
+    }
     if (url.pathname === '/host/ai-triage' || url.pathname.startsWith('/host/ai-triage/')) {
       const route = url.pathname.slice('/host/ai-triage'.length)
       const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
@@ -261,12 +293,13 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Triage input belongs in the JSON body.')
         const input = await jsonBody(request, 'triage')
         if (route === '/settings' && request.method === 'PATCH') return reply(await aiTriage.configure(owner, input as unknown as AiSettings))
-        if (route === '/process' && request.method === 'POST') return reply(await aiTriage.process(owner, input as unknown as { id: string; scope: 'inbox' | 'all'; limit: number }))
+        if (route === '/process' && request.method === 'POST') return reply(await aiTriage.process(owner, input as unknown as { id: string; scope: 'inbox' | 'all' | 'important'; limit: number }))
         if (route === '/lookup' && request.method === 'POST') {
           if (Object.keys(input).join(',') !== 'keys' || !Array.isArray(input.keys) || input.keys.length > 100) return problem(400, 'HOST_INVALID_INPUT', 'Provide up to 100 triage identities.')
           return reply(await aiTriage.lookup(owner, input.keys as AiThreadKey[]))
         }
         if (route === '/feedback' && request.method === 'POST') return reply(await aiTriage.feedback(owner, input as unknown as AiFeedbackInput))
+        if (route === '/teach' && request.method === 'POST') return reply(await aiTriage.teach(owner, input as unknown as AiTeachInput))
         if (route === '/reading' && request.method === 'POST') { await aiTriage.reading(owner, input as unknown as AiReadingInput); return reply({ accepted: true }) }
         if (route === '/reading' && request.method === 'DELETE') {
           if (Object.keys(input).length) return problem(400, 'HOST_INVALID_INPUT', 'Clearing reading signals takes no parameters.')
@@ -279,6 +312,23 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
         }
       }
       return problem(404, 'NOT_FOUND', 'Triage route not found.')
+    }
+    if (url.pathname === '/host/attention-overrides' || url.pathname.startsWith('/host/attention-overrides/')) {
+      const route = url.pathname.slice('/host/attention-overrides'.length)
+      const reply = (value: unknown) => Response.json(value, { headers: safeHeaders })
+      if (request.method === 'GET' && route === '') {
+        const after = url.searchParams.get('after') ?? '0'
+        if ([...url.searchParams.keys()].some(key => key !== 'after') || url.searchParams.getAll('after').length > 1 || !/^\d{1,16}$/.test(after) || !Number.isSafeInteger(Number(after))) return problem(400, 'HOST_CATEGORY_INVALID', 'Invalid category cursor.')
+        return reply(await attentionOverrides.changes(Number(after)))
+      }
+      if (url.search) return problem(400, 'HOST_CATEGORY_INVALID', 'Category input belongs in the JSON body.')
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or POST for category choices.')
+      const input = await jsonBody(request, 'category')
+      if (route === '') return reply(await attentionOverrides.classify(input))
+      if (route === '/lookup' && Object.keys(input).join(',') === 'keys') return reply(await attentionOverrides.lookup(input.keys))
+      const undo = /^\/([a-zA-Z0-9-]{16,80})\/undo$/.exec(route)
+      if (undo && Object.keys(input).length === 0) return reply(await attentionOverrides.undo(undo[1]!))
+      return problem(400, 'HOST_CATEGORY_INVALID', 'Invalid category request.')
     }
     if (url.pathname === '/host/performance') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Performance batches take no query parameters.')
@@ -304,6 +354,17 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       if (request.method === 'POST') return Response.json(await attentionFeedback.record(await jsonBody(request, 'preferences')), { headers: safeHeaders })
       return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use GET or POST for feedback.')
     }
+    if (url.pathname === '/host/zero-sweep' || url.pathname.startsWith('/host/zero-sweep/')) {
+      if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Get me to zero takes no query parameters.')
+      const { zeroSweep } = contextFor(owner), route = url.pathname.slice('/host/zero-sweep'.length)
+      if (route === '' && request.method === 'GET') return Response.json(zeroSweep.recent(), { headers: safeHeaders })
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for Get me to zero.')
+      const input = await jsonBody(request, 'preferences')
+      if (route === '/preview') return Response.json(await zeroSweep.preview(input), { headers: safeHeaders })
+      if (route === '/apply') return Response.json(await zeroSweep.apply(input), { headers: safeHeaders })
+      if (route === '/undo') return Response.json(await zeroSweep.undo(input), { headers: safeHeaders })
+      return problem(404, 'HOST_NOT_FOUND', 'Unknown Get me to zero route.')
+    }
     if (url.pathname === '/host/inbox-preferences') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Inbox preferences take no query parameters.')
       if (request.method === 'GET') return Response.json(await inboxPreferences.read(), { headers: safeHeaders })
@@ -313,22 +374,21 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     if (url.pathname === '/host/config' && request.method === 'GET') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Host configuration takes no query parameters.')
       const connections = await liveInbox.connections(owner)
-      const descriptors: Array<Omit<HostProvider, 'connectionIds'>> = config.mode === 'mock'
-        ? [{ id: 'mock', name: 'Offline mock', connection: 'none', enabled: true, ready: true }]
-        : registrations.map(registration => registration.onboarding)
-      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null,
+      return Response.json({ mode: config.mode, allowProviderWrites: config.allowProviderWrites, performanceLogging: true, aiTriage: aiConfiguration !== null, attentionOverrides: true, inboxWindow: true,
         preferenceScope: createHmac('sha256', runtime.sessionKey).update(`split-preferences:${owner}`).digest('hex'),
-        providers: descriptors.map(provider => ({ ...provider, connectionIds: connections.filter(connection => connection.providerId === provider.id).map(connection => connection.id) })) }, { headers: safeHeaders })
+        providers: registrations.map(({ descriptor }) => ({ ...descriptor, connectionIds: connections.filter(connection => connection.providerId === descriptor.id).map(connection => connection.id) })) }, { headers: safeHeaders })
     }
     const connect = /^\/host\/providers\/([a-z][a-z0-9-]*)\/(?:connect|connections\/([^/]+)\/reconnect)$/.exec(url.pathname)
     if (connect && request.method === 'POST') {
       if (url.search) return problem(400, 'HOST_INVALID_INPUT', 'Connection input belongs in the JSON body.')
-      const provider = registrations.find(provider => provider.onboarding.id === connect[1])
+      const provider = registrations.find(provider => provider.descriptor.id === connect[1])
       if (!provider) return problem(404, 'HOST_PROVIDER_DISABLED', 'This provider is not enabled in the current mode.')
-      if (!provider.onboarding.ready) return problem(409, 'HOST_PROVIDER_NOT_READY', provider.onboarding.setupMessage ?? 'Complete the provider configuration and restart.')
+      if (!provider.descriptor.ready || !provider.connect) return problem(409, 'HOST_PROVIDER_NOT_READY', provider.descriptor.setupMessage ?? 'Complete the provider configuration and restart.')
       const credentials = credentialsFor(provider, await jsonBody(request))
       if (connect[2] && !provider.reconnect) return problem(409, 'HOST_RECONNECT_UNAVAILABLE', 'This provider requires a new authorization flow.')
-      return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
+      try {
+        return Response.json(await (connect[2] ? provider.reconnect!(liveInbox, owner, connect[2], credentials) : provider.connect(liveInbox, owner, credentials, origin!)), { headers: safeHeaders })
+      } catch (error) { throw connectFailure(error, provider.descriptor.name) }
     }
     // Browser credentials go ONLY through the declared host onboarding fields, never raw SDK connection APIs.
     let path: string
@@ -337,9 +397,10 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       request.method === 'PUT' && /^\/v1\/connections\/[^/]+\/credentials$/.test(path)) return problem(403, 'HOST_CONNECT_REQUIRED', 'Use the host provider connection flow, not raw SDK credential input.')
     if (extension) return extension.fetch(request)
     if (url.pathname.startsWith('/v1/')) {
-      // SDK events reauthenticate on every page and the one-second poll, against the
-      // same uncached application session lookup. Revocation also terminates open SSE.
-      const forwarded = url.pathname === '/v1/events' ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
+      // SDK streams reauthenticate each page; events also recheck on idle polls.
+      // Host shutdown must abort snapshot streams as well as open SSE.
+      const streaming = url.pathname === '/v1/events' || url.pathname === '/v1/mailbox-snapshot'
+      const forwarded = streaming ? new Request(request, { signal: AbortSignal.any([request.signal, streamShutdown.signal]) }) : request
       return api.fetch(forwarded)
     }
     return problem(404, 'NOT_FOUND', 'Route not found.')
@@ -377,7 +438,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       sessions.clear()
       streamShutdown.abort()
       return closing = (async () => {
-        await Promise.all([...ownerContexts.values()].map(context => context.senderDomains.close()))
+        await Promise.all([...ownerContexts.values()].flatMap(context => [context.senderDomains.close(), context.inboxWindow.close()]))
         await Promise.allSettled([...pending])
         ownerContexts.clear()
         await aiTriage.close()
