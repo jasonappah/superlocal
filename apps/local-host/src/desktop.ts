@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dlopen, FFIType } from 'bun:ffi'
+import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { loadLocalConfig, LocalConfigurationError, ROOT_DIR, type LocalConfig } from './config'
 import { reportStartupError, startLocalServer } from './index'
@@ -12,52 +13,34 @@ export function createDesktopBootstrap(): string {
 export function acquireInstanceLock(config: LocalConfig): { release(): Promise<void> } {
   const path = join(config.dataDir, config.mode, 'instance.lock')
   mkdirSync(join(config.dataDir, config.mode), { recursive: true, mode: 0o700 })
-  const alive = (pid: number): boolean => {
-    if (!Number.isInteger(pid) || pid < 1 || pid > 2 ** 31 - 1) return false
-    try { process.kill(pid, 0); return true } catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH' }
+  if (process.platform !== 'darwin' && process.platform !== 'linux') throw new LocalConfigurationError('LOCAL_LOCK_UNSUPPORTED', 'Desktop profile locking is unavailable on this platform.')
+  const library = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  })
+  let fd: number | undefined
+  try {
+    fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.uid !== process.getuid?.()) {
+      throw new LocalConfigurationError('LOCAL_FILE_PERMISSIONS', 'The instance lock must be an owner-only regular file, never a symlink or hard link.')
+    }
+    // Keep the inode in place: unlinking a locked file would permit a second owner.
+    if (library.symbols.flock(fd, 2 | 4) !== 0) throw new LocalConfigurationError('LOCAL_INSTANCE_BUSY', 'This Superlocal profile is already served by another local host process. Close it before starting the desktop host.')
+    ftruncateSync(fd, 0)
+    writeFileSync(fd, `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`, 'utf8')
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd)
+    library.close()
+    if (error instanceof LocalConfigurationError) throw error
+    throw new LocalConfigurationError('LOCAL_FILE_PERMISSIONS', 'The instance lock must be an owner-only regular file, never a symlink or hard link.')
   }
-  const readLock = (): { pid?: unknown } => {
-    let fd: number | undefined
-    try {
-      fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
-      const stat = fstatSync(fd)
-      if (!stat.isFile() || stat.size > 1024 || process.platform !== 'win32' &&
-        ((stat.mode & 0o777) !== 0o600 || stat.uid !== process.getuid?.())) throw new Error('permissions')
-      try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(fd))) as { pid?: unknown } } catch { return {} }
-    } catch (error) {
-      throw new LocalConfigurationError('LOCAL_FILE_PERMISSIONS', 'The instance lock must be an owner-only regular file (chmod 600 on Unix), never a symlink. Existing files were not replaced.')
-    } finally { if (fd !== undefined) closeSync(fd) }
-  }
-  let holder: number | undefined
-  for (let attempt = 0; attempt < 3 && holder === undefined; attempt++) {
-    let fd: number | undefined
-    try {
-      fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_SYNC, 0o600)
-      writeFileSync(fd, `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`, 'utf8')
-      holder = process.pid
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        throw new LocalConfigurationError('LOCAL_FILE_CREATE_FAILED', 'Could not create the owner-only instance lock. Existing files were not replaced.')
-      }
-      const saved = readLock()
-      if (typeof saved.pid === 'number' && alive(saved.pid)) {
-        throw new LocalConfigurationError('LOCAL_INSTANCE_BUSY', 'This Superlocal profile is already served by another local host process. Close it before starting the desktop host.')
-      }
-      try { unlinkSync(path) } catch {}
-    } finally { if (fd !== undefined) closeSync(fd) }
-  }
-  if (holder === undefined) {
-    throw new LocalConfigurationError('LOCAL_INSTANCE_BUSY', 'This Superlocal profile is already served by another local host process. Close it before starting the desktop host.')
-  }
-  holder = process.pid
+  let holder: number | undefined = fd
   return {
     async release() {
-      if (holder !== process.pid) { holder = undefined; return }
-      try {
-        const stat = lstatSync(path)
-        if (!stat.isFile() || stat.isSymbolicLink()) return
-        if (readLock().pid === process.pid) unlinkSync(path)
-      } catch {} finally { holder = undefined }
+      if (holder === undefined) return
+      closeSync(holder)
+      holder = undefined
+      library.close()
     },
   }
 }
@@ -159,8 +142,7 @@ export async function runDesktopHost(environment: NodeJS.ProcessEnv = process.en
     let stopping: Promise<void> | undefined
     const stop = () => stopping ??= (async () => {
       deleteDesktopReadiness(config)
-      await lock.release()
-      try { await service.close() } catch { console.error('[LOCAL_SHUTDOWN_FAILED] Desktop host shutdown failed.'); process.exitCode = 1 }
+      try { await service.close(); await lock.release() } catch { console.error('[LOCAL_SHUTDOWN_FAILED] Desktop host shutdown failed.'); process.exitCode = 1 }
     })()
     process.on('SIGINT', stop)
     process.on('SIGTERM', stop)

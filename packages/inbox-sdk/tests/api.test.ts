@@ -1915,20 +1915,29 @@ describe('desktop host lifecycle', () => {
     try { acquireInstanceLock(locked) } catch (error) { second = error }
     expect(codeOf(second)).toBe('LOCAL_INSTANCE_BUSY')
     expect(JSON.parse(await readFile(lockPath, 'utf8'))).toEqual({ pid: process.pid, startedAt: expect.any(String) })
+    // An incomplete diagnostic record is not evidence that its OS lock is free.
+    await writeFile(lockPath, '', { mode: 0o600 })
+    const child = spawnSync(process.execPath, ['--no-env-file', '-e', `
+      import { acquireInstanceLock } from ${JSON.stringify(join(import.meta.dir, '../../../apps/local-host/src/desktop.ts'))};
+      try { acquireInstanceLock(${JSON.stringify(locked)}); process.exit(2) }
+      catch (error) { process.exit(error.code === 'LOCAL_INSTANCE_BUSY' ? 0 : 3) }
+    `])
+    expect(child.status).toBe(0)
+    await first.release()
     const dead = spawnSync('sh', ['-c', 'exit 0']).pid!
     await writeFile(lockPath, JSON.stringify({ pid: dead, startedAt: 'past' }), { mode: 0o600 })
     const takeover = acquireInstanceLock(locked)
     expect(JSON.parse(await readFile(lockPath, 'utf8')).pid).toBe(process.pid)
     await takeover.release()
-    expect((await stat(lockPath).then(() => 'still-exists', (error: NodeJS.ErrnoException) => error.code))).toBe('ENOENT')
+    expect((await stat(lockPath)).isFile()).toBe(true)
+    await unlink(lockPath)
     await symlink(join(locked.dataDir, 'mock', 'other'), lockPath)
     let hostile: unknown
     try { acquireInstanceLock(locked) } catch (error) { hostile = error }
     expect(codeOf(hostile)).toBe('LOCAL_FILE_PERMISSIONS')
     await unlink(lockPath)
     const again = acquireInstanceLock(locked)
-    const afterRelease = await again.release().then(() => stat(lockPath).then(() => 'still-exists', (error: NodeJS.ErrnoException) => error.code))
-    expect(afterRelease).toBe('ENOENT')
+    await again.release()
     await expect(again.release()).resolves.toBeUndefined()
   })
 
