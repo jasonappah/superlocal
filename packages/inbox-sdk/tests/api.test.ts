@@ -3,6 +3,7 @@ import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { DomUtils, parseDocument } from 'htmlparser2'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
@@ -59,7 +60,8 @@ import type {
   ProviderFolder, SendInput, SendResult, SyncContext, SyncCursor, SyncOptions, SyncResult,
 } from '../server/sdk/types'
 
-const TEMP_ROOT = '/private/var/folders/2j/6mslx1715gx8frsyn66sf1sh0000gn/T/opencode'
+const TEMP_ROOT = join(tmpdir(), 'opencode')
+const ensureTempRoot = () => mkdir(TEMP_ROOT, { recursive: true }).catch(() => {})
 const FULL = 'reference-mail'
 const RESTRICTED = 'reference-read-only'
 const DYNAMIC = 'unanticipated-provider-2026'
@@ -99,7 +101,7 @@ describe('offline classification dataset', () => {
   })
 
   test('AI refinement persists blind stages, resumes only failed adjudication and never claims human labels', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'classification-refine-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'classification-refine-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const input: ClassificationInput = { subject: 'Weekly newsletter', bodyText: 'Our weekly digest. Save 20% on a subscription.', from: 'digest@example.test', to: [], cc: [], receivedAt: '2026-09-01T12:00:00Z', bodyTruncated: false, facts: {} }
     const original: Classification = { primaryType: 'newsletter', secondaryTypes: [], actions: [], timeSensitivity: 'none', deadline: null, risk: 'none_observed', riskReasons: [], certainty: 'clear', evidence: [{ dimension: 'primaryType', label: 'newsletter', field: 'bodyText', quote: 'Our weekly digest.' }] }
@@ -206,7 +208,7 @@ describe('offline classification dataset', () => {
       (m: LinearModel) => { m.unicode.word = [[90, 65]] },
       (m: LinearModel) => { m.actions.pay.selection = { method: 'validation', threshold: 0, accepted: 30, precision: 1 } },
     ]) { const malformed = JSON.parse(saved); mutate(malformed); expect(() => validateLinearModel(malformed)).toThrow('CLASSIFIER_LINEAR_MODEL_INVALID') }
-    const root = await mkdtemp(join(TEMP_ROOT, 'classification-policy-cli-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'classification-policy-cli-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const modelPath = join(root, 'model.json'), cliPath = join(import.meta.dir, '../../../apps/local-host/src/classification/cli.ts')
     await writeFile(modelPath, saved, { mode: 0o600 })
@@ -304,7 +306,7 @@ describe('offline classification dataset', () => {
   })
 
   test('snapshots canonical mail read-only, resumes without relabeling, preserves reviews and exports private grouped training data', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'classification-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'classification-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const sourcePath = join(root, 'source.sqlite'), datasetPath = join(root, 'dataset', 'labels.sqlite')
     const writer = new Database(sourcePath)
@@ -455,7 +457,7 @@ describe('offline classification dataset', () => {
 
 describe('Google application authentication', () => {
   async function fixture(allowedEmails = ['allowed@example.test'], gmail = false, mode: 'real' | 'mock' = 'real') {
-    const root = await mkdtemp(join(TEMP_ROOT, 'google-app-auth-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'google-app-auth-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const initial = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     const config: LocalConfig = { ...initial, mode, dataDir: join(root, 'runtime'), auth: { method: 'google', sessionHours: 1, allowedEmails },
@@ -1016,7 +1018,7 @@ describe('Google application authentication', () => {
 
 describe('local performance logging', () => {
   test('the host accepts only authenticated content-free timing batches and stamps private local metadata', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'performance-host-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'performance-host-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
@@ -1065,7 +1067,7 @@ describe('local performance logging', () => {
   })
 
   test('performance logging rotates one bounded private backup and drops excess batches', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'performance-rotation-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'performance-rotation-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
@@ -1094,7 +1096,7 @@ describe('local performance logging', () => {
   })
 
   test('a stalled timing upload and an unwritable sink cannot break host mail reads or shutdown', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'performance-failure-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'performance-failure-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
@@ -1115,7 +1117,7 @@ describe('local performance logging', () => {
 
 describe('Attention baseline and explicit feedback', () => {
   test('application routes persist filtered splits and W/Undo behind the existing host owner/origin boundary', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'attention-host-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'attention-host-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
@@ -1158,7 +1160,7 @@ describe('Attention baseline and explicit feedback', () => {
   })
 
   test('actual offline mock adapter carries newsletter, transaction, and direct evidence through SDK sync', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'attention-mock-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'attention-mock-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const host = await createMockHost({ dataDir: root, encryptionKey: KEY, token: SECRET, allowProviderWrites: false })
     cleanup.push(() => host.close())
@@ -1626,7 +1628,7 @@ describe('explicit non-AI category overrides', () => {
   })
 
   test('category HTTP routes retain session, Origin, bounded JSON, privacy and durable command guards', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'category-host-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'category-host-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     const host = await createLocalHost({ ...config, dataDir: join(root, 'runtime'), allowProviderWrites: false }, {})
@@ -1654,7 +1656,7 @@ describe('explicit non-AI category overrides', () => {
 
 describe('IMAP host onboarding boundary', () => {
   test('fresh checkout stays offline; real iCloud onboarding is explicit, encrypted-SDK-only and endpoint constrained', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'imap-host-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'imap-host-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
     expect(config.mode).toBe('mock')
@@ -1754,7 +1756,7 @@ describe('IMAP host onboarding boundary', () => {
   })
 
   test('onboarding descriptors, configurable provider ids and connect failures derive from SDK definitions, not per-provider host code', async () => {
-    const root = await mkdtemp(join(TEMP_ROOT, 'descriptor-host-'))
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'descriptor-host-'))
     cleanup.push(() => rm(root, { recursive: true, force: true }))
     const configPath = join(root, 'local.json')
     const generated = loadLocalConfig({ configPath, environment: {} })
@@ -2136,7 +2138,7 @@ function cursorValue(cursor: SyncCursor | string | null | undefined) {
 
 async function fixture(options: Partial<InboxOptions> & { googleOAuth?: GoogleOAuthConfig } = {}) {
   const { googleOAuth: _hostGoogle, ...inboxOptions } = options
-  const directory = await mkdtemp(join(TEMP_ROOT, 'inbox-api-'))
+  await ensureTempRoot(); const directory = await mkdtemp(join(TEMP_ROOT, 'inbox-api-'))
   const database = join(directory, 'mail.sqlite')
   const clock = { value: EPOCH }
   const boxes = new Map<string, ReferenceMailbox>()
@@ -2475,6 +2477,10 @@ describe('bounded host inbox window', () => {
   })
 
   test('cold giant conversations with unknown attention stay in Important review, never Other', async () => {
+    // Seed arrivals are EPOCH-relative; pin the wall clock inside the 45-day
+    // Importance window so the Important split stays populated deterministically.
+    const clock = spyOn(Date, 'now').mockReturnValue(EPOCH)
+    cleanup.push(async () => { clock.mockRestore() })
     const h = await fixture(), database = new Database(':memory:')
     await h.seed('alice', 'unknown-window', Array.from({ length: 620 }, (_, index) => native(`unknown-${index}`, {
       threadId: 'one-giant', receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: BODY_SECRET,
@@ -2512,7 +2518,9 @@ describe('bounded host inbox window', () => {
     const mailboxIds = (await h.inbox.mailboxes('alice')).map(box => box.id)
     const summary = (await h.inbox.mailboxMessagePage('alice', { mailboxIds })).items[0]!
     const realAi = createAiTriageService({ database, inbox: h.inbox, configuration: null, sessionKey: KEY })
-    const saved = await realAi.state('alice'), readAt = Date.now()
+    // The seeded arrival is EPOCH-relative; pin the clock to it so the 45-day
+    // Importance window and the hold comparison share one stable reference time.
+    const saved = await realAi.state('alice'), readAt = EPOCH
     const clock = spyOn(Date, 'now').mockReturnValue(readAt), holdUntil = new Date(readAt + 1500).toISOString()
     const pending: AiDecision = { sourceId: account.id, threadId: summary.threadId, revision: 1, settingsRevision: saved.settings.revision,
       state: 'processing', mailboxIds, messageIds: [summary.id], contextVersions: [{ messageId: summary.id, bodyRevision: summary.bodyRevision ?? null }],
@@ -2534,6 +2542,10 @@ describe('bounded host inbox window', () => {
   })
 
   test('long conversation page, detail and capture contexts agree before W and reject later content changes', async () => {
+    // Seed arrivals are EPOCH-relative; pin the wall clock inside the 45-day
+    // Importance window so the Important split stays populated deterministically.
+    const clock = spyOn(Date, 'now').mockReturnValue(EPOCH)
+    cleanup.push(async () => { clock.mockRestore() })
     const h = await fixture(), database = new Database(':memory:')
     const { account, box } = await h.seed('alice', 'long-page-context', Array.from({ length: 120 }, (_, index) => native(`long-context-${index}`, {
       threadId: 'long-context', receivedAt: new Date(EPOCH - index * 1000).toISOString(), bodyText: 'Please confirm the fictional delivery plan.',
@@ -2636,6 +2648,10 @@ describe('bounded host inbox window', () => {
   }, 15000)
 
   test('captured pages make progress across several long conversations without raising the detail-read budget', async () => {
+    // Seed arrivals are EPOCH-relative; pin the wall clock inside the 45-day
+    // Importance window so the Important split stays populated deterministically.
+    const clock = spyOn(Date, 'now').mockReturnValue(EPOCH)
+    cleanup.push(async () => { clock.mockRestore() })
     const h = await fixture(), database = new Database(':memory:')
     await h.seed('alice', 'long-window-capture', Array.from({ length: 6 * 51 }, (_, index) => native(`long-capture-${index}`, {
       threadId: `long-thread-${Math.floor(index / 51)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
@@ -2994,7 +3010,9 @@ describe('bounded host inbox window', () => {
     const service = createInboxWindowService({ database, inbox: guarded, owner: 'alice', ai, sessionKey: KEY, allowProviderWrites: false,
       inboxPreferences: createInboxViewPreferencesStore(database, guarded, 'alice'), splitPreferences: createSplitPreferencesStore(database, 'alice'),
       attentionOverrides: createAttentionOverridesStore(database, guarded, 'alice') })
-    let now = Date.now()
+    // Reconcile with the existing clock pattern: `now` starts at EPOCH so the
+    // EPOCH-relative seed arrivals stay inside the 45-day Importance window.
+    let now = EPOCH
     const started = now, clock = spyOn(Date, 'now').mockImplementation(() => now)
     cleanup.push(async () => { try { await service.close(); await ai.close(); database.close() } finally { clock.mockRestore() } })
     const view: WindowDTO.InboxViewQuery = { account: 'unified', folder: 'Inbox', split: 'Important', search: false, query: '', filter: null }
@@ -3168,6 +3186,10 @@ describe('bounded host inbox window', () => {
 
   test('small selections retain missing IDs and freeze accepted targets rather than including later replies', async () => {
     const h = await fixture()
+    // Seed arrivals are EPOCH-relative; pin the wall clock inside the 45-day
+    // Importance window so the Important split stays populated deterministically.
+    const clock = spyOn(Date, 'now').mockReturnValue(EPOCH)
+    cleanup.push(async () => { clock.mockRestore() })
     const { account, box } = await h.seed('alice', 'window-capture', Array.from({ length: 6 }, (_, index) => native(`capture-${index}`, {
       threadId: `capture-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
     })))
@@ -3213,6 +3235,10 @@ describe('bounded host inbox window', () => {
   }, 15000)
 
   test('Zero persists review exclusions and credits only owned durable Done, W, Other and Later receipts with conditional Undo and partial replay', async () => {
+    // Seed arrivals are EPOCH-relative; pin the wall clock inside the 45-day
+    // Importance window so the review queue and the batch section stay populated.
+    const clock = spyOn(Date, 'now').mockReturnValue(EPOCH)
+    cleanup.push(async () => { clock.mockRestore() })
     const h = await fixture()
     await h.seed('alice', 'window-zero', Array.from({ length: 24 }, (_, index) => native(`zero-${index}`, {
       threadId: `zero-thread-${Math.floor(index / 2)}`, receivedAt: new Date(EPOCH - index * 1000).toISOString(),
@@ -3366,6 +3392,9 @@ describe('bounded host inbox window', () => {
       }
     })(), 'completed capture query becomes disposable')
     const beforeReclamation = await resume()
+    // Advance past the starting query's TTL so its reclamation stays
+    // deterministic under the pinned clock (later opens must not race with it).
+    clock.mockReturnValue(EPOCH + 31 * 60_000)
     for (let index = 0; index < 160; index++) await call('query', { account: 'unified', folder: 'Inbox', split: index % 2 ? 'Other' : 'Important', search: false, query: '', filter: null })
     await expect(call('page', { queryId: first.state.queryId })).rejects.toMatchObject({ code: 'HOST_INBOX_QUERY_EXPIRED', status: 410 })
     expect((await resume()).progress).toEqual(beforeReclamation.progress)
@@ -6245,6 +6274,10 @@ describe('mail HTTP ownership and provider lifecycle', () => {
   })
 
   test('an unknown registered provider works end to end, and unsupported capabilities do not disable local features', async () => {
+    // Seed arrivals are EPOCH-relative; pin the wall clock inside the 45-day
+    // Importance window so the Important split stays populated deterministically.
+    const clock = spyOn(Date, 'now').mockReturnValue(EPOCH)
+    cleanup.push(async () => { clock.mockRestore() })
     const h = await fixture()
     const dynamic = await h.seed('alice', 'dynamic', [native('external')], DYNAMIC)
     const readOnly = await h.seed('alice', 'readonly', [
@@ -12699,7 +12732,7 @@ describe('AI triage inference and local scoring', () => {
     output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: JSON.stringify(request) }] }] }
 
   test('private configuration requires owner-only regular files and exact bounded public allowlists', async () => {
-    const directory = await mkdtemp(join(TEMP_ROOT, 'ai-config-test-'))
+    await ensureTempRoot(); const directory = await mkdtemp(join(TEMP_ROOT, 'ai-config-test-'))
     cleanup.push(() => rm(directory, { recursive: true, force: true }))
     const path = join(directory, 'ai-inference.json')
     expect(loadAiInferenceConfig(path)).toBeNull()

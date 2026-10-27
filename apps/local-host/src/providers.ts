@@ -221,7 +221,6 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
       },
     }
   }
-  }
 
   const imap: Flow = base => {
     const presets: ImapHostPreset[] = [ICLOUD_PRESET, ...config.providers.imap.servers]

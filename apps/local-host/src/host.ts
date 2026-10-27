@@ -61,9 +61,8 @@ async function jsonBody(request: Request, kind: 'connection' | 'preferences' | '
 
 function credentialsFor(provider: HostProviderRegistration, input: Record<string, unknown>): Record<string, string> {
   const invalid = () => new InboxError('HOST_INVALID_CREDENTIALS', 'Only the declared provider credential fields are accepted.', 400)
-function credentialsFor(provider: HostProviderRegistration, input: Record<string, unknown>): Record<string, string> {
-  const invalid = () => new InboxError('HOST_INVALID_CREDENTIALS', 'Only the declared provider credential fields are accepted.', 400)
-  if (provider.descriptor.connection !== 'credentials') {
+  // OAuth providers normally take no browser fields; connections like local Exchange OAuth declare them (an email address) and are validated below.
+  if (provider.descriptor.connection !== 'credentials' && !(provider.descriptor.fields?.length)) {
     if (Object.keys(input).length) throw invalid()
     return {}
   }
