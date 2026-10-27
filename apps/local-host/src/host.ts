@@ -1,9 +1,10 @@
-import { createHmac, randomBytes } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { createMockHost, createMockProviderDefinition, type MockHost } from '@superlocal/mock-api'
 import { createInbox, InboxError, type Inbox } from 'inbox-sdk'
 import { createInboxApi } from 'inbox-sdk/http'
 import { loadLocalConfig, object, type LocalConfig } from './config'
+import { staticAssetResponse } from './desktop'
 import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
 import { connectFailure, createRealRegistrations, describeProvider, type HostExtension, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
@@ -160,6 +161,7 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
   const cookieName = `superlocal_${config.instanceId.replaceAll('-', '')}_${config.mode}`
   const sessions = new Map<string, { expires: number; origin: string }>()
   const cookieHash = (value: string) => createHmac('sha256', runtime.sessionKey).update(value).digest('hex')
+  const desktopBootstrap = config.desktop && config.desktopBootstrapToken ? { token: config.desktopBootstrapToken, used: false } : undefined
   const streamShutdown = new AbortController()
   const pending = new Set<Promise<Response>>()
   let closed = false
@@ -242,7 +244,33 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     let normalized: string
     try { normalized = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch { return problem(400, 'HOST_INVALID_PATH', 'Invalid request path.') }
     if (normalized !== url.pathname && (normalized === '/session' || normalized.startsWith('/api/auth') || normalized.startsWith('/host/auth') || applicationAuth && !!mailboxAuthorization(normalized))) return problem(400, 'HOST_INVALID_PATH', 'Use the exact authentication path.')
+    if (config.desktop && url.pathname === '/' && url.search) {
+      // Desktop OAuth return: the system browser lands on the registered root callback without a host session.
+      for (const registration of registrations) {
+        if (!registration.desktopComplete) continue
+        const response = await registration.desktopComplete(request)
+        if (response) return response
+      }
+    }
     if (url.pathname === '/session') return url.search ? problem(400, 'HOST_INVALID_INPUT', 'Session initialization takes no query parameters.') : session(request)
+    if (config.desktop && url.pathname === '/host/desktop/bootstrap') {
+      if (!desktopBootstrap) return problem(404, 'NOT_FOUND', 'Route not found.')
+      if (request.method !== 'POST') return problem(405, 'HOST_METHOD_NOT_ALLOWED', 'Use POST for the desktop bootstrap.')
+      if (request.headers.get('origin') !== config.web.origin || request.headers.get('x-superlocal') !== '1') {
+        return problem(403, 'DESKTOP_BOOTSTRAP_INVALID', 'The desktop bootstrap request was rejected.')
+      }
+      const input = await jsonBody(request)
+      const token = typeof input.token === 'string' ? input.token : ''
+      if (Object.keys(input).join(',') !== 'token' || token.length === 0 || token.length > 1024 || /[\x00-\x1f\x7f]/.test(token)) {
+        return problem(403, 'DESKTOP_BOOTSTRAP_INVALID', 'The desktop bootstrap request was rejected.')
+      }
+      if (!timingSafeEqual(Buffer.from(cookieHash(token), 'hex'), Buffer.from(cookieHash(desktopBootstrap.token), 'hex'))) {
+        return problem(403, 'DESKTOP_BOOTSTRAP_INVALID', 'The desktop bootstrap request was rejected.')
+      }
+      if (desktopBootstrap.used) return problem(409, 'DESKTOP_BOOTSTRAP_USED', 'Restart the app to sign in with a new bootstrap token.')
+      desktopBootstrap.used = true
+      return session(request)
+    }
     if (url.pathname === '/health' && request.method === 'GET') return Response.json({ ok: true }, { headers: safeHeaders })
     if (url.pathname.startsWith('/api/auth')) return applicationAuth && url.pathname === '/api/auth/callback/google' ? applicationAuth.handle(request) : problem(404, 'NOT_FOUND', 'Route not found.')
     if (url.pathname === '/host/auth' || url.pathname.startsWith('/host/auth/')) {
@@ -251,6 +279,12 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
       if (origin && !origins.has(origin) || request.headers.get('sec-fetch-site') === 'cross-site') return problem(403, 'HOST_ORIGIN_FORBIDDEN', 'This request origin is not permitted.')
       if (url.pathname === '/host/auth' && request.method === 'GET' && !url.search) return Response.json({ method: 'loopback' }, { headers: safeHeaders })
       return problem(404, 'NOT_FOUND', 'Route not found.')
+    }
+    if (config.desktop && config.desktopAssets && request.method === 'GET' && url.pathname !== '/session' && url.pathname !== '/health' &&
+      url.pathname !== '/host/desktop/bootstrap' && !url.pathname.startsWith('/host/') && !url.pathname.startsWith('/api/auth') && !url.pathname.startsWith('/v1/')) {
+      // The built UI loads before any session; unrecognized paths fall through to the host's own routes and 404.
+      const asset = staticAssetResponse(config.desktopAssets, request)
+      if (asset) return asset
     }
     const extension = extensions.find(extension => extension.matches(url.pathname))
     const callback = extension?.callbackPath === url.pathname && request.method === 'GET'

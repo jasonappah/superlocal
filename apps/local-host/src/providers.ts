@@ -61,6 +61,8 @@ export interface HostProviderRegistration {
   connect?(inbox: Inbox, owner: string, credentials: Record<string, string>, origin: string): Promise<ConnectResult>
   reconnect?(inbox: Inbox, owner: string, connectionId: string, credentials: Record<string, string>): Promise<ConnectResult>
   mount?(inbox: Inbox, authenticate: InboxApiOptions['authenticate']): HostExtension
+  /** Desktop-only: unauthenticated root OAuth callback on the single desktop port; undefined falls through to asset serving. */
+  desktopComplete?(request: Request): Promise<Response | undefined>
 }
 
 export interface HostPresets {
@@ -304,6 +306,7 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
       if (!microsoftConfig) throw new InboxError('HOST_PROVIDER_NOT_READY', 'Configure a Microsoft 365 public client ID, then restart.', 409)
       return coordinator ??= createMicrosoftOAuthHost({ inbox, database: runtime.database, encryptionKey: runtime.encryptionKey, config: microsoftConfig })
     }
+    let desktopInbox: Inbox | undefined
     const prepare = (credentials: Record<string, unknown>) => {
       const address = typeof credentials.email === 'string' ? credentials.email.toLowerCase() : ''
       if (!/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(address)) throw new InboxError('HOST_INVALID_CREDENTIALS', 'Enter a valid Microsoft 365 mailbox email.', 400)
@@ -322,9 +325,36 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
     const descriptor: Omit<HostProvider, 'connectionIds'> = { id: 'exchange-imap', name: 'Microsoft 365 / Exchange', connection: 'oauth', enabled: true, ready: !!microsoftConfig,
       actionLabel: 'Sign in with Microsoft', redirectNote: 'You will be sent to Microsoft to approve access, then brought back here while your mail loads.', mailboxSelection: 'automatic', reconnect: true,
       fields: [{ name: 'email', label: 'Microsoft 365 email address', type: 'email', required: true }] }
+    // Minimal navigation pages for the system-browser return: no provider detail, no state echo, never cached.
+    const microsoftDesktopPage = (complete: boolean) => new Response(
+      `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${complete ? 'Sign-in complete' : 'Sign-in not completed'}</title></head>` +
+      `<body><h1>${complete ? 'Sign-in complete' : 'Sign-in not completed'}</h1><p>${complete ? 'You can close this window and start using your mailbox in Superlocal.' : 'This sign-in could not be completed.'}</p>` +
+      `${complete ? '<script>window.close()</script>' : ''}<p><a href="${config.web.origin}/">Open your mailbox in Superlocal</a></p></body></html>`,
+      { headers: { 'Cache-Control': 'no-store', 'Content-Type': 'text/html; charset=utf-8', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' } })
     registrations.push({
       definition,
       descriptor: { ...descriptor, ...(!microsoftConfig ? { setupMessage: 'Set providers.exchangeImap.oauth.clientId in superlocal.local.json, then restart.' } : {}) },
+      async desktopComplete(request) {
+        // Desktop mode serves the built-in browser redirect on the same single port. The system browser lands on the
+        // registered root callback; the attempt row (owner-bound one-time state) is authoritative, and completion still
+        // requires its binding cookie, so only the actual authorizing browser can sign in.
+        const incoming = new URL(request.url)
+        if (request.method !== 'GET' || incoming.pathname !== '/' || incoming.searchParams.getAll('state').length !== 1) return undefined
+        if (incoming.searchParams.getAll('code').length !== 1 && incoming.searchParams.getAll('error').length !== 1) return undefined
+        if (incoming.search.length > 8192) return microsoftDesktopPage(false)
+        const seen = new Set<string>()
+        for (const [key, value] of incoming.searchParams) {
+          if (seen.has(key) || seen.size >= 32 || key.length > 128 || /[\x00-\x1f\x7f]/.test(key) || value.length > 8192 || /[\x00-\x1f\x7f]/.test(value)) {
+            return microsoftDesktopPage(false)
+          }
+          seen.add(key)
+        }
+        if (!desktopInbox) return microsoftDesktopPage(false)
+        try {
+          await oauth(desktopInbox).complete(incoming.href, request.headers.get('cookie') ?? '')
+          return microsoftDesktopPage(true)
+        } catch { return microsoftDesktopPage(false) }
+      },
       async connect(inbox, owner, credentials, origin) {
         if (origin !== config.web.origin) throw new InboxError('HOST_OAUTH_ORIGIN_REQUIRED', 'Open the configured web.origin before starting OAuth.', 409)
         const attempt = await oauth(inbox).start(owner, { email: prepare(credentials) })
@@ -335,6 +365,7 @@ export function createRealRegistrations(config: LocalConfig, runtime: ReturnType
         return { authorizeUrl: attempt.authorizeUrl! }
       },
       mount(inbox, authenticate) {
+        desktopInbox = inbox
         const api = createMicrosoftOAuthApi({ oauth: () => oauth(inbox), authenticate })
         return { callbackPath: '/host/providers/exchange-imap/callback', matches: path => path.startsWith('/v1/oauth/microsoft/') || path === '/host/providers/exchange-imap/callback',
           async fetch(request) {

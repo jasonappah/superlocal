@@ -30,6 +30,11 @@ export interface LocalConfig {
   web: { port: number; origin: string; allowedOrigins: string[] }
   backend: { port: number }
   auth: { method: 'loopback' | 'google'; sessionHours: number; allowedEmails?: string[] }
+  /** Desktop mode from `SUPERLOCAL_DESKTOP=1` only: one loopback port serves both the built UI and the API. Never stored in the config file. */
+  desktop: boolean
+  /** Set by the desktop host: one-time bootstrap token and the built UI asset directory. Never stored in the config file. */
+  desktopBootstrapToken?: string
+  desktopAssets?: string | null
   allowProviderWrites: boolean
   providers: {
     mock: ProviderConfig
@@ -234,7 +239,9 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   return {
     configPath, instanceId: input.instanceId, mode: input.mode, dataDir,
     web: { port: webPort, origin: webOrigin, allowedOrigins: authMethod === 'google' ? [webOrigin] : [...new Set([webOrigin, `http://localhost:${webPort}`, `http://127.0.0.1:${webPort}`, ...allowedOrigins])] },
-    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails }, allowProviderWrites: policy[input.mode],
+    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails },
+    desktop: environment.SUPERLOCAL_DESKTOP === '1', desktopBootstrapToken: undefined, desktopAssets: null,
+    allowProviderWrites: policy[input.mode],
     providers: { ...others, mock: { enabled: enabledMock }, inbound: { enabled: bool(inbound.enabled, 'providers.inbound.enabled') },
       imap: { enabled: bool(imap.enabled, 'providers.imap.enabled'), servers: imapServers }, gmail: {
       enabled: bool(gmail.enabled, 'providers.gmail.enabled'), oauth: {

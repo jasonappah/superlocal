@@ -3,8 +3,9 @@ import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { DomUtils, parseDocument } from 'htmlparser2'
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { SaxesParser } from 'saxes'
@@ -19,7 +20,8 @@ import { createGoogleOAuthApi } from '../server/google-oauth-api'
 import { createGoogleOAuthClient } from '../server/google-client'
 import { createMicrosoftOAuthCoordinator } from '../server/microsoft-oauth'
 import { createLocalHost } from '../../../apps/local-host/src/host'
-import { loadLocalConfig, type LocalConfig } from '../../../apps/local-host/src/config'
+import { loadLocalConfig, LocalConfigurationError, type LocalConfig } from '../../../apps/local-host/src/config'
+import { acquireInstanceLock, createDesktopBootstrap } from '../../../apps/local-host/src/desktop'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
 import { createAttentionOverridesStore, CATEGORY_STORAGE_LIMITS } from '../../../apps/local-host/src/attention-overrides'
 import { isCategoryCommand, isCategoryEntry, type CategoryCommand, type CategoryContext, type CategoryEntry } from '../../../apps/shared/attention-overrides'
@@ -1840,6 +1842,169 @@ describe('IMAP host onboarding boundary', () => {
       expect((await (await host.fetch(new Request(`${base}/host/providers/outlook/connect`, { method: 'POST', headers, body: '{}' }))).json()).code).toBe('HOST_PROVIDER_NOT_READY')
       expect((await host.fetch(new Request(`${base}/host/providers/fastmail/connect`, { method: 'POST', headers, body: '{}' }))).status).toBe(404)
     } finally { host.inbox.createConnection = original }
+  })
+})
+
+describe('desktop host lifecycle', () => {
+  /** Desktop-derived config shape: same single loopback port for web + API, no stored desktop keys. */
+  async function desktopFixture(root: string, exchangeImap = false, bootstrapToken = createDesktopBootstrap(), assets: string | null = null) {
+    await ensureTempRoot()
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const port = config.backend.port
+    const host = await createLocalHost({
+      ...config, mode: 'real', dataDir: join(root, 'runtime'), desktop: true, desktopAssets: assets, desktopBootstrapToken: bootstrapToken,
+      web: { port, origin: `http://localhost:${port}`, allowedOrigins: [`http://localhost:${port}`, `http://127.0.0.1:${port}`] },
+      providers: {
+        ...config.providers, ...(exchangeImap ? { exchangeImap: { enabled: true, oauth: {
+          clientId: '9e5f94bc-e8a4-4e73-b8be-63364c29d753',
+          scopes: ['https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access'],
+        } } } : {}),
+      },
+    }, {})
+    cleanup.push(() => host.close())
+    return { host, base: `http://localhost:${port}`, origin: `http://localhost:${port}`, port, bootstrapToken }
+  }
+
+  test('desktop bootstrap mints a standard loopback session exactly once and fails closed on replay, hostile origin and wrong token', async () => {
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-boot-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const { host, base, origin, bootstrapToken } = await desktopFixture(root)
+    expect(bootstrapToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    const bootstrap = async (body: unknown, overrides: Record<string, string> = {}) =>
+      host.fetch(new Request(`${base}/host/desktop/bootstrap`, { method: 'POST', headers:
+        { Origin: origin, 'X-Superlocal': '1', 'Content-Type': 'application/json', ...overrides }, body: JSON.stringify(body) }))
+    const session = async () => await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    expect((await session()).headers.get('set-cookie')).toBeTruthy()
+    const ok = await bootstrap({ token: bootstrapToken })
+    expect(ok.status).toBe(204)
+    const cookie = ok.headers.get('set-cookie')!.split(';')[0]!
+    expect(cookie).toMatch(/^superlocal_/)
+    const me = await host.fetch(new Request(`${base}/host/config`, { headers: { Origin: origin, Cookie: cookie } }))
+    expect(me.status).toBe(200)
+    const replay = await bootstrap({ token: bootstrapToken })
+    expect(replay.status).toBe(409)
+    expect((await replay.json() as { code: string }).code).toBe('DESKTOP_BOOTSTRAP_USED')
+    const hostile = await bootstrap({ token: bootstrapToken }, { Origin: 'http://evil.example' })
+    expect(hostile.status).toBe(403)
+    expect(hostile.headers.get('set-cookie')).toBeNull()
+    const wrong = await bootstrap({ token: 'B'.repeat(43) })
+    expect(wrong.status).toBe(403)
+    expect((await wrong.json() as { code: string }).code).toBe('DESKTOP_BOOTSTRAP_INVALID')
+    expect(wrong.headers.get('set-cookie')).toBeNull()
+    expect((await bootstrap({ token: bootstrapToken, extra: true })).status).toBe(403)
+    expect((await bootstrap({ token: '' })).status).toBe(403)
+    expect((await bootstrap({})).status).toBe(403)
+    const empty = await host.fetch(new Request(`${base}/host/desktop/bootstrap`, { method: 'POST',
+      headers: { Origin: origin, 'X-Superlocal': '1', 'Content-Type': 'application/json' }, body: '' }))
+    expect(empty.status).toBe(400)
+    expect((await host.fetch(new Request(`${base}/host/desktop/bootstrap`, { headers: { Origin: origin, 'X-Superlocal': '1' } }))).status).toBe(405)
+    expect((await session()).status).toBe(204)
+  })
+
+  test('desktop instance lock rejects a live second writer, takes over a dead one, refuses symlinks and releases idempotently', async () => {
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-lock-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: {} })
+    const locked = { ...config, dataDir: join(root, 'data') }
+    const lockPath = join(locked.dataDir, 'mock', 'instance.lock')
+    const codeOf = (error: unknown) => error instanceof LocalConfigurationError ? error.code : null
+    const first = acquireInstanceLock(locked)
+    let second: unknown
+    try { acquireInstanceLock(locked) } catch (error) { second = error }
+    expect(codeOf(second)).toBe('LOCAL_INSTANCE_BUSY')
+    expect(JSON.parse(await readFile(lockPath, 'utf8'))).toEqual({ pid: process.pid, startedAt: expect.any(String) })
+    const dead = spawnSync('sh', ['-c', 'exit 0']).pid!
+    await writeFile(lockPath, JSON.stringify({ pid: dead, startedAt: 'past' }), { mode: 0o600 })
+    const takeover = acquireInstanceLock(locked)
+    expect(JSON.parse(await readFile(lockPath, 'utf8')).pid).toBe(process.pid)
+    await takeover.release()
+    expect((await stat(lockPath).then(() => 'still-exists', (error: NodeJS.ErrnoException) => error.code))).toBe('ENOENT')
+    await symlink(join(locked.dataDir, 'mock', 'other'), lockPath)
+    let hostile: unknown
+    try { acquireInstanceLock(locked) } catch (error) { hostile = error }
+    expect(codeOf(hostile)).toBe('LOCAL_FILE_PERMISSIONS')
+    await unlink(lockPath)
+    const again = acquireInstanceLock(locked)
+    const afterRelease = await again.release().then(() => stat(lockPath).then(() => 'still-exists', (error: NodeJS.ErrnoException) => error.code))
+    expect(afterRelease).toBe('ENOENT')
+    await expect(again.release()).resolves.toBeUndefined()
+  })
+
+  test('desktop static assets stay inside the dist directory with private caching boundaries and fall through elsewhere', async () => {
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-assets-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const dist = join(root, 'dist')
+    await mkdir(join(dist, 'assets'), { recursive: true })
+    for (const [name, content] of [['index.html', '<p>desktop-fixture</p>'], ['favicon.svg', '<svg/>'], ['fonts.css', ''], [join('assets', 'index-abc.js'), 'console.log(1)']] as const) {
+      await writeFile(join(dist, name), content, { mode: 0o700 })
+    }
+    await writeFile(join(root, 'secret.txt'), 'outside-desktop-secret', { mode: 0o700 })
+    const { host, base } = await desktopFixture(root, false, 'C'.repeat(43), dist)
+    const index = await host.fetch(new Request(`${base}/`))
+    expect(index.status).toBe(200)
+    expect(await index.text()).toContain('desktop-fixture')
+    expect(index.headers.get('content-type')).toContain('text/html')
+    expect(index.headers.get('cache-control')).toBe('no-store')
+    expect(index.headers.get('x-content-type-options')).toBe('nosniff')
+    expect(index.headers.get('content-security-policy')).toContain("default-src 'self'")
+    const script = await host.fetch(new Request(`${base}/assets/index-abc.js`))
+    expect(script.status).toBe(200)
+    expect(script.headers.get('cache-control')).toBe('public, max-age=31536000, immutable')
+    expect(script.headers.get('content-type')).toBe('text/javascript')
+    for (const path of ['/assets/..%2fsecret.txt', '/assets/%2e%2e/secret.txt', '/assets/../secret.txt']) {
+      const response = await host.fetch(new Request(`${base}${path}`))
+      expect(await response.text()).not.toContain('outside-desktop-secret')
+      expect(response.status).not.toBe(200)
+    }
+    expect((await host.fetch(new Request(`${base}/fonts.css`))).status).toBe(200)
+    expect((await host.fetch(new Request(`${base}/fonts.css`))).headers.get('cache-control')).toBe('max-age=3600')
+    const session = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: base, 'X-Superlocal': '1' } }))
+    const cookie = session.headers.get('set-cookie')!.split(';')[0]!
+    const missing = await host.fetch(new Request(`${base}/assets/nonexistent.js`, { headers: { Cookie: cookie } }))
+    expect(missing.status).toBe(404)
+    expect((missing.headers.get('content-type') ?? '')).toContain('json')
+    expect((await host.fetch(new Request('http://evil:9999/')).then(response => response.json() as Promise<{ code: string }>)).code).toBe('HOST_LOOPBACK_REQUIRED')
+  })
+
+  test('desktop Microsoft OAuth callback completes on the root without WebView cookies and fails closed generically', async () => {
+    await ensureTempRoot(); const root = await mkdtemp(join(TEMP_ROOT, 'desktop-oauth-'))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const { host, base, origin } = await desktopFixture(root, true)
+    const bogus = await host.fetch(new Request(`${base}/?code=x&state=y`))
+    expect(bogus.status).toBe(200)
+    expect(bogus.headers.get('content-type')).toContain('text/html')
+    expect(bogus.headers.get('cache-control')).toBe('no-store')
+    const failed = await bogus.text()
+    expect(failed).toContain('This sign-in could not be completed.')
+    expect(failed).not.toContain('state=y')
+    expect(failed).not.toContain('code=x')
+    expect(await host.inbox.accounts(host.owner)).toEqual([])
+    const started = await host.fetch(new Request(`${base}/session`, { method: 'POST', headers: { Origin: origin, 'X-Superlocal': '1' } }))
+    const cookie = started.headers.get('set-cookie')!.split(';')[0]!
+    const headers = { Origin: origin, Cookie: cookie, 'Content-Type': 'application/json' }
+    const connect = await host.fetch(new Request(`${base}/host/providers/exchange-imap/connect`, { method: 'POST', headers, body: JSON.stringify({ credentials: { email: 'reader@utdallas.edu' } }) }))
+    expect(connect.status).toBe(200)
+    const authorize = await host.fetch(new Request((await connect.json() as { authorizeUrl: string }).authorizeUrl, { headers: { Cookie: cookie } }))
+    expect(authorize.status).toBe(302)
+    const state = new URL(authorize.headers.get('location')!).searchParams.get('state')!
+    const denied = await host.fetch(new Request(`${base}/?error=access_denied&state=${state}`))
+    expect(denied.status).toBe(200)
+    const deniedBody = await denied.text()
+    expect(deniedBody).toContain('This sign-in could not be completed.')
+    expect(deniedBody).not.toContain(state)
+    expect(authorize.headers.get('set-cookie')).toBeTruthy()
+    expect(await host.inbox.accounts(host.owner)).toEqual([])
+    // Same root callback in hosted/browser mode: no desktop handler, one loopback-only problem response.
+    const config = loadLocalConfig({ configPath: join(root, 'local2.json'), environment: {} })
+    const port = config.backend.port
+    const hostedHost = await createLocalHost({ ...config, mode: 'real', dataDir: join(root, 'hosted-runtime'), desktop: false, desktopAssets: null,
+      web: { port, origin: `http://localhost:${port}`, allowedOrigins: [`http://localhost:${port}`, `http://127.0.0.1:${port}`] },
+      providers: { ...config.providers, exchangeImap: { enabled: true, oauth: { clientId: '9e5f94bc-e8a4-4e73-b8be-63364c29d753', scopes: ['https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access'] } } } }, {})
+    cleanup.push(() => hostedHost.close())
+    const hostedResponse = await hostedHost.fetch(new Request(`http://localhost:${port}/?code=x&state=y`))
+    const hostedBody = await hostedResponse.text()
+    expect(hostedResponse.status).toBeGreaterThanOrEqual(400)
+    expect(hostedBody).not.toContain('Sign-in')
   })
 })
 

@@ -1,4 +1,5 @@
 import { LocalConfigurationError, loadLocalConfig, type LocalConfig } from './config'
+import { runDesktopHost } from './desktop'
 import { createLocalHost } from './host'
 
 export { createLocalHost } from './host'
@@ -38,11 +39,14 @@ export async function startLocalServer(config: LocalConfig = loadLocalConfig()) 
 }
 
 if (import.meta.main) {
-  try {
-    const service = await startLocalServer()
-    const stop = () => { void service.close().catch(() => { console.error('[LOCAL_SHUTDOWN_FAILED] Local host shutdown failed.'); process.exitCode = 1 }) }
-    process.on('SIGINT', stop)
-    process.on('SIGTERM', stop)
-    console.info(`Local ${service.host.config.mode} host: http://127.0.0.1:${service.server.port}`)
-  } catch (error) { reportStartupError(error); process.exitCode = 1 }
+  if (process.env.SUPERLOCAL_DESKTOP === '1') await runDesktopHost()
+  else {
+    try {
+      const service = await startLocalServer()
+      const stop = () => { void service.close().catch(() => { console.error('[LOCAL_SHUTDOWN_FAILED] Local host shutdown failed.'); process.exitCode = 1 }) }
+      process.on('SIGINT', stop)
+      process.on('SIGTERM', stop)
+      console.info(`Local ${service.host.config.mode} host: http://127.0.0.1:${service.server.port}`)
+    } catch (error) { reportStartupError(error); process.exitCode = 1 }
+  }
 }
