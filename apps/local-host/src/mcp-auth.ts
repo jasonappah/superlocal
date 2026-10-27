@@ -44,6 +44,7 @@ export function createMcpGrants(config: LocalConfig, runtime: { database: Databa
   })
 
   function create(creator: string, rawName: string, scope: McpScope): { id: string; token: string } {
+    if (config.auth.method !== 'loopback') throw new InboxError('MCP_AUTH_UNSUPPORTED', 'MCP grants require a loopback-authenticated profile.', 403)
     if (creator !== owner) throw new InboxError('MCP_OWNER_MISMATCH', 'MCP grants are created for this installation\'s single owner only.', 400)
     if (typeof rawName !== 'string') throw new InboxError('MCP_NAME_INVALID', 'A grant name between 1 and 80 visible characters is required.', 400)
     const name = rawName.trim()
@@ -76,6 +77,7 @@ export function createMcpGrants(config: LocalConfig, runtime: { database: Databa
   }
 
   async function authenticate(token: string): Promise<McpGrantAuth | undefined> {
+    if (config.auth.method !== 'loopback') return undefined
     if (typeof token !== 'string' || token.length !== TOKEN_PREFIX.length + 32 || !token.startsWith(TOKEN_PREFIX) ||
       !new RegExp(`^${TOKEN_PREFIX}${TOKEN_BODY}$`).test(token)) return undefined
     const hash = createHash('sha256').update(token).digest('hex')

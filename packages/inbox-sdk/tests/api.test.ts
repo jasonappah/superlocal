@@ -15185,6 +15185,9 @@ describe('owner-bound MCP grants and stdio adapter', () => {
     expect(realGrants.owner).toBe(`local:${real.config.instanceId}`)
     const realToken = realGrants.create(realGrants.owner, 'real-owner-grant', 'read').token
     expect((await real.bearer(realToken, '/v1/accounts')).status).toBe(200)
+    const restricted = createMcpGrants({ ...real.config, auth: { ...real.config.auth, method: 'google' } }, { database: real.grantsDb() })
+    expect(() => restricted.create(restricted.owner, 'restricted', 'read')).toThrow()
+    expect(await restricted.authenticate(realToken)).toBeUndefined()
     expect((await a.bearer(realToken, '/v1/mailboxes')).status).toBe(401)
     expect((await real.bearer(foreigner, '/v1/mailboxes')).status).toBe(401)
     writable.close()

@@ -16,6 +16,10 @@ installation does not exist on any other installation, rows created for a
 different owner are refused at authentication time, and revocation takes
 effect immediately on the next request.
 
+MCP grants currently require a loopback-authenticated profile. Restricted
+Google-auth profiles cannot create or use grants until owner eligibility can
+be checked against the authenticated application's authorization policy.
+
 A token looks like `superlocal_mcp_` plus 32 unpadded base64url characters
 (24 random bytes). It is shown exactly once, at creation. Only a SHA-256
 digest is stored, so a lost token cannot be recovered — revoke it and issue a
