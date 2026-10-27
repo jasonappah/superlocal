@@ -22,6 +22,8 @@ import { createMicrosoftOAuthCoordinator } from '../server/microsoft-oauth'
 import { createLocalHost } from '../../../apps/local-host/src/host'
 import { loadLocalConfig, LocalConfigurationError, type LocalConfig } from '../../../apps/local-host/src/config'
 import { acquireInstanceLock, createDesktopBootstrap } from '../../../apps/local-host/src/desktop'
+import { createMcpGrants, createMcpMount } from '../../../apps/local-host/src/mcp-auth'
+import { callSuperlocalTool, TOOL_CATALOG } from '../../../apps/mcp/src/tools'
 import { createAttentionFeedbackStore } from '../../../apps/local-host/src/attention-feedback'
 import { createAttentionOverridesStore, CATEGORY_STORAGE_LIMITS } from '../../../apps/local-host/src/attention-overrides'
 import { isCategoryCommand, isCategoryEntry, type CategoryCommand, type CategoryContext, type CategoryEntry } from '../../../apps/shared/attention-overrides'
@@ -14955,5 +14957,335 @@ describe('AI triage service', () => {
     expect(decisions).toHaveLength(33)
     expect(decisions.every(item => item.state === 'ready')).toBe(true)
     expect(calls).toBe(33)
+  })
+})
+
+describe('owner-bound MCP grants and stdio adapter', () => {
+  const MCP_ADMIN = join(import.meta.dir, '../../../apps/local-host/src/mcp-admin.ts')
+  const MCP_ADAPTER = join(import.meta.dir, '../../../apps/mcp/src/index.ts')
+
+  /** A mock (or provider-less real) instance on a private loopback port, with fictional seeded mail. */
+  async function fixture(name: string, options: { mode?: 'mock' | 'real' } = {}) {
+    await ensureTempRoot()
+    const root = await mkdtemp(join(TEMP_ROOT, `mcp-${name}-`))
+    cleanup.push(() => rm(root, { recursive: true, force: true }))
+    const config = loadLocalConfig({ configPath: join(root, 'local.json'), environment: { SUPERLOCAL_API_PORT: String(45000 + Math.floor(Math.random() * 15000)) } })
+    const runtimeDir = join(root, 'runtime')
+    const mode = options.mode ?? 'mock'
+    let host = await createLocalHost({ ...config, mode: options.mode ?? 'mock', dataDir: runtimeDir }, {})
+    cleanup.push(() => host.close())
+    // Real loopback serving for client-backed tools: the adapter never talks through test stubs.
+    const server = Bun.serve({ hostname: '127.0.0.1', port: config.backend.port, fetch: request => host.fetch(request) })
+    cleanup.push(() => server.stop(true))
+    const url = `http://localhost:${config.backend.port}`
+    const bearer = (token: string, path: string, init: RequestInit = {}) =>
+      host.fetch(new Request(`${url}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init.headers } }))
+    const cli = async (args: string[]) => {
+      const admin = Bun.spawn([process.execPath, '--no-env-file', MCP_ADMIN, ...args], {
+        stdout: 'pipe', stderr: 'pipe', env: { ...Bun.env, SUPERLOCAL_CONFIG: config.configPath, SUPERLOCAL_DATA_DIR: runtimeDir } })
+      return { code: await admin.exited, out: await new Response(admin.stdout).text(), err: await new Response(admin.stderr).text() }
+    }
+    const grant = async (label: string, scope: 'read' | 'write') =>
+      JSON.parse((await cli(['grant', '--name', label, ...(scope === 'write' ? ['--write'] : []), '--json'])).out.trim())
+    const tool = (token: string, name: string, input: unknown) =>
+      callSuperlocalTool({ client: createInboxClient({ baseUrl: url, headers: { Authorization: `Bearer ${token}` } }) }, name, input)
+    const call = async (token: string, name: string, input: unknown) => {
+      const result = await tool(token, name, input)
+      return JSON.parse(result.content[0]!.text) as Record<string, any>
+    }
+    return {
+      root, config, url, instanceId: config.instanceId,
+      get host() { return host },
+      bearer, cli, tool, call, grant,
+      /** The grants ledger with an independent writable connection for direct-store probes. */
+      grantsDb() { return new Database(join(runtimeDir, mode, 'host.sqlite')) },
+      async restart(next: LocalConfig = config) { await host.close(); host = await createLocalHost({ ...next, mode, dataDir: runtimeDir }, {}) },
+    }
+  }
+
+  test('grant lifecycle via the admin CLI: token shape, single-use exposure, list without tokens, instant revocation', async () => {
+    const r = await fixture('claims')
+    expect(r.config.auth.method).toBe('loopback')
+    const write = await r.grant('fixture-write-token', 'write')
+    const read = await r.grant('fixture-read-token', 'read')
+    for (const [created, scope] of [[write, 'write'], [read, 'read']] as const) {
+      expect(created.token).toMatch(/^superlocal_mcp_[A-Za-z0-9_-]{32}$/)
+      expect(created.scope).toBe(scope)
+      expect(String(created.id)).toMatch(/^mcp_[0-9a-f]{16}$/)
+    }
+    // Normal grants (owner = the instance owner) authenticate immediately.
+    expect((await r.bearer(write.token, '/v1/mailboxes')).status).toBe(200)
+    const revoked = await r.cli(['revoke', write.id, '--json'])
+    expect(revoked.code).toBe(0)
+    expect(JSON.parse(revoked.out)).toEqual({ id: write.id, revoked: true })
+    const denied = await r.bearer(write.token, '/v1/mailboxes')
+    expect(denied.status).toBe(401)
+    expect((await denied.json()).code).toBe('MCP_GRANT_INVALID')
+    // Listing never exposes tokens and reflects revocation; the CLI reports unknown ids cleanly.
+    const listing = JSON.parse((await r.cli(['list', '--json'])).out)
+    expect(listing.map((entry: { name: string }) => entry.name).sort()).toEqual(['fixture-read-token', 'fixture-write-token'])
+    expect(listing.find((entry: { name: string }) => entry.name === 'fixture-read-token')?.revokedAt).toBeNull()
+    expect(typeof listing.find((entry: { name: string }) => entry.name === 'fixture-write-token')?.revokedAt).toBe('number')
+    expect(JSON.stringify(listing)).not.toMatch(/superlocal_mcp_[A-Za-z0-9_-]{32}/)
+    const unknown = await r.cli(['revoke', 'mcp_0000000000000000', '--json'])
+    expect(unknown.code).toBe(1)
+    expect(unknown.err.trim()).toBe('MCP_GRANT_NOT_FOUND')
+  })
+
+  test('cross-owner and wrong-instance grants are denied; the owner is bound to the installation', async () => {
+    const a = await fixture('owner-a')
+    const b = await fixture('owner-b')
+    expect(a.instanceId).not.toBe(b.instanceId)
+    const foreigner = (await a.grant('foreign-copy', 'write')).token
+    // A token issued by one installation is not a token anywhere else: separate ledger.
+    const stolen = await b.bearer(foreigner, '/v1/mailboxes')
+    expect(stolen.status).toBe(401)
+    expect((await stolen.json()).code).toBe('MCP_GRANT_INVALID')
+    // A foreign row injected into this store (a leftover from another owner or a mode change) fails closed.
+    const hostileToken = `superlocal_mcp_${'b'.repeat(32)}`
+    const store = a.grantsDb()
+    store.query('INSERT INTO local_mcp_grants (id, owner, name, scope, token_hash, created_at) VALUES (?,?,?,?,?,?)')
+      .run(`mcp_${'0'.repeat(16)}`, 'attacker@elsewhere.test', 'hostile', 'write', createHash('sha256').update(hostileToken).digest('hex'), Date.now())
+    store.close()
+    expect((await a.bearer(hostileToken, '/v1/mailboxes')).status).toBe(401)
+    // The factory itself refuses cross-owner creation and unprovided scopes.
+    const writable = a.grantsDb()
+    const direct = createMcpGrants(a.config, { database: writable })
+    expect(direct.owner).toBe('superlocal-mock')
+    await expect(Promise.resolve().then(() => direct.create('attacker@elsewhere.test', 'foreign', 'write'))).rejects.toMatchObject({ code: 'MCP_OWNER_MISMATCH' })
+    expect(() => direct.create(direct.owner, 'bad-scope', 'admin' as never)).toThrow()
+    // Real instances bind the instance identity instead of the mock owner, and the two never cross.
+    const real = await fixture('owner-real', { mode: 'real' })
+    const realGrants = createMcpGrants({ ...real.config, mode: 'real' }, { database: real.grantsDb() })
+    expect(realGrants.owner).toBe(`local:${real.config.instanceId}`)
+    const realToken = realGrants.create(realGrants.owner, 'real-owner-grant', 'read').token
+    expect((await real.bearer(realToken, '/v1/accounts')).status).toBe(200)
+    expect((await a.bearer(realToken, '/v1/mailboxes')).status).toBe(401)
+    expect((await real.bearer(foreigner, '/v1/mailboxes')).status).toBe(401)
+    writable.close()
+  })
+
+  test('read scopes cannot write, non-API and encoded paths stay denied, and browser session auth is unchanged', async () => {
+    const r = await fixture('scopes')
+    const read = await r.grant('reader', 'read')
+    const write = await r.grant('editor', 'write')
+    expect((await r.bearer(read.token, '/v1/drafts')).status).toBe(200)
+    const writeDenied = await r.bearer(read.token, '/v1/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    expect(writeDenied.status).toBe(403)
+    expect((await writeDenied.json()).code).toBe('MCP_OPERATION_FORBIDDEN')
+    // A write grant passes the gate and reaches normal SDK validation inside the API.
+    const drafted = await r.bearer(write.token, '/v1/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    expect(drafted.status).toBe(400)
+    // Non-allowlisted routes and encoded path aliases stay denied even with write scope.
+    expect((await r.bearer(write.token, '/v1/messages/demo/media/demo')).status).toBe(403)
+    expect((await r.bearer(write.token, '/v1/%64rafts')).status).toBe(403)
+    expect((await r.bearer(write.token, '/host/providers/outlook/connect', { method: 'POST' })).status).toBe(403)
+    // Without a MCP bearer, the browser contract is exactly as before MCP existed.
+    const anonymous = await r.host.fetch(new Request(`${r.url}/v1/mailboxes`))
+    expect(anonymous.status).toBe(401)
+    expect((await anonymous.json()).code).toBe('UNAUTHENTICATED')
+    const session = await r.host.fetch(new Request(`${r.url}/session`, { method: 'POST', headers: { Origin: r.config.web.origin, 'X-Superlocal': '1' } }))
+    expect(session.status).toBe(204)
+    const cookie = session.headers.get('set-cookie')!.split(';')[0]!
+    expect((await r.host.fetch(new Request(`${r.url}/v1/mailboxes`, { headers: { Cookie: cookie } }))).status).toBe(200)
+  })
+
+  test('results and request bodies are bounded per list and per byte, with explicit truncation and no body content', async () => {
+    const r = await fixture('bounds')
+    const write = await r.grant('bounded-writer', 'write')
+    const mailboxes = await r.call(write.token, 'list_mailboxes', {})
+    expect(mailboxes.ok).toBe(true)
+    // Oversized forwarded bodies are refused by declared length and by actual read.
+    const declared = await r.bearer(write.token, '/v1/mailbox-conversations', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 10, query: 'x'.repeat(300 * 1024) }) })
+    expect(declared.status).toBe(413)
+    expect((await declared.json()).code).toBe('MCP_BODY_TOO_LARGE')
+    // Tight unit caps prove both directions: fat bodies rejected, results not streamed past the limit.
+    const tight = createMcpMount({
+      grants: createMcpGrants(r.config, { database: r.grantsDb() }),
+      api: { fetch: request => r.host.fetch(request) }, bodyLimitBytes: 32, resultLimitBytes: 1 })
+    const fat = await tight.fetch(new Request(`${r.url}/v1/mailbox-conversations`, {
+      method: 'POST', headers: { Authorization: `Bearer ${write.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mailboxIds: [String(mailboxes.items[0].id)], limit: 10 }) }))
+    expect(fat?.status).toBe(413)
+    const fatParsed = (await fat?.json()) as { code: string }
+    expect(fatParsed.code).toBe('MCP_BODY_TOO_LARGE')
+    const anyResult = await tight.fetch(new Request(`${r.url}/v1/mailboxes`, { headers: { Authorization: `Bearer ${write.token}` } }))
+    expect(anyResult?.status).toBe(503)
+    expect(((await anyResult?.json()) as { code: string }).code).toBe('MCP_RESULT_TOO_LARGE')
+    // Successful mounts are uncacheable and never echo sizes back to the MCP client.
+    const listed = await r.bearer(write.token, '/v1/mailboxes')
+    expect(listed.headers.get('cache-control')).toBe('no-store')
+    expect(listed.headers.get('content-length')).toBeNull()
+    // List bounding on real fictional mail: absurd limits clamp, and truncation is explicit.
+    const everything = await r.call(write.token, 'list_recent', { limit: 4096 })
+    expect(everything.items.length).toBeLessThanOrEqual(50)
+    expect(everything.truncated).toBe(true)
+    const sampled = await r.call(write.token, 'search_mail', { query: 'the', limit: 3 })
+    expect(sampled.ok).toBe(true)
+    expect(sampled.items.length).toBeLessThanOrEqual(3)
+    expect(sampled.items.length === 3 ? sampled.truncated === true || sampled.nextCursor !== null : true).toBe(true)
+    expect(JSON.stringify(sampled)).not.toContain('bodyText')
+    // Thread reads stay bounded and never carry body content out of the host.
+    const recent = await r.call(write.token, 'list_recent', { mailboxIds: [String(mailboxes.items[0].id)], limit: 1 })
+    expect(recent.items.length).toBe(1)
+    const thread = await r.call(write.token, 'read_thread', { mailboxId: String(mailboxes.items[0].id), sourceId: String(recent.items[0].sourceId) })
+    expect(thread.ok).toBe(true)
+    expect(thread.items.length).toBeLessThanOrEqual(50)
+    expect(JSON.stringify(thread)).not.toContain('bodyText')
+    expect(JSON.stringify(thread)).not.toContain('bodyHtml')
+  })
+
+  test('conditional draft edits fail with a real conflict on a stale revision and succeed on the current one', async () => {
+    const r = await fixture('draft-conflict')
+    const write = await r.grant('draft-writer', 'write')
+    const accounts = await r.call(write.token, 'list_accounts', {})
+    expect(accounts.items.length).toBeGreaterThan(0)
+    const created = await r.call(write.token, 'create_draft', {
+      accountId: String(accounts.items[0].id), to: [{ name: 'Recipient Example', email: 'recipient@example.test' }],
+      subject: 'Conditional edit', text: 'Original text' })
+    expect(created.ok).toBe(true)
+    expect(created.status).toBe('active')
+    const stale = await r.call(write.token, 'update_draft', { id: String(created.id), revision: Number(created.revision) + 5, subject: 'Hostile stale edit' })
+    expect(stale.ok).toBe(false)
+    expect(stale.error.kind).toBe('conflict')
+    expect(stale.error.status).toBe(412)
+    // The stale attempt consumed nothing.
+    const current = await r.call(write.token, 'update_draft', { id: String(created.id), revision: Number(created.revision), subject: 'Advanced edit' })
+    expect(current.ok).toBe(true)
+    expect(Number(current.revision)).toBeGreaterThan(Number(created.revision))
+    expect(current.status).toBe('active')
+  })
+
+  test('done receipts replay identically for the same id and payload, conflict on change, and send keys never duplicate an enqueue', async () => {
+    const r = await fixture('receipts')
+    const write = await r.grant('receipt-writer', 'write')
+    const mailbox = String((await r.call(write.token, 'list_mailboxes', {})).items[0].id)
+    const recent = await r.call(write.token, 'list_recent', { mailboxIds: [mailbox], limit: 1 })
+    const thread = await r.call(write.token, 'read_thread', { mailboxId: mailbox, sourceId: String(recent.items[0].sourceId) })
+    const delivery = thread.items.map((message: { memberships: Array<Record<string, unknown>> }) => message.memberships)
+      .flat(1).find((entry: { mailboxId: string }) => entry.mailboxId === mailbox)!
+    expect(delivery).toBeTruthy()
+    const target = [{ mailboxId: String(delivery.mailboxId), messageId: String(delivery.messageId), revision: Number(delivery.revision) }]
+    const applied = await r.call(write.token, 'mark_done', { targets: target, done: true, id: 'mcp-durable-action' })
+    expect(applied.ok).toBe(true)
+    expect(String(applied.receiptId)).toBeTruthy()
+    expect(applied.states[0].done).toBe(true)
+    expect(Number(applied.states[0].revision)).toBeGreaterThan(Number(delivery.revision))
+    // The identical retry replays the stored receipt, never fabricates a second one.
+    const replay = await r.call(write.token, 'mark_done', { targets: target, done: true, id: 'mcp-durable-action' })
+    expect(replay.ok).toBe(true)
+    expect(replay.receiptId).toBe(applied.receiptId)
+    expect(replay.states).toEqual(applied.states)
+    // A changed payload under the same id is refused: the durable action is immutable.
+    const changed = await r.call(write.token, 'mark_done', { targets: target, done: false, id: 'mcp-durable-action' })
+    expect(changed.ok).toBe(false)
+    expect(changed.error.kind).toBe('conflict')
+    // Draft submission enqueues once per idempotency key, across reconnects to the same instance.
+    const accounts = await r.call(write.token, 'list_accounts', {})
+    const draft = await r.call(write.token, 'create_draft', {
+      accountId: String(accounts.items[0].id), to: 'planner@example.test',
+      subject: 'Queued once', text: 'One operation for this durable key.' })
+    expect(draft.ok).toBe(true)
+    const send = await r.call(write.token, 'send_draft', { id: String(draft.id), revision: Number(draft.revision), idempotencyKey: 'enqueue-once' })
+    expect(send.ok).toBe(true)
+    expect(typeof send.queued).toBe('boolean')
+    expect(String(send.operationId)).toBeTruthy()
+    const replayed = await r.call(write.token, 'send_draft', { id: String(draft.id), revision: Number(draft.revision), idempotencyKey: 'enqueue-once' })
+    expect(replayed.ok).toBe(true)
+    expect(replayed.operationId).toBe(send.operationId)
+    // Disconnecting everything and reconnecting preserves the durable operation identity.
+    await r.restart()
+    const after = await r.call(write.token, 'send_draft', { id: String(draft.id), revision: Number(draft.revision), idempotencyKey: 'enqueue-once' })
+    expect(after.ok).toBe(true)
+    expect(after.operationId).toBe(send.operationId)
+    // Two different keys target one draft: exactly one enqueue wins, the other conflicts.
+    const second = await r.call(write.token, 'create_draft', {
+      accountId: String(accounts.items[0].id), to: 'planner@example.test',
+      subject: 'One winner only', text: 'Racing keys cannot both enqueue.' })
+    expect(second.ok).toBe(true)
+    const attempts = await Promise.all(['racing-key-a', 'racing-key-b'].map(key =>
+      r.call(write.token, 'send_draft', { id: String(second.id), revision: Number(second.revision), idempotencyKey: key }).then(result => ({ key, result }))))
+    expect(attempts.map(entry => Boolean(entry.result.ok)).sort()).toEqual([false, true])
+    const winner = attempts.find(entry => entry.result.ok)!
+    const loser = attempts.find(entry => !entry.result.ok)!
+    expect(loser.result.error.kind).toBe('conflict')
+    expect(String(winner.result.operationId)).toBeTruthy()
+    // The winning key keeps replaying its enqueue; the losing key did not record one.
+    const settled = await r.call(write.token, 'send_draft', { id: String(second.id), revision: Number(second.revision), idempotencyKey: winner.key })
+    expect(settled.ok).toBe(true)
+    expect(settled.operationId).toBe(winner.result.operationId)
+  })
+
+  test('unsupported provider actions stay unsupported and map to conflict without fabrication', async () => {
+    // Mock seed mail has no reachable native-only action, so the provider's own problem
+    // body (the exact shape the SDK emits for an unsupported provider action) is replayed
+    // into a real client roundtrip: the tool must surface it verbatim, without fabrication.
+    const original = globalThis.fetch
+    cleanup.push(async () => { globalThis.fetch = original })
+    globalThis.fetch = (async () => Response.json(
+      { code: 'UNSUPPORTED_OPERATION', error: 'The provider does not support this action.', retryable: false }, { status: 409 })) as unknown as typeof fetch
+    const refused = await callSuperlocalTool(
+      { client: createInboxClient({ baseUrl: 'http://127.0.0.1:2', headers: { Authorization: `Bearer superlocal_mcp_${'x'.repeat(32)}` } }) },
+      'mark_done', { targets: [{ mailboxId: 'inbox', messageId: 'm-1', revision: 1 }] })
+    const mapped = JSON.parse(refused.content[0]!.text) as { ok: boolean; error: { kind: string; status: number; code: string; hint?: string } }
+    expect(mapped.ok).toBe(false)
+    expect(mapped.error.kind).toBe('conflict')
+    expect(mapped.error.status).toBe(409)
+    expect(mapped.error.code).toBe('UNSUPPORTED_OPERATION')
+    expect(mapped.error.hint).toBeUndefined()
+    // Unknown tools answer as not_found rather than crashing the adapter.
+    const unknown = await callSuperlocalTool({ client: createInboxClient({ baseUrl: 'http://127.0.0.1:2' }) }, 'delete_everything', {})
+    const parsed = JSON.parse(unknown.content[0]!.text) as { ok: boolean; error: { kind: string } }
+    expect(parsed.ok).toBe(false)
+    expect(parsed.error.kind).toBe('not_found')
+  })
+
+  test('a real stdio MCP client initializes, lists, calls, and exits cleanly while the host stays alive', async () => {
+    const r = await fixture('stdio')
+    const write = await r.grant('stdio-writer', 'write')
+    expect(TOOL_CATALOG.map(entry => entry.name)).toEqual([
+      'list_accounts', 'list_mailboxes', 'list_recent', 'search_mail', 'read_thread',
+      'create_draft', 'update_draft', 'send_draft', 'mark_done', 'undo_done'])
+    const readTools = ['list_accounts', 'list_mailboxes', 'list_recent', 'search_mail', 'read_thread']
+    expect(TOOL_CATALOG.every(entry => entry.annotations.readOnlyHint === (readTools.includes(entry.name) ? true : undefined))).toBe(true)
+    // Install a loopback adapter through the real configured host.
+    const child = Bun.spawn([process.execPath, '--no-env-file', MCP_ADAPTER], {
+      stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+      env: { ...Bun.env, SUPERLOCAL_URL: r.url, SUPERLOCAL_MCP_TOKEN: write.token } })
+    const frame = (payload: unknown) => child.stdin.write(`${JSON.stringify(payload)}\n`)
+    frame({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fictional-mcp-client', version: '0.0.0' } } })
+    frame({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    frame({ jsonrpc: '2.0', id: 2, method: 'tools/list' })
+    frame({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'list_mailboxes', arguments: {} } })
+    frame({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'list_recent', arguments: { limit: 3 } } })
+    const mailboxes = await r.call(write.token, 'list_mailboxes', {})
+    const recent = await r.call(write.token, 'list_recent', { mailboxIds: [String(mailboxes.items[0].id)], limit: 2 })
+    frame({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'read_thread', arguments: { mailboxId: String(mailboxes.items[0].id), sourceId: String(recent.items[0].sourceId) } } })
+    frame({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'create_draft', arguments: {} } })
+    // Clean EOF: the adapter releases stdin and exits while the host keeps serving (the reverse contract).
+    child.stdin.end()
+    const outcome = await child.exited
+    const stdout = await new Response(child.stdout).text()
+    const stderr = await new Response(child.stderr).text()
+    expect(stderr.length).toBeGreaterThan(0)
+    const frames = stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    const reply = (id: number) => frames.find(entry => entry.id === id)!
+    expect(reply(1).result.serverInfo.name).toBe('superlocal-mail')
+    expect(String(reply(1).result.protocolVersion)).toBeTruthy()
+    expect(reply(2).result.tools.map((entry: { name: string }) => entry.name)).toEqual(TOOL_CATALOG.map(entry => entry.name))
+    expect(reply(3).result.content[0].text).toContain('"ok":true')
+    const page = JSON.parse(reply(4).result.content[0].text) as { ok: boolean; items: unknown[] }
+    expect(page.ok).toBe(true)
+    expect(page.items.length).toBeLessThanOrEqual(3)
+    expect(reply(5).result.content[0].text).toContain('"ok":true')
+    const invalid = JSON.parse(reply(6).result.content[0].text) as { ok: boolean; error: { kind: string; message: string } }
+    expect(invalid.ok).toBe(false)
+    expect(invalid.error.kind).toBe('invalid_request')
+    for (const line of stdout.trim().split('\n')) expect(() => JSON.parse(line)).not.toThrow()
+    expect(outcome).toBe(0)
+    // The adapter is gone; the host itself is untouched and still answers under the same grant.
+    expect((await r.bearer(write.token, '/v1/mailboxes')).status).toBe(200)
   })
 })

@@ -6,6 +6,7 @@ import { createInboxApi } from 'inbox-sdk/http'
 import { loadLocalConfig, object, type LocalConfig } from './config'
 import { staticAssetResponse } from './desktop'
 import { createInboxViewPreferencesStore, INBOX_PREFERENCES_BODY_LIMIT } from './inbox-preferences'
+import { createMcpGrants, createMcpMount } from './mcp-auth'
 import { connectFailure, createRealRegistrations, describeProvider, type HostExtension, type HostProviderRegistration } from './providers'
 import { openLocalRuntime } from './runtime'
 import { createSenderDomainHost } from './sender-domains'
@@ -213,6 +214,18 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     return identity && scopeMatches(request, identity.scope) && ownsMailboxAuthorization(request, identity.id) ? { id: identity.id } : null
   }
   const api = createInboxApi({ inbox: liveInbox, authenticate, allowedOrigins })
+  // MCP grants are durable grant configuration on the host ledger; shutdown never drops their tables.
+  const mcpGrants = config.mode === 'real' || config.mode === 'mock' ? createMcpGrants(config, runtime) : undefined
+  const mcpAuthenticate = async (request: Request): Promise<{ id: string } | null> => {
+    if (!mcpGrants || closed) return null
+    const header = request.headers.get('authorization')
+    if (!header?.startsWith('Bearer superlocal_mcp_')) return null
+    const grant = await mcpGrants.authenticate(header.slice(7))
+    return grant ? { id: grant.owner } : null
+  }
+  // A second API instance authenticated only by MCP grants: MCP never sees or mints browser sessions.
+  const mcpApi = mcpGrants ? createInboxApi({ inbox: liveInbox, authenticate: mcpAuthenticate, allowedOrigins: [] }) : undefined
+  const mcpMount = mcpGrants && mcpApi ? createMcpMount({ grants: mcpGrants, api: mcpApi }) : undefined
   extensions = registrations.flatMap(registration => registration.mount ? [registration.mount(liveInbox, authenticate)] : [])
 
   function session(request: Request): Response {
@@ -240,6 +253,11 @@ export async function createLocalHost(config: LocalConfig = loadLocalConfig(), e
     const url = new URL(request.url)
     if (!['http:', 'https:'].includes(url.protocol) || !hosts.has(url.host)) return problem(403, 'HOST_LOOPBACK_REQUIRED', 'Use the configured loopback host or local alias.')
     if (closed) return problem(503, 'HOST_CLOSED', 'The local host is shutting down.')
+    // MCP bearer requests resolve to durable grants, never browser sessions; the allowlist gates them.
+    if (mcpMount && request.headers.get('authorization')?.startsWith('Bearer superlocal_mcp_')) {
+      const mounted = await mcpMount.fetch(request)
+      if (mounted) return mounted
+    }
     // Never route encoded or trailing-slash auth aliases through a more permissive handler.
     let normalized: string
     try { normalized = decodeURIComponent(url.pathname).replace(/\/+$/, '') } catch { return problem(400, 'HOST_INVALID_PATH', 'Invalid request path.') }
