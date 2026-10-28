@@ -15110,8 +15110,8 @@ describe('owner-bound MCP grants and stdio adapter', () => {
         stdout: 'pipe', stderr: 'pipe', env: { ...Bun.env, SUPERLOCAL_CONFIG: config.configPath, SUPERLOCAL_DATA_DIR: runtimeDir } })
       return { code: await admin.exited, out: await new Response(admin.stdout).text(), err: await new Response(admin.stderr).text() }
     }
-    const grant = async (label: string, scope: 'read' | 'write') =>
-      JSON.parse((await cli(['grant', '--name', label, ...(scope === 'write' ? ['--write'] : []), '--json'])).out.trim())
+    const grant = async (label: string, scope: 'read' | 'write', content = false) =>
+      JSON.parse((await cli(['grant', '--name', label, ...(scope === 'write' ? ['--write'] : []), ...(content ? ['--content'] : []), '--json'])).out.trim())
     const tool = (token: string, name: string, input: unknown) =>
       callSuperlocalTool({ client: createInboxClient({ baseUrl: url, headers: { Authorization: `Bearer ${token}` } }) }, name, input)
     const call = async (token: string, name: string, input: unknown) => {
@@ -15286,6 +15286,102 @@ describe('owner-bound MCP grants and stdio adapter', () => {
     expect(current.status).toBe('active')
   })
 
+  test('reminders use conditional durable receipts and operation status is readable without write scope', async () => {
+    const r = await fixture('reminder-status')
+    const write = await r.grant('reminder-writer', 'write')
+    const read = await r.grant('status-reader', 'read')
+    const mailbox = String((await r.call(read.token, 'list_mailboxes', {})).items[0].id)
+    const recent = await r.call(read.token, 'list_recent', { mailboxIds: [mailbox], limit: 1 })
+    const thread = await r.call(read.token, 'read_thread', { mailboxId: mailbox, sourceId: recent.items[0].sourceId })
+    const membership = thread.items.flatMap((message: any) => message.memberships).find((entry: any) => entry.mailboxId === mailbox)
+    const targets = [{ mailboxId: mailbox, messageId: membership.messageId, revision: membership.revision }]
+    const args = { targets, snoozedUntil: '2099-01-01T00:00:00.000Z', id: 'reminder-key' }
+    expect((await r.call(read.token, 'set_reminder', args)).error.kind).toBe('forbidden')
+    const applied = await r.call(write.token, 'set_reminder', args)
+    expect(applied.ok).toBe(true)
+    expect(applied.states[0].snoozedUntil).toBe(args.snoozedUntil)
+    expect((await r.call(write.token, 'set_reminder', args)).receiptId).toBe(applied.receiptId)
+    expect((await r.call(write.token, 'set_reminder', { ...args, snoozedUntil: null })).error.kind).toBe('conflict')
+    expect((await r.call(write.token, 'undo_done', { receiptId: applied.receiptId })).ok).toBe(true)
+    const accounts = await r.call(write.token, 'list_accounts', {})
+    const draft = await r.call(write.token, 'create_draft', { accountId: accounts.items[0].id, to: 'example@example.test', subject: 'Status test', text: 'Fictional.' })
+    const send = await r.call(write.token, 'send_draft', { id: draft.id, revision: draft.revision, idempotencyKey: 'status-test' })
+    const status = await r.call(read.token, 'operation_status', { operationId: send.operationId })
+    expect(status.ok).toBe(true)
+    expect(status.operationId).toBe(send.operationId)
+    expect(typeof status.queued).toBe('boolean')
+  })
+
+  test('message text is shaped and read/star mutations are scoped and conditional', async () => {
+    const r = await fixture('message-read-star')
+    const write = await r.grant('message-writer', 'write')
+    const read = await r.grant('message-reader', 'read', true)
+    expect(read.content).toBe(true)
+    const mailbox = (await r.call(read.token, 'list_mailboxes', {})).items[0].id
+    const recent = await r.call(read.token, 'list_recent', { mailboxIds: [mailbox], limit: 1 })
+    const message = (await r.call(read.token, 'read_thread', { mailboxId: mailbox, sourceId: recent.items[0].sourceId })).items[0]
+    expect(write.content).toBe(false)
+    expect((await r.call(write.token, 'read_message', { mailboxId: mailbox, messageId: message.id })).error.kind).toBe('forbidden')
+    const body = await r.call(read.token, 'read_message', { mailboxId: mailbox, messageId: message.id })
+    expect(body.ok).toBe(true)
+    expect(typeof body.bodyText).toBe('string')
+    expect(body.bodyText.length).toBeLessThanOrEqual(65536)
+    expect(typeof body.bodyTruncated).toBe('boolean')
+    expect(body.bodyHtml).toBeUndefined()
+    expect(body.attachments).toBeUndefined()
+    const contentWriter = await r.grant('content-writer', 'write', true)
+    expect(contentWriter.content).toBe(true)
+    expect((await r.call(contentWriter.token, 'read_message', { mailboxId: mailbox, messageId: message.id })).ok).toBe(true)
+    const shapedMount = createMcpMount({
+      grants: createMcpGrants(r.config, { database: r.grantsDb() }),
+      api: { fetch: () => Response.json({ id: 'm', sourceId: 's', threadId: 't', revision: 1, bodyText: 'x'.repeat(70000), bodyHtml: '<secret>', attachments: [{ filename: 'secret' }] }) },
+    })
+    const shapedResponse = await shapedMount.fetch(new Request(`${r.url}/v1/mailboxes/box/messages/m`, { headers: { Authorization: `Bearer ${read.token}` } }))
+    const shaped = await shapedResponse!.json()
+    expect(shaped.bodyText.length).toBe(65536)
+    expect(shaped.bodyTruncated).toBe(true)
+    expect(shaped.bodyHtml).toBeUndefined()
+    expect(shaped.attachments).toBeUndefined()
+    const args = { mailboxId: mailbox, messageId: message.id, revision: message.revision, isStarred: !message.starred, idempotencyKey: 'star-key' }
+    expect((await r.call(read.token, 'set_read_star', args)).error.kind).toBe('forbidden')
+    const changed = await r.call(write.token, 'set_read_star', args)
+    expect(changed.ok).toBe(true)
+    expect((await r.call(write.token, 'set_read_star', args)).operationId).toBe(changed.operationId)
+    expect((await r.call(write.token, 'set_read_star', { ...args, isStarred: message.starred })).error.kind).toBe('conflict')
+    expect((await r.call(write.token, 'set_read_star', { ...args, revision: message.revision + 999, idempotencyKey: 'stale-star' })).error.kind).toBe('conflict')
+    for (const payload of [
+      { messageIds: [message.id], viaMailboxId: mailbox, ifRevisions: { [message.id]: message.revision }, changes: { isRead: true, deletePermanently: true } },
+      { messageIds: [message.id], viaMailboxId: mailbox, changes: { isRead: true } },
+      { messageIds: [message.id], viaMailboxId: mailbox, ifRevisions: { [message.id]: message.revision }, changes: { isRead: true }, owner: 'other' },
+    ]) {
+      const response = await r.bearer(write.token, '/v1/operations', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'forged' }, body: JSON.stringify(payload) })
+      expect(response.status).toBe(403)
+    }
+    const other = await fixture('content-other-instance')
+    expect((await other.call(read.token, 'read_message', { mailboxId: mailbox, messageId: message.id })).error.kind).toBe('grant_invalid')
+    expect((await r.cli(['revoke', read.id, '--json'])).code).toBe(0)
+    expect((await r.call(read.token, 'read_message', { mailboxId: mailbox, messageId: message.id })).error.kind).toBe('grant_invalid')
+  })
+
+  test('legacy grants migrate without enabling content', async () => {
+    const r = await fixture('legacy-content')
+    const database = new Database(':memory:')
+    cleanup.push(() => database.close())
+    database.exec('CREATE TABLE local_mcp_grants (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER) STRICT')
+    const token = `superlocal_mcp_${'L'.repeat(32)}`
+    database.query('INSERT INTO local_mcp_grants (id, owner, name, scope, token_hash, created_at) VALUES (?,?,?,?,?,?)').run('mcp_0123456789abcdef', 'superlocal-mock', 'legacy', 'write', createHash('sha256').update(token).digest('hex'), Date.now())
+    const grants = createMcpGrants(r.config, { database })
+    expect(grants.list()[0]?.content).toBe(false)
+    expect((await grants.authenticate(token))?.content).toBe(false)
+    let reached = false
+    const mount = createMcpMount({ grants, api: { fetch: () => { reached = true; return Response.json({}) } } })
+    const denied = await mount.fetch(new Request(`${r.url}/v1/mailboxes/box/messages/message`, { headers: { Authorization: `Bearer ${token}` } }))
+    expect(denied?.status).toBe(403)
+    expect((await denied!.json()).code).toBe('MCP_CONTENT_FORBIDDEN')
+    expect(reached).toBe(false)
+    expect((await mount.fetch(new Request(`${r.url}/v1/mailboxes`, { headers: { Authorization: `Bearer ${token}` } })))?.status).toBe(200)
+  })
+
   test('done receipts replay identically for the same id and payload, conflict on change, and send keys never duplicate an enqueue', async () => {
     const r = await fixture('receipts')
     const write = await r.grant('receipt-writer', 'write')
@@ -15375,8 +15471,8 @@ describe('owner-bound MCP grants and stdio adapter', () => {
     const write = await r.grant('stdio-writer', 'write')
     expect(TOOL_CATALOG.map(entry => entry.name)).toEqual([
       'list_accounts', 'list_mailboxes', 'list_recent', 'search_mail', 'read_thread',
-      'create_draft', 'update_draft', 'send_draft', 'mark_done', 'undo_done'])
-    const readTools = ['list_accounts', 'list_mailboxes', 'list_recent', 'search_mail', 'read_thread']
+      'read_message', 'set_read_star', 'create_draft', 'update_draft', 'send_draft', 'operation_status', 'set_reminder', 'mark_done', 'undo_done'])
+    const readTools = ['list_accounts', 'list_mailboxes', 'list_recent', 'search_mail', 'read_thread', 'read_message', 'operation_status']
     expect(TOOL_CATALOG.every(entry => entry.annotations.readOnlyHint === (readTools.includes(entry.name) ? true : undefined))).toBe(true)
     // Install a loopback adapter through the real configured host.
     const child = Bun.spawn([process.execPath, '--no-env-file', MCP_ADAPTER], {

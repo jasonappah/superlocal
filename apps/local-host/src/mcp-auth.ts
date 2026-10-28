@@ -5,8 +5,8 @@ import { InboxError } from 'inbox-sdk'
 import type { LocalConfig } from './config'
 
 export type McpScope = 'read' | 'write'
-export interface McpGrantView { id: string; name: string; scope: McpScope; createdAt: number; lastUsedAt: number | null; revokedAt: number | null }
-export interface McpGrantAuth { owner: string; scope: McpScope }
+export interface McpGrantView { id: string; name: string; scope: McpScope; content: boolean; createdAt: number; lastUsedAt: number | null; revokedAt: number | null }
+export interface McpGrantAuth { owner: string; scope: McpScope; content: boolean }
 
 const TOKEN_PREFIX = 'superlocal_mcp_'
 const TOKEN_BODY = '[A-Za-z0-9_-]{32}' // 24 random bytes in base64url.
@@ -21,7 +21,7 @@ export interface McpGrants {
   /** The single owner every stored grant must belong to. */
   owner: string
   /** Returns the plaintext token exactly once; only its sha256 hash is stored. */
-  create(owner: string, name: string, scope: McpScope): { id: string; token: string }
+  create(owner: string, name: string, scope: McpScope, content?: boolean): { id: string; token: string }
   /** Listing and revocation never expose tokens. */
   list(): McpGrantView[]
   revoke(id: string): boolean
@@ -36,26 +36,34 @@ export interface McpGrants {
 export function createMcpGrants(config: LocalConfig, runtime: { database: Database }): McpGrants {
   const owner = config.mode === 'mock' ? MOCK_OWNER : `local:${config.instanceId}`
   runtime.database.exec('CREATE TABLE IF NOT EXISTS local_mcp_grants (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER) STRICT')
-  type Row = { id: string; owner: string; name: string; scope: string; token_hash: string; created_at: number; last_used_at: number | null; revoked_at: number | null }
+  // Multiple host/admin processes can initialize concurrently. Only a duplicate-column
+  // race is harmless; all other migration failures must prevent grant use.
+  if (!runtime.database.query<{ name: string }, []>('PRAGMA table_info(local_mcp_grants)').all().some(column => column.name === 'content')) {
+    try { runtime.database.exec('ALTER TABLE local_mcp_grants ADD COLUMN content INTEGER NOT NULL DEFAULT 0 CHECK (content IN (0, 1))') }
+    catch (error) { if (!(error instanceof Error) || !/duplicate column name: content/i.test(error.message)) throw error }
+  }
+  type Row = { id: string; owner: string; name: string; scope: string; content: number; token_hash: string; created_at: number; last_used_at: number | null; revoked_at: number | null }
   const row = (value: Row): McpGrantView => ({
     id: value.id, name: value.name,
     scope: ['read', 'write'].includes(value.scope) ? value.scope as McpScope : 'read',
+    content: value.content === 1,
     createdAt: value.created_at, lastUsedAt: value.last_used_at, revokedAt: value.revoked_at,
   })
 
-  function create(creator: string, rawName: string, scope: McpScope): { id: string; token: string } {
+  function create(creator: string, rawName: string, scope: McpScope, content = false): { id: string; token: string } {
     if (config.auth.method !== 'loopback') throw new InboxError('MCP_AUTH_UNSUPPORTED', 'MCP grants require a loopback-authenticated profile.', 403)
     if (creator !== owner) throw new InboxError('MCP_OWNER_MISMATCH', 'MCP grants are created for this installation\'s single owner only.', 400)
     if (typeof rawName !== 'string') throw new InboxError('MCP_NAME_INVALID', 'A grant name between 1 and 80 visible characters is required.', 400)
     const name = rawName.trim()
     if (!name || name.length > 80 || /[\x00-\x1f\u007f]/.test(name)) throw new InboxError('MCP_NAME_INVALID', 'A grant name between 1 and 80 visible characters is required.', 400)
     if (scope !== 'read' && scope !== 'write') throw new InboxError('MCP_SCOPE_INVALID', 'A grant scope must be read or write.', 400)
+    if (typeof content !== 'boolean') throw new InboxError('MCP_SCOPE_INVALID', 'Content access must be explicitly enabled.', 400)
     const id = `mcp_${randomBytes(8).toString('hex')}`
     const token = `${TOKEN_PREFIX}${randomBytes(24).toString('base64url')}`
     const tokenHash = createHash('sha256').update(token).digest('hex')
     try {
-      runtime.database.query('INSERT INTO local_mcp_grants (id, owner, name, scope, token_hash, created_at) VALUES (?,?,?,?,?,?)')
-        .run(id, owner, name, scope, tokenHash, Date.now())
+      runtime.database.query('INSERT INTO local_mcp_grants (id, owner, name, scope, token_hash, created_at, content) VALUES (?,?,?,?,?,?,?)')
+        .run(id, owner, name, scope, tokenHash, Date.now(), content ? 1 : 0)
     } catch (error) {
       if (error instanceof Error && error.message.includes('UNIQUE')) throw new InboxError('MCP_NAME_EXISTS', 'A grant with that name already exists.', 409)
       throw new InboxError('MCP_GRANT_STORE_FAILED', 'The MCP grant could not be stored.', 500)
@@ -93,7 +101,7 @@ export function createMcpGrants(config: LocalConfig, runtime: { database: Databa
     if (value.last_used_at === null || now - value.last_used_at >= LAST_USED_INTERVAL_MS) {
       runtime.database.query('UPDATE local_mcp_grants SET last_used_at=? WHERE id=?').run(now, value.id)
     }
-    return { owner: value.owner, scope: value.scope === 'write' ? 'write' : 'read' }
+    return { owner: value.owner, scope: value.scope === 'write' ? 'write' : 'read', content: value.content === 1 }
   }
 
   return { owner, create, list, revoke, authenticate }
@@ -104,6 +112,7 @@ const MCP_ROUTES: Array<{ method: string; path: RegExp; scope: McpScope }> = [
   { method: 'GET', path: /^\/v1\/accounts$/, scope: 'read' },
   { method: 'GET', path: /^\/v1\/mailboxes$/, scope: 'read' },
   { method: 'GET', path: /^\/v1\/mailboxes\/([^/%]+)$/, scope: 'read' },
+  { method: 'GET', path: /^\/v1\/mailboxes\/([^/%]+)\/messages\/([^/%]+)$/, scope: 'read' },
   { method: 'POST', path: /^\/v1\/mailbox-conversations$/, scope: 'read' },
   { method: 'POST', path: /^\/v1\/mailbox-message-page$/, scope: 'read' },
   { method: 'POST', path: /^\/v1\/mailbox-counts$/, scope: 'read' },
@@ -119,6 +128,7 @@ const MCP_ROUTES: Array<{ method: string; path: RegExp; scope: McpScope }> = [
   { method: 'POST', path: /^\/v1\/drafts\/([^/%]+)\/submit$/, scope: 'write' },
   // Operation status reads let MCP clients resolve queued and uncertain sends.
   { method: 'GET', path: /^\/v1\/operations\/([^/%]+)$/, scope: 'read' },
+  { method: 'POST', path: /^\/v1\/operations$/, scope: 'write' },
 ]
 
 export interface McpMountOptions {
@@ -135,6 +145,17 @@ export interface McpMount { fetch(request: Request): Promise<Response | undefine
 
 const DEFAULT_BODY_LIMIT = 256 * 1024
 const DEFAULT_RESULT_LIMIT = 2 * 1024 * 1024
+const MCP_TEXT_LIMIT = 64 * 1024
+
+function allowedMutation(value: unknown): boolean {
+  const record = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
+  const validId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 512 && !/[\u0000-\u001f\u007f/\\]/.test(v)
+  if (!record(value) || Object.keys(value).some(key => !['messageIds', 'changes', 'ifRevisions', 'viaMailboxId'].includes(key))) return false
+  if (!Array.isArray(value.messageIds) || !value.messageIds.length || value.messageIds.length > 50 || !value.messageIds.every(validId) || new Set(value.messageIds).size !== value.messageIds.length || !validId(value.viaMailboxId)) return false
+  if (!record(value.changes) || !Object.keys(value.changes).length || Object.entries(value.changes).some(([key, field]) => !['isRead', 'isStarred'].includes(key) || typeof field !== 'boolean')) return false
+  if (!record(value.ifRevisions) || Object.keys(value.ifRevisions).length !== value.messageIds.length) return false
+  return value.messageIds.every(id => Object.hasOwn(value.ifRevisions as object, id) && Number.isSafeInteger((value.ifRevisions as Record<string, unknown>)[id]) && ((value.ifRevisions as Record<string, number>)[id] ?? -1) >= 0)
+}
 
 /**
  * Bearer-gated MCP mount. Only `Authorization: Bearer superlocal_mcp_*` requests are
@@ -220,8 +241,23 @@ export function createMcpMount(options: McpMountOptions): McpMount {
         if (!route || grant.scope === 'read' && route.scope === 'write') {
           return oversized(403, 'MCP_OPERATION_FORBIDDEN', 'This MCP grant does not permit this operation.')
         }
+        if (request.method === 'GET' && /^\/v1\/mailboxes\/([^/%]+)\/messages\/([^/%]+)$/.test(url.pathname) && !grant.content) {
+          return problem(403, 'MCP_CONTENT_FORBIDDEN', 'This grant does not permit message content. Create a new grant with --content.')
+        }
         const forwarded = await boundedRequest(request)
-        return await boundedResponse(await options.api.fetch(forwarded))
+        if (request.method === 'POST' && url.pathname === '/v1/operations') {
+          let payload: unknown
+          try { payload = await forwarded.clone().json() } catch { return problem(403, 'MCP_OPERATION_FORBIDDEN', 'Only conditional read/star mutations are permitted.') }
+          if (!allowedMutation(payload)) return problem(403, 'MCP_OPERATION_FORBIDDEN', 'Only conditional read/star mutations are permitted.')
+        }
+        const response = await boundedResponse(await options.api.fetch(forwarded))
+        if (request.method === 'GET' && /^\/v1\/mailboxes\/([^/%]+)\/messages\/([^/%]+)$/.test(url.pathname) && response.ok) {
+          const message = await response.json() as { id: string; sourceId: string; threadId: string; revision: number; bodyText: string }
+          if (typeof message.bodyText !== 'string') return problem(503, 'MCP_UNAVAILABLE', 'The message text is unavailable.')
+          return Response.json({ id: message.id, sourceId: message.sourceId, threadId: message.threadId, revision: message.revision,
+            bodyText: message.bodyText.slice(0, MCP_TEXT_LIMIT), bodyTruncated: message.bodyText.length > MCP_TEXT_LIMIT }, { headers: safeHeaders })
+        }
+        return response
       } catch (error) {
         if (error instanceof InboxError && /^MCP_[A-Z_]+$/.test(error.code) && Number.isInteger(error.status) && error.status >= 400 && error.status <= 599) {
           return problem(error.status, error.code, error.message)

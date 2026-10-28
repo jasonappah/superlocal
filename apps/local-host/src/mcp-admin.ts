@@ -7,13 +7,14 @@ const help = `Manage MCP grants for this Superlocal installation
 
 bun --no-env-file apps/local-host/src/mcp-admin.ts <command> [options]
 
-grant   --name "<label>" [--write] [--json]  Create a grant; the token is printed once.
+grant   --name "<label>" [--write] [--content] [--json]  Create a grant; the token is printed once.
 list    [--json]                             List grants; tokens are never shown.
 revoke  <id> [--json]                        Revoke a grant; access ends immediately.
 help                                         Show this text.
 
 The command operates on the configured instance (SUPERLOCAL_CONFIG / SUPERLOCAL_DATA_DIR).
 Grant tokens equal superlocal_mcp_ plus 32 unpadded base64url characters.
+--content explicitly permits reading message text; without it message bodies are denied.
 `
 
 function stamp(value: number | null): string {
@@ -24,7 +25,7 @@ function stamp(value: number | null): string {
 
 async function main() {
   const { values, positionals } = parseArgs({ args: Bun.argv.slice(2), allowPositionals: true, strict: true, options: {
-    name: { type: 'string' }, write: { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean' },
+    name: { type: 'string' }, write: { type: 'boolean' }, content: { type: 'boolean' }, json: { type: 'boolean' }, help: { type: 'boolean' },
   } })
   const command = positionals[0]
   if (!command || values.help || command === 'help') { process.stdout.write(help); return }
@@ -41,17 +42,17 @@ async function main() {
     if (command === 'grant') {
       if (!values.name?.trim()) throw new Error('MCP_NAME_REQUIRED')
       const scope = values.write ? 'write' : 'read'
-      const grant = grants.create(grants.owner, values.name, scope)
+      const grant = grants.create(grants.owner, values.name, scope, values.content === true)
       const view = grants.list().find(entry => entry.id === grant.id)
-      if (values.json) console.log(JSON.stringify({ ...(view ?? { id: grant.id, name: values.name.trim(), scope, createdAt: null, lastUsedAt: null, revokedAt: null }), token: grant.token }))
-      else console.log(`MCP grant created: ${view?.name} (${scope}) ${grant.token}`)
+      if (values.json) console.log(JSON.stringify({ ...(view ?? { id: grant.id, name: values.name.trim(), scope, content: values.content === true, createdAt: null, lastUsedAt: null, revokedAt: null }), token: grant.token }))
+      else console.log(`MCP grant created: ${view?.name} (${scope}${values.content ? ', message content' : ', no message content'}) ${grant.token}`)
       return
     }
     if (command === 'list') {
       const rows = grants.list()
       if (values.json) { console.log(JSON.stringify(rows)); return }
       for (const row of rows) {
-        console.log(`${row.id}  ${row.name}  (${row.scope})  created ${stamp(row.createdAt)}  last used ${stamp(row.lastUsedAt)}${row.revokedAt === null ? '' : '  revoked'}`)
+        console.log(`${row.id}  ${row.name}  (${row.scope}${row.content ? ', message content' : ', no message content'})  created ${stamp(row.createdAt)}  last used ${stamp(row.lastUsedAt)}${row.revokedAt === null ? '' : '  revoked'}`)
       }
       if (!rows.length) console.log('No MCP grants.')
       return

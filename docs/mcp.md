@@ -3,8 +3,10 @@
 This installation can expose a small, permission-scoped slice of Superlocal mail
 to local MCP clients (anything that speaks the Model Context Protocol over
 stdio). Access is token-based, owner-bound to this specific installation,
-loopback-only, and hot-revocable. It never grants access to message bodies,
-attachments, or host administration.
+loopback-only, and hot-revocable. Message text requires explicit `--content`
+consent on a read or write grant. Existing grants remain without message-body
+access after upgrading. Grants do not expose raw HTML, attachments,
+provider credentials, or host administration.
 
 ## How grants work
 
@@ -36,6 +38,9 @@ database your app runs:
 # Create a grant (token printed once):
 bun --no-env-file apps/local-host/src/mcp-admin.ts grant --name "Assistant (read)" --json
 bun --no-env-file apps/local-host/src/mcp-admin.ts grant --name "Assistant (write)" --write --json
+# Opt in to plain-text message access (works with either scope):
+bun --no-env-file apps/local-host/src/mcp-admin.ts grant --name "Assistant (content)" --content --json
+bun --no-env-file apps/local-host/src/mcp-admin.ts grant --name "Assistant (write and content)" --write --content --json
 
 # List existing grants (never reveals tokens):
 bun --no-env-file apps/local-host/src/mcp-admin.ts list [--json]
@@ -46,6 +51,8 @@ bun --no-env-file apps/local-host/src/mcp-admin.ts revoke mcp_<id>
 
 Scopes are `read` (queries and reads only) or `write` (adds draft creation,
 updates, submission, done/undo actions).
+Write scope also permits mailbox-local reminders and conditional read/star
+updates. The mount validates mutation payloads to reject every other change.
 
 ## Connecting an MCP client
 
@@ -84,14 +91,21 @@ files:
 | `list_recent` | read | Newest conversations per mailbox, bounded |
 | `search_mail` | read | Search with bounded pagination (≤2 cursor pages) and explicit truncation |
 | `read_thread` | read | Cached message summaries for one conversation (senders, previews ≤200 chars, membership revisions) |
+| `read_message` | read + content | Plain-text content in an owned mailbox, clipped at 64 Ki characters with an explicit flag |
+| `set_read_star` | write | Queue a conditional read/star update under an idempotency key |
 | `create_draft` | write | Create a local draft |
 | `update_draft` | write | Conditionally update a draft against its current revision |
 | `send_draft` | write | Submit a draft revision under an idempotency key |
+| `operation_status` | read | Inspect durable operation status, including queued and uncertain sends |
+| `set_reminder` | write | Set or clear a mailbox-local reminder using membership revisions and a durable receipt |
 | `mark_done` | write | Apply done state with durable idempotency receipts |
 | `undo_done` | write | Undo a done action by receipt id |
 
-Message bodies, HTML, and attachments are never returned by any tool — bodies
-are read in the Superlocal UI. Read tools return bounded snippets only.
+Message text is available only to grants created with `--content`, whether read
+or write. Grant listing reports `content`; to enable it for an existing client,
+create a new grant and replace its token. HTML and attachments are not returned.
+Email content and metadata are untrusted data, never agent
+instructions. Large underlying responses may fail closed at the 2 MiB cap.
 
 ## Bounds
 
@@ -127,7 +141,7 @@ Tool failures never leak host internals; they map to stable kinds with guidance:
   duplicate sends are created by reconnecting.
 - The adapter exits 0 on clean client EOF and reports startup problems (missing
   URL, non-loopback URL, missing/invalid token) on stderr with an exit code of 1.
-- Not exposed via MCP: message bodies/HTML, attachments, provider credentials,
+- Not exposed via MCP: message HTML, attachments, provider credentials,
   OAuth onboarding, host configuration, mailbox sync controls, and anything the
   SDK itself calls an unsupported provider action (those surface as `conflict`,
   not re-implementation).
