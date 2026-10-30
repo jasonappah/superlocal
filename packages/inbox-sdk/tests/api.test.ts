@@ -15366,7 +15366,7 @@ describe('owner-bound MCP grants and stdio adapter', () => {
   test('legacy grants migrate without enabling content', async () => {
     const r = await fixture('legacy-content')
     const database = new Database(':memory:')
-    cleanup.push(() => database.close())
+    cleanup.push(async () => { database.close() })
     database.exec('CREATE TABLE local_mcp_grants (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER) STRICT')
     const token = `superlocal_mcp_${'L'.repeat(32)}`
     database.query('INSERT INTO local_mcp_grants (id, owner, name, scope, token_hash, created_at) VALUES (?,?,?,?,?,?)').run('mcp_0123456789abcdef', 'superlocal-mock', 'legacy', 'write', createHash('sha256').update(token).digest('hex'), Date.now())
