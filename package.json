@@ -10,6 +10,8 @@
     "start": "bun --no-env-file run --cwd apps/web build && bun --no-env-file scripts/dev.ts --built",
     "dev": "bun --no-env-file scripts/dev.ts",
     "dev:host": "bun --no-env-file apps/local-host/src/index.ts",
+    "build:desktop": "bun --no-env-file scripts/build-desktop.ts",
+    "install:desktop": "bun --no-env-file scripts/build-desktop.ts --install",
     "start:host": "bun --no-env-file apps/local-host/src/index.ts",
     "typecheck:host": "bun run --cwd apps/local-host typecheck",
     "dev:web": "bun run --cwd apps/web dev",

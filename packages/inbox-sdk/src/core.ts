@@ -17,6 +17,8 @@ import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSy
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
   type MailboxQuery, type MailboxConversationQuery, type MailboxConversation, type MailboxThreadKey, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type MailboxForwardedCopy, type SendingIdentity, type SendingIdentities } from './contracts'
 
+declare const __SUPERLOCAL_STANDALONE__: boolean
+
 type AccountRow = { id: string; owner: string; generation: number; status: Account['status']; data: string; native: string; credentials: string; connection_id: string; connection_generation: number; credential_version: number }
 type ConnectionRow = { id: string; owner: string; generation: number; status: Connection['status']; credential_version: number; data: string; credentials: string }
 type MailboxRow = { id: string; owner: string; source: string; connection: string; selector: string; data: string }
@@ -232,7 +234,10 @@ export function createInbox(options: InboxOptions): Inbox {
     if (correspondenceStarts >= 2) throw unavailableRead()
     correspondenceStarts++
     let worker: CorrespondenceWorker
-    try { worker = new Worker(Bun.resolveSync('./correspondence-worker', import.meta.dir)) as CorrespondenceWorker }
+    // Standalone builds embed the worker as a separate Bun compile entry point.
+    // Normal source execution retains its module-relative resolution.
+    try { worker = new Worker(typeof __SUPERLOCAL_STANDALONE__ !== 'undefined' && __SUPERLOCAL_STANDALONE__
+      ? '/$bunfs/root/packages/inbox-sdk/src/correspondence-worker.js' : Bun.resolveSync('./correspondence-worker', import.meta.dir)) as CorrespondenceWorker }
     catch { throw unavailableRead() }
     let finish!: () => void
     const finished = new Promise<void>(resolve => { finish = resolve })
