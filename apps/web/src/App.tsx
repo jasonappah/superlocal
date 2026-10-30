@@ -462,7 +462,11 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     const snapshot = store.getSnapshot(), scope = snapshot.window?.state;
     if (!readerId || !readerScope || !scope || scope.queryId !== readerScope.queryId || scope.queryGeneration !== readerScope.queryGeneration || scope.scopeState !== readerScope.scopeState
       || snapshot.mail.find(mail => mail.id === readerId)?.sourceGeneration !== readerGeneration) return;
-    store.pinThreadMessages(readerId, ids);
+    // ThreadView's history pins also include the focused card and draft origin.
+    // Only expanded cards actually display bodies and need body-cache protection.
+    const visible = Array.from(readerScroll.current?.querySelectorAll<HTMLElement>(".thread-message.is-expanded[data-thread-message]") ?? [])
+      .map(element => element.dataset.threadMessage).filter((id): id is string => !!id);
+    store.pinThreadMessages(readerId, ids, visible);
   }, [store, readerId, readerGeneration, readerScope?.queryId, readerScope?.queryGeneration, readerScope?.scopeState]);
   const loadReaderMessage = useCallback((id: string) => readerId ? store.loadThread(readerId, id) : Promise.resolve(), [store, readerId]);
   const loadOlderMessages = useCallback(() => readerId ? store.loadMoreMessages(readerId) : Promise.resolve(), [store, readerId]);
@@ -630,6 +634,17 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     if (!currentMail || currentMail.operationId) return;
     void store.loadThread(currentMail.id).catch(() => {});
   }, [store, currentMail?.id, currentMail?.messages.map(message => `${message.id}:${message.bodyRevision ?? message.revision}:${!!message.loaded}`).join(","), inbox.policy?.remoteImages]);
+  const warmingIds = useMemo(() => {
+    if (!currentMail || !matchingWindow || isDrafts) return [];
+    const index = visibleMail.findIndex(mail => mail.id === currentMail.id);
+    if (index < 0) return [];
+    return [visibleMail[index + 1], visibleMail[index + 2], visibleMail[index - 1]].filter((mail): mail is Mail => !!mail).map(mail => mail.id);
+  }, [currentMail?.id, matchingWindow, isDrafts, visibleMail]);
+  const warmingKey = JSON.stringify(warmingIds);
+  useEffect(() => {
+    store.warmAdjacentBodies(currentMail?.id, warmingIds);
+    return () => store.warmAdjacentBodies(undefined, []);
+  }, [store, currentMail?.id, warmingKey, listViewKey, inbox.policy?.remoteImages, matchingWindow?.state.queryGeneration, matchingWindow?.state.scopeState]);
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
     document.documentElement.dataset.style =

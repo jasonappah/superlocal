@@ -310,6 +310,11 @@ export class InboxStore {
   private operations = new Map<string, Operation>();
   private submissions = new Map<string, { idempotencyKey: string; revision: number; sendAt?: string }>();
   private loadingThreads = new Map<string, Promise<void>>();
+  private bodyRequests = new Map<string, Promise<SdkMessage>>();
+  private speculativeDetails = new Map<string, { detail: SdkMessage; generation: number; bodyEpoch: number; windowEpoch: number }>();
+  private warmingGeneration = 0;
+  private warmingQueue: string[] = [];
+  private warmingActive = false;
   private recovery = this.storage.readSaved<Record<string, { draft: Draft; revision: number }>>(recoveryKey, {});
   private references = this.storage.readSaved<SendReference[]>(outboxKey, []).filter(ref => ref && [ref.id, ref.draftId, ref.accountId, ref.mailboxId].every(value => typeof value === "string"));
   private issueHolds = new Map<string, ReturnType<typeof setTimeout>>();
@@ -362,6 +367,7 @@ export class InboxStore {
   private windowMetadataEvents: ChangeEvent[] = [];
   private windowDetails = new Map<string, ThreadHistory>();
   private threadMessagePins = new Map<string, Map<string, string>>();
+  private threadBodyPins = new Map<string, Set<string>>();
   private threadHistoryLoads = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private threadValidations = new Map<string, ThreadValidation>();
   private threadValidationQueue: Promise<unknown> = Promise.resolve();
@@ -483,13 +489,14 @@ export class InboxStore {
     if (epoch !== this.windowEpoch || generation !== this.generation) throw new DOMException("Inbox view changed", "AbortError");
   }
   private clearThreadMessagePins(id?: string) {
-    for (const key of id ? [id] : new Set([...this.threadMessagePins.keys(), ...this.threadValidations.keys(), ...this.threadHistoryLoads.keys()])) {
+    for (const key of id ? [id] : new Set([...this.threadMessagePins.keys(), ...this.threadBodyPins.keys(), ...this.threadValidations.keys(), ...this.threadHistoryLoads.keys()])) {
       this.threadMessagePins.delete(key);
+      this.threadBodyPins.delete(key);
       this.threadValidations.get(key)?.controller.abort(); this.threadValidations.delete(key);
       this.threadHistoryLoads.get(key)?.controller.abort(); this.threadHistoryLoads.delete(key);
     }
   }
-  pinThreadMessages = (id: string, ids: readonly string[]) => {
+  pinThreadMessages = (id: string, ids: readonly string[], visibleIds: readonly string[] = ids) => {
     if (!ids.length) { this.clearThreadMessagePins(id); return; }
     const row = this.windowRows.get(id);
     if (!row || this.sourceAccounts.find(source => source.id === row.sourceId)?.generation !== row.sourceGeneration) return;
@@ -500,7 +507,10 @@ export class InboxStore {
       const mailbox = resident.get(key)?.memberships.find(state => boxes.has(state.mailboxId))?.mailboxId;
       if (mailbox) pins.set(key, mailbox);
     }
-    if (pins.size) this.threadMessagePins.set(id, pins); else this.clearThreadMessagePins(id);
+    if (pins.size) {
+      this.threadMessagePins.set(id, pins);
+      this.threadBodyPins.set(id, new Set(visibleIds.filter(key => resident.has(key))));
+    } else this.clearThreadMessagePins(id);
   };
   private threadSummaries(row: InboxWindowRow, history = this.windowDetails.get(row.key)?.summaries ?? []) {
     if (!history.length && !this.threadMessagePins.get(row.key)?.size) return { summaries: row.summaries, truncated: false };
@@ -526,6 +536,7 @@ export class InboxStore {
     // Raw anchors plus disposable/pinned history share one unique 500-summary budget.
     this.windowRows.set(row.key, { ...row, summaries: selected.summaries.filter(summary => anchors.has(summary.id)) });
     this.windowDetails.set(row.key, { ...history, summaries: selected.summaries.filter(summary => !anchors.has(summary.id)), truncated: history.truncated || selected.truncated });
+    this.trimSpeculativeBodies(INBOX_WINDOW_BYTE_LIMIT);
     if (this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
       if (previousRow) this.windowRows.set(row.key, previousRow); else this.windowRows.delete(row.key);
       if (previous) this.windowDetails.set(row.key, previous); else this.windowDetails.delete(row.key);
@@ -587,6 +598,7 @@ export class InboxStore {
       this.windowPins.set(owner, new Set(ids));
       this.windowPinnedBytes.set(owner, new TextEncoder().encode(JSON.stringify(projections)).length * 2);
     } else { this.windowPins.delete(owner); this.windowPinnedBytes.delete(owner); }
+    if (projections.length) this.trimSpeculativeBodies(INBOX_WINDOW_BYTE_LIMIT);
     if (projections.length && this.state.window && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
       const keys = this.trimWindow(this.state.window.keys);
       this.publish({ window: { ...this.state.window, keys, residentBytes: this.windowBytes() } }); this.rebuild();
@@ -597,18 +609,30 @@ export class InboxStore {
     const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length * 2;
     const resident = new Map(this.state.mail.filter(mail => this.windowRows.has(mail.id)).map(mail => [mail.id, mail]));
     for (const row of this.windowRows.values()) if (!resident.has(row.key)) resident.set(row.key, row.mail);
-    return size([...this.windowRows.values()]) + size([...resident.values()]) + size([...this.windowDetails.values()]) + size([...this.details.values()])
+    return size([...this.windowRows.values()]) + size([...resident.values()]) + size([...this.windowDetails.values()]) + size([...this.details.values()]) + size([...this.speculativeDetails.values()].map(value => value.detail))
       + size([...this.threadMessagePins].map(([id, pins]) => [id, [...pins]])) + [...this.windowPinnedBytes.values()].reduce((sum, value) => sum + value, 0)
       + [...this.retainedViews.values()].reduce((sum, view) => sum + view.bytes, 0);
+  }
+  private trimSpeculativeBodies(limit: number) {
+    while (this.speculativeDetails.size && this.windowBytes() > limit) this.speculativeDetails.delete(this.speculativeDetails.keys().next().value!);
+  }
+  private protectedBodyIds() {
+    return new Set([...(this.windowPins.get("reader") ?? [])].flatMap(id => [...(this.threadBodyPins.get(id) ?? [])]));
   }
   private trimWindow(keys: string[], evict: "start" | "end" = "start"): string[] {
     const pins = this.pinnedWindowKeys();
     const active = new Set(keys);
     for (const id of this.windowRows.keys()) if (!active.has(id) && !pins.has(id)) { this.windowRows.delete(id); this.windowDetails.delete(id); this.clearThreadMessagePins(id); }
+    this.trimSpeculativeBodies(INBOX_WINDOW_BYTE_LIMIT / 2);
     // Retained inactive views are the cheapest to lose: oldest first, before any body cache or active row.
     while (this.retainedViews.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) this.retainedViews.delete(this.retainedViews.keys().next().value!);
     // Body eviction is not metadata deletion and never drops command intent/fences.
-    while (this.details.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) this.details.delete(this.details.keys().next().value!);
+    const protectedBodies = this.protectedBodyIds();
+    while (this.details.size && this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT / 2) {
+      const id = [...this.details.keys()].find(key => !protectedBodies.has(key));
+      if (!id) break;
+      this.details.delete(id);
+    }
     while (this.windowRows.size > INBOX_WINDOW_LIMIT || this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) {
       const candidates = evict === "start" ? keys : [...keys].reverse();
       const id = candidates.find(id => active.has(id) && this.windowRows.has(id));
@@ -2238,14 +2262,90 @@ export class InboxStore {
     timing({ conversations: mail.length });
   }
 
-  private cachedDetail(row: MailboxMessageSummary): SdkMessage | undefined {
-    const detail = this.details.get(row.id);
+  private cachedDetail(row: MailboxMessageSummary, detail = this.details.get(row.id)): SdkMessage | undefined {
     if (detail?.accountId !== row.sourceId) return;
     // The opaque SDK body identity includes attachments/envelope metadata, not
     // flags or memberships. A body read newer than our summary is also safe;
     // insisting on equality there would refetch forever until a scan catches up.
     if (row.bodyRevision && detail.bodyRevision) return row.bodyRevision === detail.bodyRevision || detail.revision > row.revision ? detail : undefined;
     return detail.revision >= row.revision ? detail : undefined;
+  }
+
+  // A request is shared, but admission and publication remain the caller's job.
+  private requestBody(mailboxId: string, row: MailboxMessageSummary): Promise<SdkMessage> {
+    const key = JSON.stringify([this.generation, this.bodyEpoch, this.windowEpoch, mailboxId, row.sourceId, row.id, row.bodyRevision, row.revision]);
+    const pending = this.bodyRequests.get(key); if (pending) return pending;
+    const request = this.client.mailboxMessage(mailboxId, row.id, this.requestOptions()).finally(() => {
+      if (this.bodyRequests.get(key) === request) this.bodyRequests.delete(key);
+    });
+    this.bodyRequests.set(key, request); return request;
+  }
+
+  private admitBody(detail: SdkMessage, row: MailboxMessageSummary, speculative: boolean, bounded = true): boolean {
+    if (detail.accountId !== row.sourceId) throw new Error("The conversation body belongs to another source.");
+    const current = this.messageRows.get(nativeKey(row.sourceId, row.id));
+    if (!current || current.threadId !== row.threadId || current.bodyRevision !== row.bodyRevision || current.revision !== row.revision) return false;
+    if (row.bodyRevision && detail.bodyRevision && row.bodyRevision !== detail.bodyRevision && detail.revision <= row.revision || detail.revision < row.revision && !row.bodyRevision) return false;
+    const previous = this.details.get(row.id);
+    if (previous && this.cachedDetail(row, previous) && previous.revision >= detail.revision) return false;
+    if (!bounded) { this.details.set(row.id, detail); this.speculativeDetails.delete(row.id); return true; }
+    const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length * 2;
+    const limit = 8 * 1024 * 1024, incoming = size(detail);
+    if (incoming > limit) { if (speculative) return false; throw new Error("This message exceeds the safe body cache size."); }
+    const protectedIds = this.protectedBodyIds();
+    let total = [...this.details].reduce((sum, [id, value]) => sum + (id === row.id ? 0 : size(value)), incoming)
+      + [...this.speculativeDetails].reduce((sum, [id, value]) => sum + (id === row.id ? 0 : size(value.detail)), 0);
+    const speculativeEvictions: string[] = [], evictions: string[] = [];
+    for (const [id, value] of this.speculativeDetails) {
+      if (total <= limit) break;
+      if (id === row.id) continue;
+      speculativeEvictions.push(id); total -= size(value.detail);
+    }
+    if (!speculative) for (const [id, value] of this.details) {
+      if (total <= limit) break;
+      if (id === row.id || protectedIds.has(id)) continue;
+      evictions.push(id); total -= size(value);
+    }
+    if (total > limit) { if (speculative) return false; throw new Error("Expanded messages exceed the safe body cache size. Collapse another message and try again."); }
+    for (const id of speculativeEvictions) this.speculativeDetails.delete(id);
+    for (const id of evictions) { this.details.delete(id); this.speculativeDetails.delete(id); }
+    if (speculative) {
+      this.speculativeDetails.set(row.id, { detail, generation: this.generation, bodyEpoch: this.bodyEpoch, windowEpoch: this.windowEpoch });
+      if (this.windowBytes() > INBOX_WINDOW_BYTE_LIMIT) { this.speculativeDetails.delete(row.id); return false; }
+    }
+    else { this.speculativeDetails.delete(row.id); this.details.set(row.id, detail); this.trimSpeculativeBodies(INBOX_WINDOW_BYTE_LIMIT); }
+    return true;
+  }
+
+  warmAdjacentBodies = (readerId: string | undefined, ids: readonly string[]) => {
+    ++this.warmingGeneration;
+    this.warmingQueue = [...new Set(ids)].filter(id => id !== readerId).slice(0, 3);
+    this.drainWarmingQueue();
+  };
+
+  private drainWarmingQueue() {
+    if (this.warmingActive || !this.warmingQueue.length) return;
+    this.warmingActive = true;
+    void (async () => {
+      while (this.warmingQueue.length) {
+        const id = this.warmingQueue.shift()!, ticket = this.warmingGeneration;
+        const mail = this.state.mail.find(value => value.id === id);
+        if (!mail?.window || mail.operationId || !this.windowRows.has(id)) continue;
+        const message = mail.messages.at(-1); if (!message || message.pending) continue;
+        const mailboxId = message.memberships?.[0]?.mailboxId ?? mail.mailboxId!;
+        const row = this.summaries.get(mailboxId)?.find(value => value.sourceId === mail.sourceId && value.id === message.id);
+        if (!row || this.cachedDetail(row)) continue;
+        const cached = this.speculativeDetails.get(row.id);
+        if (cached && cached.generation === this.generation && cached.bodyEpoch === this.bodyEpoch && cached.windowEpoch === this.windowEpoch && this.cachedDetail(row, cached.detail)) continue;
+        const generation = this.generation, bodyEpoch = this.bodyEpoch, windowEpoch = this.windowEpoch;
+        const context = this.windowRows.get(id);
+        try {
+          const detail = await this.requestBody(mailboxId, row);
+          if (ticket !== this.warmingGeneration || generation !== this.generation || bodyEpoch !== this.bodyEpoch || windowEpoch !== this.windowEpoch || this.windowRows.get(id) !== context) continue;
+          this.admitBody(detail, row, true);
+        } catch { /* Speculation never publishes errors. */ }
+      }
+    })().finally(() => { this.warmingActive = false; this.drainWarmingQueue(); });
   }
 
   loadMoreMessages = (id: string): Promise<void> => this.loadThreadHistory(id, false);
@@ -2309,38 +2409,64 @@ export class InboxStore {
   loadThread = (id: string, messageId?: string): Promise<void> => {
     const mail = this.state.mail.find(mail => mail.id === id);
     if (!mail || mail.operationId) return Promise.resolve();
-    const key = nativeKey(mail.sourceId!, mail.sdkThreadId!) + (mail.window ? `\0${messageId ?? mail.messages.at(-1)?.id}` : "");
+    const key = JSON.stringify([this.generation, this.bodyEpoch, mail.window ? this.windowEpoch : null,
+      nativeKey(mail.sourceId!, mail.sdkThreadId!), mail.window ? messageId ?? mail.messages.at(-1)?.id : null]);
     const pending = this.loadingThreads.get(key); if (pending) return pending;
     const generation = this.generation;
     const bodyEpoch = this.bodyEpoch;
+    const windowEpoch = this.windowEpoch;
     const timing = measurePerformance({ kind: "thread", messages: mail.messages.length });
     const work = (async () => {
       const changed = new Set<string>();
       let fetched = 0;
       for (const message of mail.messages) if (!message.pending && (!mail.window || message.id === (messageId ?? mail.messages.at(-1)?.id))) {
-        const mailboxId = message.memberships?.[0]?.mailboxId ?? mail.mailboxId!;
-        const row = this.summaries.get(mailboxId)?.find(row => row.sourceId === mail.sourceId && row.id === message.id);
-        if (!row || this.cachedDetail(row)) continue;
-        const detail = await this.client.mailboxMessage(mailboxId, message.id, this.requestOptions());
-        fetched++;
-        if (generation !== this.generation || bodyEpoch !== this.bodyEpoch) return;
-        if (detail.accountId !== row.sourceId) throw new Error("The conversation body belongs to another source.");
-        const previous = this.details.get(message.id);
-        if (previous && previous.revision >= detail.revision) continue;
-        this.details.set(message.id, detail);
-        if (mail.window) {
-          const bytes = () => new TextEncoder().encode(JSON.stringify([...this.details.values()])).length * 2;
-          while (this.details.size > 1 && bytes() > 8 * 1024 * 1024) this.details.delete(this.details.keys().next().value!);
-          if (bytes() > 8 * 1024 * 1024) { this.details.delete(message.id); throw new Error("This message exceeds the safe body cache size."); }
+        const resolve = () => {
+          const currentMail = this.state.mail.find(value => value.id === id && value.sourceId === mail.sourceId && value.sdkThreadId === mail.sdkThreadId && value.sourceGeneration === mail.sourceGeneration);
+          const currentMessage = currentMail?.messages.find(value => value.id === message.id && !value.pending);
+          if (!currentMail || !currentMessage) return;
+          const ids = [...new Set([...(currentMessage.memberships?.map(value => value.mailboxId) ?? []), currentMail.mailboxId].filter((value): value is string => !!value))];
+          for (const mailboxId of ids) {
+            const row = this.summaries.get(mailboxId)?.find(value => value.sourceId === mail.sourceId && value.threadId === mail.sdkThreadId && value.id === message.id && value.memberships.some(member => member.mailboxId === mailboxId));
+            if (row) return { mailboxId, row };
+          }
+        };
+        let target = resolve();
+        while (target) {
+          const { mailboxId, row } = target;
+          if (this.cachedDetail(row)) break;
+          const speculative = this.speculativeDetails.get(row.id);
+          let detail: SdkMessage;
+          if (speculative && speculative.generation === generation && speculative.bodyEpoch === bodyEpoch && speculative.windowEpoch === this.windowEpoch && this.cachedDetail(row, speculative.detail)) detail = speculative.detail;
+          else {
+            try { detail = await this.requestBody(mailboxId, row); fetched++; }
+            catch (error) {
+              if (generation !== this.generation || bodyEpoch !== this.bodyEpoch || mail.window && windowEpoch !== this.windowEpoch) return;
+              const current = resolve();
+              if (current && current.mailboxId !== mailboxId) { target = current; continue; }
+              throw error;
+            }
+          }
+          if (generation !== this.generation || bodyEpoch !== this.bodyEpoch || mail.window && windowEpoch !== this.windowEpoch) return;
+          if (detail.accountId !== row.sourceId) throw new Error("The conversation body belongs to another source.");
+          const next = resolve(); if (!next) break;
+          if (next.mailboxId !== mailboxId) { target = next; continue; }
+          const current = next.row;
+          const changedRow = current.revision !== row.revision || current.bodyRevision !== row.bodyRevision;
+          if (this.cachedDetail(current, detail)) {
+            if (this.admitBody(detail, current, false, !!mail.window)) changed.add(nativeKey(current.sourceId, current.threadId));
+            break;
+          }
+          // Retry only a superseded request, not an invalid response to an unchanged row.
+          if (!changedRow) break;
+          target = next;
         }
-        changed.add(nativeKey(row.sourceId, row.threadId));
       }
       if (changed.size) this.rebuild(changed);
       else if (this.calendarKey !== displayTimes().key) this.rebuild();
       this.resolve("thread"); timing({ pages: fetched, conversations: changed.size });
     })().catch(error => { timing({ outcome: "error" }); this.fail(error, "load-thread"); throw error; }).finally(() => {
       if (this.loadingThreads.get(key) === work) this.loadingThreads.delete(key);
-      if (generation === this.generation && bodyEpoch !== this.bodyEpoch) void this.loadThread(id).catch(() => {});
+      if (generation === this.generation && bodyEpoch !== this.bodyEpoch && (!mail.window || windowEpoch === this.windowEpoch)) void this.loadThread(id, messageId).catch(() => {});
     });
     this.loadingThreads.set(key, work); return work;
   };

@@ -2817,7 +2817,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
     for (const [name, sizes] of [["full", [100, 100, 0, 1]], ["sparse", [3, 2, 0, 1]], ["empty", [0, 0, 0, 1]], ["exhausted", [0]], ["unfinished", [0]]] as const) {
       const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [], mismatchedCheckpoints: number[] = [];
       const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
-      let queries = 0, revision = 1, holdQuery = false, heldQuery = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let queries = 0, revision = 1, holdQuery = false, heldQuery = false, remoteImages = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
       // The host count pager is resumable: unknown until its bounded passes finish, then exact.
       const countRequests: string[] = [], countsKnownAfter = name === "sparse" ? 8 : Infinity;
       const knownTotals: Page["totals"] = { conversations: 6, messages: 6, inbox: 7, splits: { Important: 7, Other: 0 }, folders: { Inbox: 7 }, holding: false };
@@ -2827,6 +2827,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
       let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
       let lookupRead: ((ids: string[]) => Row[]) | undefined;
       let bodyRead: ((id: string) => import("inbox-sdk/types").Message | Promise<import("inbox-sdk/types").Message>) | undefined;
+      const bodyPaths: string[] = [];
       let summaryRead: ((id: string, signal: AbortSignal) => Promise<import("inbox-sdk/types").MailboxMessageSummary | Response>) | undefined;
       let senderRead: ((input: SenderInput) => SenderResult) | undefined;
       let signedState = name === "full";
@@ -2853,7 +2854,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
         if (url.pathname === "/v1/mailboxes") return Response.json([box]);
         if (url.pathname === "/v1/changes") return Response.json({ state: "fictional-state", events: [], hasMore: false, resetRequired: false });
         if (["/v1/labels", "/v1/drafts", `/v1/accounts/${source.id}/folders`].includes(url.pathname)) return Response.json([]);
-        if (url.pathname === "/v1/policy") return Response.json({ remoteImages: false, undoSendSeconds: 0 });
+        if (url.pathname === "/v1/policy") return Response.json({ remoteImages, undoSendSeconds: 0 });
         if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: false, providers: [], inboxWindow: true });
         if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "selected", includedMailboxIds: [box.id], pinnedMailboxIds: [] });
         if (url.pathname === "/host/inbox/query") {
@@ -2887,7 +2888,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           const result = await summaryRead(decodeURIComponent(url.pathname.split("/").at(-2)!), init!.signal!);
           return result instanceof Response ? result : Response.json(result);
         }
-        if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && bodyRead) return Response.json(await bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!)));
+        if (/^\/v1\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname) && bodyRead) { bodyPaths.push(url.pathname); return Response.json(await bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!))); }
         if (url.pathname === "/host/inbox/sender" && senderRead) return Response.json(senderRead(JSON.parse(String(init?.body))));
         if (["/host/inbox/zero/create", "/host/inbox/selection/create"].includes(url.pathname)) {
           captures.push({ path: url.pathname, ...JSON.parse(String(init?.body)) });
@@ -3134,7 +3135,7 @@ test("demand-driven host windows bound automatic requests and render unknown tot
               targets: Array.from({ length: 500 }, (_, i) => ({ mailboxId: box.id, messageId: `giant-${i + 1}`, revision: 1 })),
               targetsComplete: false, actionContextComplete: false, contextVersion: "same-giant-context" };
           };
-          const otherSummary = summary(1, "companion");
+          let otherSummary = summary(1, "companion");
           const companionRow: Row = { key: `${box.id}:companion`, sourceId: source.id, threadId: "companion", sourceGeneration: 1, revision: 1,
             mail: projected([otherSummary]), summaries: [otherSummary], messagesComplete: true,
             counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 }, targets: [{ mailboxId: box.id, messageId: otherSummary.id, revision: 1 }],
@@ -3150,14 +3151,156 @@ test("demand-driven host windows bound automatic requests and render unknown tot
             if (holdHistory && offset === 2) await new Promise<void>(resolve => { releaseHistory = resolve; });
             return result;
           };
-          bodyRead = id => {
-            assert.ok(id === deepId || id === otherSummary.id); bodyReads.push(id);
-            const message = id === deepId ? summary(501) : otherSummary;
+          let failWarm = true, holdBody = false, releaseBody: (() => void) | undefined;
+          bodyRead = async id => {
+            assert.ok(id === deepId || id === otherSummary.id || id === "giant-700" || id === "giant-699"); bodyReads.push(id);
+            if (failWarm) { failWarm = false; throw new Error("Fictional background failure"); }
+            const message = id === deepId ? summary(501) : id === "giant-700" ? summary(700) : id === "giant-699" ? summary(699) : otherSummary;
+            if (holdBody) { holdBody = false; await new Promise<void>(resolve => { releaseBody = resolve; }); }
             return { ...message, snoozedUntil: null, bcc: [], attachments: [], bodyFormat: "html", bodyHtml: `<p>${message.bodyRevision}</p>`, bodyText: message.bodyRevision! };
           };
           await store.seekWindow("start");
           assert.ok(!giantRow().summaries.some(message => message.id === deepId) && !giantRow().targets.some(target => target.messageId === deepId));
+          let beforeWarm = store.getSnapshot();
+          const pageCountBeforeWarm = pages.length;
+          store.warmAdjacentBodies(undefined, []);
+          store.warmAdjacentBodies(giantKey, [companionRow.key]);
+          await until(() => bodyReads.length === 1, "a synchronous empty-to-nonempty warming transition drains the queue");
+          await sleep(20);
+          assert.strictEqual(store.getSnapshot(), beforeWarm, "background failures are silent");
+          bodyReads.length = 0;
+          holdBody = true;
+          store.warmAdjacentBodies(undefined, ["nonresident-conversation"]);
+          store.warmAdjacentBodies(giantKey, [companionRow.key]);
+          await until(() => !!releaseBody, "work queued as a drain completes is not stranded");
+          const foreground = store.loadThread(companionRow.key);
+          assert.equal(bodyReads.length, 1, "foreground shares the in-flight speculative request");
+          otherSummary = { ...otherSummary, revision: 2, bodyRevision: "companion-body-2" };
+          Object.assign(companionRow, { revision: revision + 1, summaries: [otherSummary], mail: projected([otherSummary]) });
+          reverseDelta = { upserts: [companionRow], newHead: [], removed: [] }; await store.retry();
+          assert.strictEqual(store.loadThread(companionRow.key), foreground, "a rerender shares the existing foreground load");
+          releaseBody!(); releaseBody = undefined;
+          await foreground;
+          assert.equal(bodyReads.length, 2, "a superseded foreground request retries the current body");
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!.messages[0].body, "<p>companion-body-2</p>");
+          const internals = store as unknown as { details: Map<string, import("inbox-sdk/types").Message>; speculativeDetails: Map<string, unknown>; summaries: Map<string, Summary[]>; messageRows: Map<string, Summary>; publish: (state: unknown) => void; rebuild: (threads: Set<string>) => void; windowBytes: () => number; windowPinnedBytes: Map<string, number>; windowRows: Map<string, Row>; windowDetails: Map<string, unknown>; saveThreadHistory: (row: Row, history: unknown) => void; trimWindow: (keys: string[]) => string[] };
+          internals.details.delete(otherSummary.id);
+          internals.rebuild(new Set([`${source.id}\0companion`]));
+          holdBody = true;
+          const membershipPaths = bodyPaths.length;
+          const moving = store.loadThread(companionRow.key);
+          await until(() => !!releaseBody, "body request is held while membership changes");
+          const alternative = "fictional-other-box", moved = { ...otherSummary, memberships: [{ ...otherSummary.memberships[0], mailboxId: alternative }] };
+          const originalRows = internals.summaries.get(box.id)!;
+          internals.summaries.set(box.id, originalRows.filter(row => row.id !== otherSummary.id));
+          internals.summaries.set(alternative, [moved]);
+          internals.messageRows.set(`${source.id}\0${otherSummary.id}`, moved);
+          const currentMail = store.getSnapshot().mail;
+          internals.publish({ mail: currentMail.map(mail => mail.id !== companionRow.key ? mail : { ...mail, mailboxId: alternative, messages: mail.messages.map(message => ({ ...message, memberships: moved.memberships })) }) });
+          releaseBody!(); releaseBody = undefined; await moving;
+          assert.deepEqual(bodyPaths.slice(membershipPaths), [`/v1/mailboxes/${box.id}/messages/${otherSummary.id}`, `/v1/mailboxes/${alternative}/messages/${otherSummary.id}`], "a changed membership retries against the current mailbox");
+          assert.ok(internals.details.has(otherSummary.id), "the moved message body is admitted");
+          internals.summaries.set(box.id, originalRows); internals.summaries.delete(alternative);
+          internals.messageRows.set(`${source.id}\0${otherSummary.id}`, otherSummary);
+          internals.publish({ mail: currentMail });
+          internals.details.delete(otherSummary.id);
+          internals.rebuild(new Set([`${source.id}\0companion`]));
+          beforeWarm = store.getSnapshot(); bodyReads.length = 0;
+          store.warmAdjacentBodies(giantKey, [companionRow.key]);
+          await until(() => bodyReads.includes(otherSummary.id), "adjacent body is warmed");
+          await sleep(20);
+          assert.strictEqual(store.getSnapshot(), beforeWarm, "warming does not publish a replacement model");
+          assert.equal(pages.length, pageCountBeforeWarm, "warming does not request additional window metadata");
           await store.loadThread(companionRow.key);
+          assert.equal(bodyReads.length, 1, "foreground promotion uses the warmed body without another request");
+          assert.ok(store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!.messages[0].loaded, "foreground promotion publishes the admitted body");
+          const windowLimit = 32 * 1024 * 1024, beforeWindowPressure = bodyReads.length;
+          internals.windowPinnedBytes.set("fictional-pressure", windowLimit - internals.windowBytes() - 50);
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => bodyReads.length > beforeWindowPressure, "window-budget speculative read is attempted");
+          await sleep(30);
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "speculation is rejected when it would exceed the window budget");
+          assert.ok(internals.windowBytes() <= windowLimit);
+          internals.windowPinnedBytes.delete("fictional-pressure");
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => internals.speculativeDetails.has("giant-700"), "body is admitted when window pressure is removed");
+          const windowKeys = store.getSnapshot().window!.keys;
+          internals.windowPinnedBytes.set("fictional-pressure", windowLimit / 2 - internals.windowBytes() + 100);
+          assert.deepEqual(internals.trimWindow(windowKeys), windowKeys, "speculation does not displace resident rows when the window trims");
+          assert.ok(internals.details.has(otherSummary.id), "speculation is evicted before published bodies when the window trims");
+          assert.equal(internals.speculativeDetails.has("giant-700"), false);
+          internals.windowPinnedBytes.delete("fictional-pressure");
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => internals.speculativeDetails.has("giant-700"), "body can be warmed again after trimming");
+          const savedRow = internals.windowRows.get(giantKey)!, savedHistory = internals.windowDetails.get(giantKey);
+          internals.windowPinnedBytes.set("fictional-pressure", windowLimit - internals.windowBytes() - 200);
+          internals.saveThreadHistory(savedRow, { contextVersion: savedRow.contextVersion, summaries: [summary(1)], cursor: null, exhausted: true });
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "foreground history evicts speculation before rejecting its window");
+          assert.ok(internals.windowBytes() <= windowLimit);
+          internals.windowPinnedBytes.delete("fictional-pressure");
+          internals.windowRows.set(giantKey, savedRow);
+          if (savedHistory) internals.windowDetails.set(giantKey, savedHistory); else internals.windowDetails.delete(giantKey);
+          bodyReads.length = 1;
+          const normalDetail = internals.details.get(otherSummary.id)!;
+          const largeText = "x".repeat(2_200_000);
+          internals.details.set(otherSummary.id, { ...normalDetail, bodyText: largeText });
+          internals.rebuild(new Set([`${source.id}\0companion`]));
+          const pressuredSnapshot = store.getSnapshot();
+          const ordinaryRead = bodyRead;
+          bodyRead = async id => ({ ...await ordinaryRead!(id), bodyText: largeText });
+          // Speculative admission must protect even unpinned published details.
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => bodyReads.includes("giant-700"), "cache-pressure speculative request completes");
+          await sleep(50);
+          assert.strictEqual(store.getSnapshot(), pressuredSnapshot, "cache pressure causes no speculative publication");
+          assert.equal(internals.details.get(otherSummary.id)?.bodyText, largeText, "speculation cannot evict a published unpinned body");
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "speculation is skipped when published bodies consume the budget");
+          const readsUnderPressure = bodyReads.length; await store.loadThread(companionRow.key);
+          assert.equal(bodyReads.length, readsUnderPressure, "the published body remains cached under speculation pressure");
+          store.warmAdjacentBodies(companionRow.key, []);
+          store.pinWindow("reader", [giantKey]);
+          await store.loadThread(giantKey);
+          assert.equal(internals.details.has(otherSummary.id), false, "foreground admission may evict the formerly displayed body after the reader pin moves");
+          assert.equal(internals.details.get("giant-700")?.bodyText, largeText, "the newly displayed large body is admitted");
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.at(-1)!.loaded, true);
+          internals.details.delete("giant-700");
+          internals.rebuild(new Set([`${source.id}\0giant`]));
+          store.pinThreadMessages(giantKey, ["giant-699", "giant-700"], ["giant-699"]);
+          await store.loadThread(giantKey, "giant-699");
+          store.pinThreadMessages(giantKey, ["giant-699", "giant-700"], ["giant-699", "giant-700"]);
+          await assert.rejects(store.loadThread(giantKey, "giant-700"), /Collapse another message/, "simultaneously expanded bodies that exceed the cap fail honestly");
+          assert.ok(internals.details.has("giant-699"), "an expanded body is not evicted to admit another expanded body");
+          store.pinThreadMessages(giantKey, ["giant-699", "giant-700"], ["giant-700"]);
+          await store.loadThread(giantKey, "giant-700");
+          assert.equal(internals.details.has("giant-699"), false, "a collapsed body in the same conversation can be evicted");
+          assert.equal(internals.details.get("giant-700")?.bodyText, largeText);
+          bodyRead = async id => ({ ...await ordinaryRead!(id), accountId: "foreign-source" });
+          await assert.rejects(store.loadThread(giantKey, "giant-699"), /another source/, "source fences still reject foreign bodies under pressure");
+          assert.ok(internals.details.has("giant-700"), "a foreign response cannot evict the visible body");
+          store.pinWindow("reader", []);
+          store.pinThreadMessages(giantKey, []);
+          internals.details.delete("giant-700");
+          internals.details.set(otherSummary.id, normalDetail);
+          internals.rebuild(new Set([`${source.id}\0companion`, `${source.id}\0giant`]));
+          bodyRead = ordinaryRead;
+          holdBody = true;
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => !!releaseBody, "navigation-fenced speculative body is held");
+          store.warmAdjacentBodies(undefined, []);
+          const afterNavigation = store.getSnapshot();
+          releaseBody!(); releaseBody = undefined; await sleep(50);
+          assert.strictEqual(store.getSnapshot(), afterNavigation);
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "a cancelled navigation cannot admit its late body");
+          holdBody = true;
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => !!releaseBody, "policy-fenced speculative body is held");
+          remoteImages = true; await store.retry();
+          const afterPolicy = store.getSnapshot();
+          releaseBody!(); releaseBody = undefined; await sleep(50);
+          assert.strictEqual(store.getSnapshot(), afterPolicy, "a pre-policy speculative reply cannot publish after the policy change");
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "a pre-policy speculative reply is not admitted");
+          await store.loadThread(companionRow.key);
+          bodyReads.length = 1;
           const companion = store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!;
           await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey); await store.loadThread(giantKey, deepId);
           let cachedMail = store.getSnapshot().mail;
