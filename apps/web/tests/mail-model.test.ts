@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { accounts, seedMail, defaultPreferences, type Draft, type Mail } from "../src/data.ts";
 import { matchesSearch, splitRuleError } from "../src/mail-search.ts";
-import { selectMailView } from "../src/mail-view.ts";
+import { selectMailView, selectZeroQueue, zeroEligible, zeroScope, sameZeroScope, zeroStorageKey, zeroReviewVersion, zeroBatchCandidate, normalizeZeroSession, ZERO_QUEUE_LIMIT, type ZeroSession } from "../src/mail-view.ts";
 import { classifyAttention, conversationAttention } from "../../shared/mail-attention.ts";
-import { AI_TRIAGE_VERSION, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
+import { AI_INPUT_POLICY_VERSION, AI_TRIAGE_VERSION, aiSortingStatus, type AiDecision, type AiTriageState } from "../../shared/ai-triage.ts";
 import { normalizeSplits, attentionSplit } from "../../shared/splits.ts";
 import { senderActivity, senderContact, senderConversations, senderHostname, type SenderHistoryMessage } from "../src/sender-context.ts";
 import {
@@ -28,6 +28,834 @@ const inbox = seedMail().find(
     mail.messages.every((message) => message.email !== mail.account),
 )!;
 const deadline = "2026-10-01T12:00:00.000Z";
+
+test("guided zero snapshots all active Important work without unread, custom-split or receiving-view leaks", () => {
+  const now = Date.parse(deadline);
+  const boxes = ["a", "b", "c"].map(id => ({ id, sourceId: id === "c" ? "source-b" : "source-a", sourceGeneration: 1, name: id, email: `${id}@example.test`, canSend: false }));
+  const scope = zeroScope(UNIFIED_ACCOUNT, ["b", "a", "c"], boxes);
+  const make = (thread: string, box = "a"): Mail => ({ ...inbox, id: `${box}:${thread}`, account: box, mailboxId: box, sourceId: box === "c" ? "source-b" : "source-a", sdkThreadId: thread,
+    split: "Custom overlapping filter", folder: "Inbox", locations: ["Inbox"], unread: false,
+    messages: [{ ...inbox.messages[0], id: `message:${thread}`, outgoing: false, nativeFolder: "inbox", bodyRevision: "body-1", receivedAt: deadline,
+      attention: classifyAttention({ subject: "Please reply", preview: "" }), memberships: [{ mailboxId: box, messageId: `message:${thread}`, revision: 1, done: false, snoozedUntil: null }] }] });
+  const read = make("read"), unread = { ...make("unread"), unread: true }, other = make("other"), done = make("done"), sleeping = make("sleeping"), doneSleeping = make("done-sleeping");
+  other.messages[0].attention = classifyAttention({ subject: "Weekly digest", preview: "", facts: { version: 1, listId: true, listUnsubscribe: true } });
+  done.messages[0].memberships![0].done = true;
+  sleeping.messages[0].memberships![0].snoozedUntil = new Date(now + 60000).toISOString();
+  doneSleeping.messages[0].memberships![0] = { ...doneSleeping.messages[0].memberships![0], done: true, snoozedUntil: sleeping.messages[0].memberships![0].snoozedUntil };
+  const all = unifiedMail([read, make("read", "b"), make("read", "c"), unread, other, done, sleeping, doneSleeping], ["a", "b", "c"], boxes, now);
+  const before = structuredClone(all);
+  const queue = selectZeroQueue([...all, ...all], scope, now);
+  assert.equal(queue.total, 3, "read Important and a same-thread-ID different source count separately; overlapping views do not");
+  assert.equal(queue.overflowCount, 0);
+  assert.deepEqual(new Set(queue.ids), new Set(all.filter(mail => ["read", "unread"].includes(mail.sdkThreadId!)).map(mail => mail.id)));
+  assert.ok(queue.ids.every(id => all.find(mail => mail.id === id)?.messages.some(message => message.memberships?.some(state => !state.done))));
+  assert.equal(zeroEligible({ ...all[0], operationId: "queued-send" }, scope, now), false);
+  assert.equal(zeroEligible(read, scope, now), false, "individual views cannot enter a Unified snapshot");
+  assert.equal(selectZeroQueue(all, zeroScope(UNIFIED_ACCOUNT, [], boxes), now).total, 0, "empty Unified selection never falls back to all mail");
+  const expanded = all.find(mail => mail.sourceId === "source-a" && mail.sdkThreadId === "read")!;
+  assert.equal(zeroEligible(expanded, zeroScope(UNIFIED_ACCOUNT, ["a"], boxes), now), false, "a projection containing an uncaptured receiving membership is rejected");
+  const mixed = unifiedMail([sleeping, make("sleeping", "b")], ["a", "b"], boxes, now)[0];
+  assert.equal(zeroEligible(mixed, scope, now), true, "one future reminder cannot hide another awake receiving membership");
+  const mixedDone = { ...unifiedMail([done, make("done", "b")], ["a", "b"], boxes, now)[0], locations: ["Inbox", "Done"] };
+  assert.equal(zeroEligible(mixedDone, scope, now), true, "an aggregate Done location cannot hide another awake receiving membership");
+  assert.deepEqual(selectZeroQueue([mixedDone], scope, now).ids, [mixedDone.id]);
+  const mixedFolders = { ...expanded, locations: ["Inbox", "Spam"], messages: [
+    { ...expanded.messages[0], id: "old-spam", nativeFolder: "spam", memberships: expanded.messages[0].memberships!.map(state => ({ ...state, messageId: "old-spam" })) },
+    ...expanded.messages,
+  ] };
+  assert.equal(selectMailView([mixedFolders], UNIFIED_ACCOUNT, "Inbox", "Important", defaultPreferences, false, "", null).visibleMail.length, 1);
+  assert.deepEqual(selectZeroQueue([mixedFolders], scope, now).ids, [mixedFolders.id], "old hidden history cannot exclude a currently visible Important request");
+  assert.equal(zeroEligible({ ...mixedFolders, messages: mixedFolders.messages.map(message => ({ ...message, nativeFolder: "spam" })) }, scope, now), false);
+  const fullyDone = { ...unifiedMail([done], ["a"], boxes, now)[0], locations: ["Inbox", "Done"], unread: true };
+  assert.equal(zeroEligible(fullyDone, scope, now), false, "fully Done memberships remain excluded even with unread and an Inbox location");
+  const held = { ...expanded, aiHoldUntil: Math.max(now, Date.now()) + 60000 };
+  assert.equal(zeroEligible(held, scope, now), true, "explicit session start does not wait for automatic inference");
+  assert.deepEqual(selectZeroQueue([held], scope, now), { ids: [held.id], total: 1, overflowCount: 0 }, "held Important cannot produce a false zero");
+  const presentation = selectMailView([held], UNIFIED_ACCOUNT, "Inbox", "Important", defaultPreferences, false, "", null);
+  assert.equal(presentation.holdingMail, true); assert.deepEqual(presentation.visibleMail, [], "normal-screen arrival presentation keeps its existing hold");
+  const due = unifiedMail([sleeping], ["a"], boxes, now + 60001)[0];
+  assert.equal(zeroEligible(due, scope, now + 60001), true);
+  assert.deepEqual(all, before, "snapshot selection never changes mail or membership state");
+  const later = unifiedMail([make("later-arrival")], ["a"], boxes, now)[0];
+  assert.equal(queue.ids.includes(later.id), false, "a captured queue remains ID-only and does not absorb later arrivals");
+});
+
+test("guided zero review identity ignores opens and flag revisions but fences content, replies and receiving state", () => {
+  const boxes = ["a", "b"].map(id => ({ id, sourceId: "source", sourceGeneration: 1, name: id, email: `${id}@example.test`, canSend: false }));
+  const scope = zeroScope("a", [], boxes);
+  const mail: Mail = { ...inbox, id: "a:thread", account: "a", sourceId: "source", sdkThreadId: "thread", locations: ["Inbox"],
+    messages: [{ ...inbox.messages[0], id: "message", bodyRevision: "body-1", revision: 1, receivedAt: deadline, nativeFolder: "inbox", outgoing: false,
+      memberships: [{ mailboxId: "a", messageId: "message", revision: 1, done: false, snoozedUntil: null }] }] };
+  const version = zeroReviewVersion(mail, scope);
+  const opened = { ...mail, unread: false, starred: true, opened: "Just now", messages: mail.messages.map(message => ({ ...message, isRead: true, isStarred: true, revision: 9, loaded: true, body: "loaded later", memberships: message.memberships!.map(state => ({ ...state, revision: 8 })) })) };
+  assert.equal(zeroReviewVersion(opened, scope), version);
+  assert.equal(zeroReviewVersion({ ...mail, messages: [...mail.messages, { ...mail.messages[0], id: "pending-send", pending: true, outgoing: true }] }, scope), version, "pending is not a confirmed reply");
+  for (const changed of [
+    { ...mail, subject: "Changed subject" },
+    { ...mail, messages: [...mail.messages, { ...mail.messages[0], id: "new-reply" }] },
+    { ...mail, messages: mail.messages.map(message => ({ ...message, bodyRevision: "body-2" })) },
+    { ...mail, messages: mail.messages.map(message => ({ ...message, nativeFolder: "archive" })) },
+    { ...mail, messages: mail.messages.map(message => ({ ...message, memberships: message.memberships!.map(state => ({ ...state, done: true })) })) },
+    { ...mail, messages: mail.messages.map(message => ({ ...message, memberships: message.memberships!.map(state => ({ ...state, snoozedUntil: deadline })) })) },
+  ]) assert.notEqual(zeroReviewVersion(changed, scope), version);
+  assert.notEqual(zeroReviewVersion(mail, zeroScope("a", [], boxes.map(box => ({ ...box, sourceGeneration: 2 })))), version);
+  assert.notEqual(zeroReviewVersion(mail, zeroScope(UNIFIED_ACCOUNT, ["a", "b"], boxes)), version);
+  assert.equal(zeroEligible({ ...mail, messages: [...mail.messages, { ...mail.messages[0], id: "new-reply" }] }, scope, Date.parse(deadline)), true, "changed context remains reviewable rather than becoming completed");
+});
+
+test("guided zero batches require current quiet proof and never route around manual choices or uncertainty", () => {
+  const now = Date.parse(deadline);
+  const scope = zeroScope("box", [], [{ id: "box", sourceId: "source", sourceGeneration: 1, name: "Box", email: "me@example.test", canSend: false }]);
+  const ai = { configured: true, settings: { enabled: true, revision: 2, model: "fixture-model", mode: "apply" } } as AiTriageState;
+  const decision: AiDecision = { sourceId: "source", threadId: "thread", revision: 1, settingsRevision: 2, state: "ready", mailboxIds: ["box"], messageIds: ["message"],
+    contextVersions: [{ messageId: "message", bodyRevision: "body-1" }], latestMessageId: "message", inputHash: "fixture-hash", model: "fixture-model", schemaVersion: AI_TRIAGE_VERSION,
+    updatedAt: deadline, holdUntil: null, assessment: { type: "newsletter", response: "not_needed", task: "none", actions: [], urgency: "none", deadline: null, topics: [], risk: "none_observed", certainty: "clear", reason: "Fictional quiet campaign", evidence: [{ messageRef: "m1", field: "type", quote: "Newsletter" }] },
+    score: { category: "Important", score: 55, reasons: [], contributions: [], version: "preference-2" }, override: null, problemCode: null };
+  const mail: Mail = { ...inbox, id: "box:thread", account: "box", mailboxId: "box", sourceId: "source", sdkThreadId: "thread", locations: ["Inbox"], attentionCategory: "Important", triage: decision,
+    messages: [{ ...inbox.messages[0], id: "message", bodyRevision: "body-1", revision: 1, nativeFolder: "inbox", outgoing: false,
+      attention: classifyAttention({ subject: "Weekly digest", preview: "", facts: { version: 1, listId: true, listUnsubscribe: true } }),
+      memberships: [{ mailboxId: "box", messageId: "message", revision: 1, done: false, snoozedUntil: null }] }] };
+  const candidate = zeroBatchCandidate(mail, scope, ai, now)!;
+  assert.equal(candidate.basis, "no-outstanding-work", "a legacy Important score does not defeat explicit quiet assessment proof");
+  assert.equal(candidate.membershipCount, 1);
+  assert.equal(candidate.reviewVersion, zeroReviewVersion(mail, scope));
+  const legacy = { ...mail, triage: { ...decision, schemaVersion: "triage-1", assessment: { ...decision.assessment!, task: undefined } } };
+  assert.equal(zeroBatchCandidate(legacy, scope, ai, now)?.basis, "quiet-legacy-campaign");
+  assert.equal(zeroBatchCandidate({ ...legacy, triage: { ...legacy.triage, assessment: { ...legacy.triage.assessment, evidence: [] } } }, scope, ai, now), null);
+  for (const change of [
+    { certainty: "insufficient" }, { certainty: "ambiguous" }, { task: "unknown" }, { task: "required" }, { task: "optional" },
+    { response: "unknown" }, { response: "waiting" }, { response: "optional" }, { response: "needed" }, { type: "unknown" },
+    { actions: ["review"] }, { urgency: "immediate" }, { urgency: "routine" }, { deadline }, { risk: "unknown" }, { risk: "unsolicited" }, { risk: "phishing_suspected" },
+  ] satisfies Array<Partial<NonNullable<AiDecision["assessment"]>>>) {
+    assert.equal(zeroBatchCandidate({ ...mail, triage: { ...decision, assessment: { ...decision.assessment!, ...change } } }, scope, ai, now), null, JSON.stringify(change));
+  }
+  for (const state of ["pending", "processing", "failed", "stale"] as const) assert.equal(zeroBatchCandidate({ ...mail, triage: { ...decision, state } }, scope, ai, now), null);
+  for (const triage of [
+    { ...decision, model: "old-model" }, { ...decision, settingsRevision: 1 }, { ...decision, problemCode: "AI_INSUFFICIENT_CONTEXT" },
+    { ...decision, contextVersions: [] }, { ...decision, contextVersions: [{ messageId: "message", bodyRevision: null }] },
+    { ...decision, override: { category: "Important" as const, inputHash: "fixture-hash", at: deadline } },
+    { ...decision, override: { category: "Other" as const, inputHash: "fixture-hash", at: deadline } },
+  ]) assert.equal(zeroBatchCandidate({ ...mail, triage }, scope, ai, now), null);
+  for (const category of ["Important", "Other"] as const) {
+    const manual = { ...mail, attentionOverride: { sourceId: "source", threadId: "thread", revision: 1, override: { category,
+      context: { sourceId: "source", threadId: "thread", sourceGeneration: 1, mailboxIds: ["box"], latestMessageId: "message",
+        messages: [{ messageId: "message", revision: 1, bodyRevision: "body-1", memberships: [{ mailboxId: "box", revision: 1 }] }] } } } };
+    assert.equal(zeroBatchCandidate(manual, scope, ai, now), null, `explicit ${category} is never suggested again`);
+  }
+  assert.equal(zeroBatchCandidate(mail, scope, null, now), null);
+  assert.equal(zeroBatchCandidate(mail, scope, { ...ai, settings: { ...ai.settings, enabled: false } }, now), null);
+  assert.equal(zeroBatchCandidate(mail, scope, { ...ai, settings: { ...ai.settings, mode: "preview" } }, now)?.basis, "no-outstanding-work", "a current preview may inform an explicit user-confirmed suggestion");
+  assert.equal(zeroBatchCandidate({ ...mail, triage: undefined }, scope, ai, now), null, "an unexplained applied Important category cannot fall back around missing AI proof");
+  assert.equal(zeroBatchCandidate({ ...mail, messages: [...mail.messages, { ...mail.messages[0], id: "pending", pending: true }] }, scope, ai, now), null);
+  assert.equal(zeroBatchCandidate({ ...mail, messages: [...mail.messages, { ...mail.messages[0], id: "new-reply" }] }, scope, ai, now), null);
+  assert.equal(zeroBatchCandidate({ ...mail, messages: [{ ...mail.messages[0], bodyRevision: "body-2" }] }, scope, ai, now), null);
+  assert.equal(zeroBatchCandidate({ ...mail, messages: Array.from({ length: 501 }, (_, index) => ({ ...mail.messages[0], id: `message-${index}`, memberships: [{ ...mail.messages[0].memberships![0], messageId: `message-${index}` }] })) }, scope, ai, now), null, "the action cap counts memberships, not conversations");
+});
+
+test("guided zero snapshots and persisted sessions are bounded, immutable-scope and ID-only", () => {
+  const now = Date.parse(deadline), boxes = [{ id: "box", sourceId: "source", sourceGeneration: 1, name: "Box", email: "me@example.test", canSend: false }];
+  const scope = zeroScope("box", [], boxes);
+  const base: Mail = { ...inbox, id: "box:thread", account: "box", sourceId: "source", sdkThreadId: "thread", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: "message", outgoing: false, nativeFolder: "inbox", memberships: [{ mailboxId: "box", messageId: "message", revision: 1, done: false, snoozedUntil: null }] }] };
+  const queue = selectZeroQueue(Array.from({ length: ZERO_QUEUE_LIMIT + 1 }, (_, index) => ({ ...base, id: `box:${index}`, sdkThreadId: String(index) })), scope, now);
+  assert.equal(queue.ids.length, ZERO_QUEUE_LIMIT); assert.equal(queue.total, ZERO_QUEUE_LIMIT + 1); assert.equal(queue.overflowCount, 1);
+  const saved: ZeroSession = { version: 1, id: "session", scope, startedAt: now, phase: "review", paused: true, remainingIds: ["box:thread"], currentId: "box:thread", initialCount: 2, decidedCount: 1, overflowCount: 0 };
+  const restored = normalizeZeroSession({ ...saved, mail: [base], undo: "not-restorable" }, scope)!;
+  assert.deepEqual(restored, saved); assert.notStrictEqual(restored.remainingIds, saved.remainingIds);
+  assert.equal(Object.hasOwn(restored, "reviewOnlyIds"), false, "older sessions keep the optional field absent");
+  const individual = { ...saved, reviewOnlyIds: ["box:thread", "box:already-decided"] };
+  const restoredIndividual = normalizeZeroSession(individual, scope)!;
+  assert.deepEqual(restoredIndividual, individual, "unchecked conversations retain individual-review intent, including IDs already decided during this session");
+  assert.notStrictEqual(restoredIndividual.reviewOnlyIds, individual.reviewOnlyIds);
+  assert.deepEqual(normalizeZeroSession({ ...saved, reviewOnlyIds: [] }, scope), { ...saved, reviewOnlyIds: [] });
+  assert.equal(normalizeZeroSession({ ...saved, reviewOnlyIds: queue.ids }, scope)?.reviewOnlyIds?.length, ZERO_QUEUE_LIMIT);
+  for (const reviewOnlyIds of [undefined, null, "box:thread", {}, [base], [42], [""], ["x".repeat(1025)], ["duplicate", "duplicate"], queue.ids.concat("overflow")]) {
+    assert.equal(normalizeZeroSession({ ...saved, reviewOnlyIds }, scope), null, "malformed, duplicate, or oversized individual-review IDs reject the saved session");
+  }
+  assert.equal(Object.hasOwn(restored, "mail"), false); assert.equal(Object.hasOwn(restored, "undo"), false);
+  assert.equal(Object.isFrozen(scope), true); assert.equal(Object.isFrozen(scope.mailboxes), true); assert.equal(Object.isFrozen(scope.mailboxes[0]), true);
+  boxes[0].sourceGeneration = 2;
+  assert.equal(scope.mailboxes[0].sourceGeneration, 1, "capture never follows mutable account metadata");
+  const changed = zeroScope("box", [], boxes);
+  assert.equal(sameZeroScope(scope, changed), false); assert.notEqual(zeroStorageKey(scope), zeroStorageKey(changed));
+  assert.equal(normalizeZeroSession(saved, changed), null);
+  assert.equal(normalizeZeroSession(saved, zeroScope(UNIFIED_ACCOUNT, ["box"], boxes)), null);
+  const bootstrap = zeroScope("box", [], []);
+  assert.deepEqual(bootstrap, { account: "box", mailboxes: [] }, "a known route with loading accounts cannot throw during ordinary startup");
+  assert.deepEqual(zeroScope("missing", [], boxes), { account: "missing", mailboxes: [] });
+  assert.equal(selectZeroQueue([base], bootstrap, now).total, 0);
+  assert.equal(sameZeroScope(scope, bootstrap), false, "an active session detects unavailable receiving scope and can pause");
+  assert.equal(normalizeZeroSession(saved, bootstrap), null);
+  const partial = zeroScope(UNIFIED_ACCOUNT, ["box", "removed"], boxes);
+  assert.deepEqual(partial.mailboxes, [], "one missing requested mailbox fails the entire scope closed, never silently shrinking it");
+  assert.equal(selectZeroQueue([{ ...base, account: UNIFIED_ACCOUNT }], partial, now).total, 0);
+  for (const invalid of [
+    null, [], { ...saved, version: 2 }, { ...saved, phase: "unknown" }, { ...saved, startedAt: Infinity }, { ...saved, initialCount: -1 }, { ...saved, decidedCount: 3 },
+    { ...saved, currentId: "missing" }, { ...saved, remainingIds: ["same", "same"] }, { ...saved, remainingIds: [base] }, { ...saved, remainingIds: [""] },
+    { ...saved, initialCount: ZERO_QUEUE_LIMIT + 1 }, { ...saved, remainingIds: queue.ids.concat("overflow") },
+    { ...saved, scope: { ...scope, mailboxes: [...scope.mailboxes, ...scope.mailboxes] } },
+    { ...saved, scope: { ...scope, mailboxes: [{ ...scope.mailboxes[0], sourceGeneration: NaN }] } },
+  ]) assert.equal(normalizeZeroSession(invalid, scope), null);
+  assert.equal(zeroStorageKey(zeroScope(UNIFIED_ACCOUNT, ["b", "a"], [
+    { ...boxes[0], id: "a" }, { ...boxes[0], id: "b" },
+  ])), zeroStorageKey(zeroScope(UNIFIED_ACCOUNT, ["a", "b"], [{ ...boxes[0], id: "a" }, { ...boxes[0], id: "b" }])));
+});
+
+for (const scenario of ["scope and sparse reload", "lost acknowledgements and late pages", "snooze receipts before refresh", "durable cleanup reload", "feedback cleanup reload"]) test(`SDK-backed manual categories ${scenario}`, async () => {
+  // Isolate owner-lifetime state and exercise the real Bun-backed SDK in either runner.
+  if (process.env.INBOX_CATEGORY_TEST_CHILD !== scenario) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", `SDK-backed manual categories ${scenario}`, "--timeout", "30000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_CATEGORY_TEST_CHILD: scenario }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createMockHost }, { MockInboxProvider }, { InboxStore, InboxClassificationError }, { InboxError }, { Database }, { createAttentionOverridesStore }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../../mock-api/src/provider.ts"), import("../src/inbox.ts"), import("inbox-sdk"), import("bun:sqlite"),
+    import("../../local-host/src/attention-overrides.ts"), import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "manual-categories-client-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const originals = { getMessage: MockInboxProvider.prototype.getMessage, mutate: MockInboxProvider.prototype.mutate, send: MockInboxProvider.prototype.send };
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 37).toString("base64"), token: "fictional-category-client-token-for-tests", allowProviderWrites: false });
+  let database = new Database(join(root, "categories.sqlite"));
+  let categories = createAttentionOverridesStore(database, host.inbox, host.owner), stop: (() => void) | undefined;
+  const feedback = scenario === "feedback cleanup reload" ? (await import("../../local-host/src/attention-feedback.ts")).createAttentionFeedbackStore(database, host.inbox, host.owner) : null;
+  let lostFeedbackAcks = 0, lostFeedbackUndoAcks = 0;
+  const feedbackCommands: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [], feedbackUndos: string[] = [];
+  let bodyReads = 0, providerReads = 0, providerWrites = 0, aiRequests = 0, inventories = 0, lostAcks = 0;
+  let holdPage = false, pageHeld = false, releasePage: (() => void) | undefined, returnedPages = 0;
+  let holdDelta = false, deltaHeld = false, releaseDelta: (() => void) | undefined, stateWrites = 0, failStateWrite = 0;
+  const pages: Array<{ after: number; count: number; cursor: number }> = [];
+  const commands: import("../../shared/attention-overrides.ts").CategoryCommand[] = [];
+  let commandPlan: import("../src/inbox.ts").InboxCommandRecovery | undefined, lostStateAcks = 0, lostInverseAcks = 0;
+  const stateCommands: unknown[] = [], inverseCommands: string[] = [];
+  const capturePlan = (plan: import("../src/inbox.ts").InboxCommandRecovery) => { commandPlan = JSON.parse(JSON.stringify(plan)); };
+  const until = async (check: () => boolean) => {
+    for (let attempt = 0; attempt < 800 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(check(), "category SDK fixture reached the expected state");
+  };
+  try {
+    console.info = () => {}; console.warn = () => {};
+    const nativeBox = host.store.mailboxes(host.owner)[0];
+    const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
+    const native = host.store.receive(source, { from: "category-fixture@example.test", to: nativeBox.email, subject: "Manual category fixture", text: "Fictional unassessed request.", isRead: false });
+    host.store.receive(source, { from: "unrelated@example.test", to: nativeBox.email, subject: "Unrelated category fixture", text: "A separate fictional conversation." });
+    if (scenario === "durable cleanup reload") for (let i = 0; i < 60; i++) host.store.receive(source, { from: "fixture@example.test", to: nativeBox.email, subject: `Recovery group ${i}`, text: "Fictional recovery content." });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const primary = (await host.inbox.mailboxes(host.owner)).find(box => box.sourceId === source.accountId)!;
+    const candidate = (await host.inbox.mailboxCandidates(host.owner, primary.connectionId)).find(value => value.sourceId === source.accountId && value.selector.kind === "domain")!;
+    const overlap = await host.inbox.createMailbox(host.owner, { sourceId: source.accountId, name: "Category receiving overlap", selector: candidate.selector });
+    let preferences = { revision: 1, unifiedMode: "selected", includedMailboxIds: [primary.id], pinnedMailboxIds: [] as string[] };
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL("http://localhost:41999"), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    MockInboxProvider.prototype.getMessage = async function (id) { providerReads++; return originals.getMessage.call(this, id); };
+    MockInboxProvider.prototype.mutate = async function (id, changes) { providerWrites++; return originals.mutate.call(this, id, changes); };
+    MockInboxProvider.prototype.send = async function (input) { providerWrites++; return originals.send.call(this, input); };
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: false, providers: [], preferenceScope: "fictional-category-client", attentionOverrides: true, aiTriage: false });
+      if (url.pathname === "/host/inbox-preferences") {
+        if (init?.method === "PUT") preferences = { ...JSON.parse(String(init.body)), revision: preferences.revision + 1 };
+        return Response.json(preferences);
+      }
+      if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
+      if (url.pathname.startsWith("/host/attention-feedback")) {
+        if (!feedback) return Response.json([]);
+        try {
+          if (url.pathname.endsWith("/undo")) {
+            const id = url.pathname.split("/")[3]; feedbackUndos.push(id);
+            const event = await feedback.undo(id);
+            if (lostFeedbackUndoAcks) { lostFeedbackUndoAcks--; throw new TypeError("Lost feedback Undo acknowledgement"); }
+            return Response.json(event);
+          }
+          if (init?.method === "POST") {
+            const input = JSON.parse(String(init.body)); feedbackCommands.push(input);
+            assert.ok(commandPlan?.kind === "attention-feedback");
+            assert.deepEqual(commandPlan.input, input, "feedback ID and targets are saved before every dispatch");
+            const event = await feedback.record(input);
+            if (lostFeedbackAcks) { lostFeedbackAcks--; throw new TypeError("Lost feedback acknowledgement"); }
+            return Response.json(event);
+          }
+          return Response.json(await feedback.list());
+        } catch (error) {
+          if (error instanceof InboxError) return Response.json({ code: error.code, error: error.message }, { status: error.status });
+          throw error;
+        }
+      }
+      if (url.pathname.startsWith("/host/ai-triage")) { aiRequests++; throw new Error("Manual categorization must not contact AI."); }
+      if (url.pathname.startsWith("/host/attention-overrides")) {
+        try {
+          if (url.pathname.endsWith("/lookup")) return Response.json(await categories.lookup(JSON.parse(String(init?.body)).keys));
+          if (url.pathname.endsWith("/undo")) return Response.json(await categories.undo(url.pathname.split("/")[3]));
+          if (init?.method === "POST") {
+            const command = JSON.parse(String(init.body)); commands.push(command);
+            if (scenario === "durable cleanup reload") {
+              assert.equal(commandPlan?.kind, "category");
+              assert.deepEqual(commandPlan!.kind === "category" && commandPlan!.groups.find(group => group.input.id === command.id)?.input, command, "every exact category body is persisted before POST");
+              if (commands.length === 2) lostAcks = 2;
+            }
+            const receipt = await categories.classify(command);
+            if (lostAcks) { lostAcks--; throw new TypeError("Controlled lost category acknowledgement"); }
+            return Response.json(receipt);
+          }
+          const after = Number(url.searchParams.get("after")), page = await categories.changes(after);
+          pages.push({ after, count: page.entries.length, cursor: page.cursor });
+          if (holdPage) { holdPage = false; pageHeld = true; await new Promise<void>(resolve => { releasePage = resolve; }); }
+          returnedPages++;
+          return Response.json(page);
+        } catch (error) {
+          if (error instanceof InboxError) return Response.json({ code: error.code, error: error.message }, { status: error.status });
+          throw error;
+        }
+      }
+      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
+      if (url.pathname === "/v1/mailbox-snapshot") inventories++;
+      if ((url.pathname.endsWith("/state") && init?.method === "PATCH" || url.pathname === "/v1/mailbox-actions" && init?.method === "POST") && ++stateWrites === failStateWrite) return Response.json({ code: "CONFLICT", error: "Controlled membership conflict" }, { status: 412 });
+      if (scenario === "durable cleanup reload" && url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
+        const command = JSON.parse(String(init.body)); stateCommands.push(command);
+        assert.equal(commandPlan?.kind, "mailbox-state");
+        assert.deepEqual(commandPlan!.kind === "mailbox-state" && commandPlan!.input, command, "mailbox command is durable before dispatch");
+      }
+      if (scenario === "durable cleanup reload" && /\/v1\/mailbox-actions\/[^/]+\/undo$/.test(url.pathname)) inverseCommands.push(url.pathname);
+      const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-category-client-token-for-tests");
+      const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (response.ok && url.pathname === "/v1/mailbox-actions" && init?.method === "POST" && lostStateAcks) { lostStateAcks--; throw new TypeError("Lost mailbox command acknowledgement"); }
+      if (response.ok && /\/v1\/mailbox-actions\/[^/]+\/undo$/.test(url.pathname) && lostInverseAcks) { lostInverseAcks--; throw new TypeError("Lost mailbox inverse acknowledgement"); }
+      if (url.pathname === "/v1/mailbox-changes" && holdDelta) {
+        holdDelta = false; deltaHeld = true;
+        await new Promise<void>(resolve => { releaseDelta = resolve; });
+      }
+      return response;
+    }) as typeof fetch;
+    let store = new InboxStore(); stop = store.start();
+    const current = (account = UNIFIED_ACCOUNT) => store.getSnapshot().mail.find(mail => mail.account === account && mail.subject === "Manual category fixture")!;
+    await until(() => store.getSnapshot().loaded && !!current() && returnedPages > 0);
+    if (scenario === "feedback cleanup reload") {
+      const { validInboxCommandRecovery } = await import("../src/inbox.ts");
+      const initial = current();
+      lostFeedbackAcks = 2;
+      await assert.rejects(store.action([initial], "not-important", undefined, capturePlan), /Lost feedback acknowledgement/);
+      assert.ok(commandPlan?.kind === "attention-feedback" && commandPlan.status === "uncertain");
+      assert.ok(validInboxCommandRecovery(commandPlan));
+      assert.equal(JSON.stringify(commandPlan).includes(initial.subject), false); assert.equal(JSON.stringify(commandPlan).includes("@"), false);
+      const livePlan = JSON.parse(JSON.stringify(commandPlan));
+      assert.equal(feedbackCommands.length, 2); assert.deepEqual(feedbackCommands[0], feedbackCommands[1]);
+      const liveUndo = await store.replayCommand(livePlan, capturePlan);
+      assert.deepEqual(feedbackCommands[2], feedbackCommands[0], "the original tab retries the same feedback command after two lost responses");
+      assert.deepEqual(liveUndo.receipts, [{ kind: "attention-feedback", id: livePlan.input.id }]);
+      const once = await host.inbox.mailboxStateReceipt(host.owner, `attention:${livePlan.input.id}`);
+      assert.equal(once.states[0].revision, livePlan.input.targets[0].revision + 1, "one durable Done is applied despite repeated feedback requests");
+      assert.equal((await feedback!.list()).length, 1);
+      await liveUndo(); await store.retry();
+      const captured = current(); lostFeedbackAcks = 2;
+      await assert.rejects(store.action([captured], "not-important", undefined, capturePlan), /Lost feedback acknowledgement/);
+      const reloadPlan = JSON.parse(JSON.stringify(commandPlan));
+      const postCount = feedbackCommands.length;
+      host.store.receive(source, { from: "fixture@example.test", to: nativeBox.email, subject: captured.subject, threadId: native.threadId, text: "New reply after frozen feedback." });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      assert.equal(feedbackCommands.length, postCount, "reload does not automatically replay feedback mutations");
+      const reloadedUndo = await store.replayCommand(reloadPlan, capturePlan);
+      assert.deepEqual(feedbackCommands.at(-1), reloadPlan.input, "explicit reload Retry sends the original ID and body without newer reply targets");
+      assert.equal((await feedback!.list()).length, 2, "each user choice creates exactly one feedback event");
+      assert.ok(current().messages.some(message => !captured.messages.some(old => old.id === message.id) && message.memberships?.every(state => !state.done)), "feedback recovery never inherits a newer reply");
+      lostFeedbackUndoAcks = 1;
+      await assert.rejects(reloadedUndo(), /Lost feedback Undo acknowledgement/);
+      const inverse = JSON.parse(JSON.stringify(commandPlan));
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      assert.deepEqual(await store.undoCommand(inverse, capturePlan), [{ kind: "attention-feedback", id: reloadPlan.input.id }]);
+      assert.equal(feedbackUndos.at(-1), feedbackUndos.at(-2), "lost inverse acknowledgement reuses the feedback ID");
+      assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done)));
+      await store.action([current()], "not-important", undefined, capturePlan);
+      const stale = JSON.parse(JSON.stringify(commandPlan));
+      const receipt = await host.inbox.mailboxStateReceipt(host.owner, `attention:${stale.input.id}`), member = receipt.states[0];
+      const newer = await host.inbox.setMailboxState(host.owner, member.mailboxId, member.messageId, { done: false }, member.revision);
+      await assert.rejects(store.undoCommand(stale, capturePlan), /Newer mailbox changes were not overwritten/);
+      assert.deepEqual((await host.inbox.mailboxMessageSummary(host.owner, member.mailboxId, member.messageId)).memberships.find(state => state.mailboxId === member.mailboxId), newer);
+      assert.equal(commandPlan?.kind === "attention-feedback" && commandPlan.undoStatus, "rejected", "a rejected conditional mail inverse cannot credit Zero Undo");
+      assert.equal(providerWrites, 0); assert.equal(aiRequests, 0); return;
+    }
+    if (scenario === "durable cleanup reload") {
+      const { validInboxCommandRecovery, InboxRecoveryRejected } = await import("../src/inbox.ts");
+      const { ZeroActionRecovery, restoreZeroRecovery } = await import("../src/GuidedZero.tsx");
+      const selected = store.getSnapshot().mail.filter(mail => mail.account === UNIFIED_ACCOUNT && mail.subject.startsWith("Recovery group "));
+      assert.equal(selected.length, 60);
+      await assert.rejects(store.classify(selected, "Other", capturePlan), error => error instanceof InboxClassificationError && error.completed === 50 && !!error.retry);
+      assert.equal(commandPlan?.kind, "category");
+      const categoryPlan = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.ok(validInboxCommandRecovery(categoryPlan));
+      if (categoryPlan.kind !== "category") throw new Error("Expected category recovery");
+      assert.deepEqual(categoryPlan.groups.map(group => group.status), ["accepted", "uncertain"]);
+      assert.equal(categoryPlan.groups[0].input.targets.length, 50); assert.equal(categoryPlan.groups[1].input.targets.length, 10);
+      assert.equal(JSON.stringify(categoryPlan).includes("Recovery group"), false);
+      assert.equal(JSON.stringify(categoryPlan).includes("@"), false);
+      const categoryBodies = commands.length;
+      stop!(); store = new InboxStore(); stop = store.start();
+      await until(() => store.getSnapshot().loaded && !!current());
+      assert.equal(commands.length, categoryBodies, "mount/reload never replays saved mutations");
+      const reverseCategories = await store.replayCommand(categoryPlan, capturePlan);
+      assert.equal(commands.length, categoryBodies + 1, "accepted groups are not re-executed");
+      assert.deepEqual(commands.at(-1), categoryPlan.groups[1].input, "unconfirmed category group reuses its original ID and exact captured body after reload");
+      assert.equal(reverseCategories.receipts?.length, 2);
+      await store.undoCommand(commandPlan!, capturePlan);
+      assert.equal(commandPlan!.kind === "category" && commandPlan!.groups.every(group => group.status === "retracted"), true);
+      await store.retry();
+      // Done was accepted, but both transport acknowledgements were lost.
+      const chosen = current(); lostStateAcks = 2;
+      await assert.rejects(store.action([chosen], "done", undefined, capturePlan), /Lost mailbox command/);
+      const donePlan = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.equal(donePlan.kind, "mailbox-state");
+      assert.deepEqual(stateCommands.at(-1), stateCommands.at(-2), "even immediate ambiguous retries use the same membership-only body");
+      const postCount = stateCommands.length;
+      host.store.receive(source, { from: "fixture@example.test", to: nativeBox.email, subject: chosen.subject, threadId: native.threadId, text: "New reply after the captured command." });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      const recoveredDone = await store.replayCommand(donePlan, capturePlan);
+      assert.equal(stateCommands.length, postCount, "receipt lookup recovers accepted Done without new mutation");
+      assert.equal(recoveredDone.receipts?.[0].kind, "mailbox-state");
+      assert.ok(current().messages.some(message => !chosen.messages.some(old => old.id === message.id) && message.memberships?.every(state => !state.done)), "later replies never enter recovered targets");
+      await store.undoCommand(commandPlan!, capturePlan); await store.retry();
+      // Reminder uses the same SDK durable local-state command, not PATCH.
+      const at = new Date(Date.now() + 86400000).toISOString(); lostStateAcks = 2;
+      await assert.rejects(store.action([current()], "remind", at, capturePlan), /Lost mailbox command/);
+      const pendingReminder = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.equal(pendingReminder.kind, "mailbox-state");
+      assert.ok(pendingReminder.kind === "mailbox-state" && pendingReminder.before.length === pendingReminder.input.targets.length);
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      await store.replayCommand(pendingReminder, capturePlan);
+      assert.ok(commandPlan?.kind === "mailbox-state" && commandPlan.accepted.every(state => state.snoozedUntil === at));
+      lostInverseAcks = 1;
+      await assert.rejects(store.undoCommand(commandPlan!, capturePlan), /Lost mailbox inverse/);
+      const pendingInverse = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      assert.ok(pendingInverse.kind === "mailbox-state" && pendingInverse.undoStatus === "uncertain");
+      const inversePath = inverseCommands.at(-1);
+      stop!(); store = new InboxStore(); stop = store.start(); await until(() => store.getSnapshot().loaded && !!current());
+      const inverses = await store.undoCommand(pendingInverse, capturePlan);
+      assert.equal(inverseCommands.at(-1), inversePath, "lost Undo response reuses the server-owned inverse by original receipt ID");
+      assert.equal(inverses[0].kind, "mailbox-state");
+      assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done && state.snoozedUntil === null)));
+      await store.action([current()], "remind", at, capturePlan);
+      const stale = JSON.parse(JSON.stringify(commandPlan)) as import("../src/inbox.ts").InboxCommandRecovery;
+      if (stale.kind !== "mailbox-state") throw new Error("Expected reminder plan");
+      const accepted = stale.accepted[0];
+      const later = await host.inbox.setMailboxState(host.owner, accepted.mailboxId, accepted.messageId, { snoozedUntil: null, done: true }, accepted.revision);
+      await assert.rejects(store.undoCommand(stale, capturePlan), error => !!error && typeof error === "object" && "status" in error && error.status === 412);
+      assert.deepEqual((await host.inbox.mailboxMessageSummary(host.owner, accepted.mailboxId, accepted.messageId)).memberships.find(state => state.mailboxId === accepted.mailboxId), later, "stale reminder inverse cannot overwrite newer state even when original values look reusable");
+      const writesBeforeFence = stateCommands.length;
+      const otherOwner = { ...stale, owner: "a".repeat(64) };
+      await assert.rejects(store.replayCommand(otherOwner, capturePlan), error => error instanceof InboxRecoveryRejected);
+      const otherGeneration = structuredClone(stale); otherGeneration.sources[0].generation++;
+      await assert.rejects(store.replayCommand(otherGeneration, capturePlan), error => error instanceof InboxRecoveryRejected);
+      assert.equal(stateCommands.length, writesBeforeFence);
+      assert.equal(validInboxCommandRecovery({ ...stale, subject: "must not persist" }), false);
+      // Rehydrating a UI journal only restores data; its explicit Retry owns I/O.
+      const session = { version: 2 as const, id: "zero-reload", account: primary.id, scopeKey: "frozen-scope", revision: 1, startedAt: 1, phase: "review" as const, paused: true, currentId: chosen.id, status: "ready" as const,
+        progress: { initialCount: 1, remainingCount: 1, decidedCount: 0, ineligibleCount: 0, unknownCount: 0, captureComplete: true } };
+      const journal = { version: 1 as const, session, selection: [{ id: chosen.id, reviewVersion: "opaque-review-token", decision: "done" as const }], command: donePlan,
+        completedIds: [], undoneIds: [], receipts: [], inverseReceipts: [], attempts: [], mailPending: true, undoRequested: false, problem: "" };
+      const restored = restoreZeroRecovery(JSON.parse(JSON.stringify(journal)), session); assert.ok(restored);
+      let replayCount = 0;
+      new ZeroActionRecovery(restored!, { transport: {} as any, save: () => true, session: () => {}, undoMail: async () => [], replayMail: async () => { replayCount++; throw new Error("must be explicit"); } });
+      assert.equal(replayCount, 0);
+      assert.equal(providerWrites, 0); return;
+    }
+    if (scenario === "snooze receipts before refresh") {
+      await store.setViewPreferences({ unifiedMode: "selected", includedMailboxIds: [primary.id, overlap.id], pinnedMailboxIds: [] });
+      await store.retry();
+      const scope = zeroScope(UNIFIED_ACCOUNT, [primary.id, overlap.id], store.getSnapshot().accounts);
+      const when = new Date(Date.now() + 86400000).toISOString();
+      assert.equal(current().messages.flatMap(message => message.memberships ?? []).length, 2);
+      assert.equal(zeroEligible(current(), scope), true);
+      const reverse = await store.action([current()], "remind", when);
+      // Match the observed UI: the first reminder has already reached the mail model.
+      await store.retry();
+      assert.equal(zeroEligible(current(), scope), false);
+      holdDelta = true; const delayedRefresh = store.retry(); await until(() => deltaHeld);
+      const inventoryBaseline = inventories;
+      const unrelated = new Map(store.getSnapshot().mail.filter(mail => mail.sdkThreadId !== current().sdkThreadId).map(mail => [mail.id, mail]));
+      const snoozedRevisions = new Map(current().messages.flatMap(message => (message.memberships ?? []).map(state => [state.mailboxId, state.revision] as const)));
+      await reverse();
+      assert.equal(zeroEligible(current(), scope), true, "Undo must restore the guided current conversation before a delayed mail refresh returns");
+      assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done && state.snoozedUntil === null && state.revision > snoozedRevisions.get(state.mailboxId)!)));
+      const reverseAgain = await store.action([current()], "remind", when);
+      assert.equal(zeroEligible(current(), scope), false, "Later publishes its authoritative memberships before returning the Undo closure");
+      assert.ok(current().messages.every(message => message.memberships?.every(state => state.snoozedUntil === when)));
+      await reverseAgain(); assert.equal(zeroEligible(current(), scope), true);
+      let sawPartialSnooze = false;
+      const unsubscribe = store.subscribe(() => { sawPartialSnooze ||= current().messages.some(message => message.memberships?.some(state => state.snoozedUntil === when)); });
+      try {
+        const beforeRollback = stateWrites; failStateWrite = beforeRollback + 1;
+        await assert.rejects(store.action([current()], "remind", when));
+        assert.equal(stateWrites - beforeRollback, 1, "one atomic durable reminder command rejects without sequential PATCH rollback");
+      } finally { unsubscribe(); }
+      assert.equal(sawPartialSnooze, false, "a rejected durable reminder never publishes partial membership changes");
+      assert.equal(zeroEligible(current(), scope), true);
+      assert.ok(current().messages.every(message => message.memberships?.every(state => !state.done && state.snoozedUntil === null)), "rollback receipts restore all represented memberships immediately");
+      assert.equal(inventories, inventoryBaseline, "action completion does not wait for or restart a full inventory");
+      for (const mail of store.getSnapshot().mail) if (unrelated.has(mail.id)) assert.strictEqual(mail, unrelated.get(mail.id));
+      releaseDelta!(); releaseDelta = undefined; await delayedRefresh;
+      assert.equal(zeroEligible(current(), scope), true, "the older delayed snooze snapshot cannot replace authoritative Undo/rollback receipts");
+      assert.equal(providerWrites, 0); assert.equal(aiRequests, 0);
+      return;
+    }
+    const initial = current(), unrelated = new Map(store.getSnapshot().mail.filter(mail => mail.sdkThreadId !== initial.sdkThreadId).map(mail => [mail.id, mail]));
+    const baseline = { bodyReads, providerReads, providerWrites, aiRequests, inventories };
+    assert.equal(initial.triage, undefined); assert.equal(store.getSnapshot().ai, null); assert.equal(conversationAttention(initial), "Important");
+    const undoOther = await store.classify([initial], "Other");
+    assert.equal(conversationAttention(current()), "Other"); assert.equal(current().attentionOverride?.override?.category, "Other");
+    assert.equal(inFolder(current(), "Inbox"), true); assert.equal(current().unread, initial.unread);
+    assert.ok(current().messages.every(message => message.nativeFolder === "inbox" && message.memberships?.every(state => !state.done && !state.snoozedUntil)));
+    for (const mail of store.getSnapshot().mail) if (unrelated.has(mail.id)) assert.strictEqual(mail, unrelated.get(mail.id), "category receipts preserve unrelated Mail identities");
+    assert.deepEqual({ bodyReads, providerReads, providerWrites, aiRequests, inventories }, baseline, "a local category receipt performs no AI, provider, body, or full-inventory work");
+
+    if (scenario === "scope and sparse reload") {
+      await undoOther(); assert.equal(conversationAttention(current()), "Important"); assert.equal(current().attentionOverride, undefined);
+      await store.classify([current()], "Other");
+      const undoRepeat = await store.classify([current()], "Other"); await undoRepeat();
+      assert.equal(conversationAttention(current()), "Other", "Undo of a repeated choice restores the prior explicit Other");
+      const undoImportant = await store.classify([current()], "Important"); assert.equal(conversationAttention(current()), "Important");
+      await undoImportant(); assert.equal(conversationAttention(current()), "Other");
+      assert.deepEqual({ bodyReads, providerReads, providerWrites, aiRequests, inventories }, baseline);
+      const durableRevision = current().attentionOverride!.revision, beforeReload = pages.length;
+      stop(); stop = undefined; database.close(); database = new Database(join(root, "categories.sqlite"));
+      categories = createAttentionOverridesStore(database, host.inbox, host.owner);
+      store = new InboxStore(); stop = store.start();
+      await until(() => store.getSnapshot().loaded && current()?.attentionOverride?.revision === durableRevision);
+      assert.equal(conversationAttention(current()), "Other", "a restarted service and InboxStore restore the durable explicit choice");
+      assert.equal(pages[beforeReload].after, 0); assert.equal(pages[beforeReload].count, 1);
+      const reloadPages = pages.slice(beforeReload);
+      assert.ok(reloadPages.length <= 2, "bootstrap and its existing mail-delta catch-up use bounded sparse reads, not per-conversation requests");
+      assert.ok(reloadPages.slice(1).every(page => page.after === durableRevision && page.count === 0), "catch-up starts at the saved choice cursor instead of reloading the inventory");
+      await store.setViewPreferences({ unifiedMode: "selected", includedMailboxIds: [primary.id, overlap.id], pinnedMailboxIds: [] });
+      assert.equal(conversationAttention(current()), "Important", "expanded receiving scope does not inherit the narrower choice");
+      assert.equal(current().attentionOverride, undefined);
+      assert.equal(conversationAttention(current(primary.id)), "Other", "the original receiving scope keeps its applicable choice");
+      await store.classify([current()], "Other");
+      const captured = current(), beforeReplyCommands = commands.length;
+      host.store.receive(source, { from: "category-fixture@example.test", to: nativeBox.email, subject: "Manual category fixture", threadId: native.threadId, text: "A newer fictional reply needs review.", isRead: false });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 }); await store.retry();
+      assert.equal(conversationAttention(current()), "Important"); assert.equal(current().attentionOverride, undefined);
+      assert.ok(current().messages.length > captured.messages.length);
+      await assert.rejects(store.classify([captured], "Other"), error => error instanceof InboxClassificationError && error.code === "HOST_CATEGORY_CONTEXT_CHANGED");
+      assert.equal(commands.length, beforeReplyCommands, "a stale captured conversation is rejected before sending a broadened command");
+    } else {
+      holdPage = true; const refresh = store.retry(); await until(() => pageHeld); await refresh;
+      const priorReturned = returnedPages;
+      await store.classify([current()], "Important");
+      const newRevision = current().attentionOverride!.revision;
+      releasePage!(); releasePage = undefined; await until(() => returnedPages > priorReturned);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      assert.equal(current().attentionOverride?.revision, newRevision); assert.equal(conversationAttention(current()), "Important", "a late old Other page cannot replace a newer Important receipt");
+      lostAcks = 2; const commandOffset = commands.length;
+      let interrupted: InstanceType<typeof InboxClassificationError> | undefined;
+      try { await store.classify([current()], "Other"); assert.fail("both controlled acknowledgements should be interrupted"); }
+      catch (error) { assert.ok(error instanceof InboxClassificationError); interrupted = error; }
+      assert.ok(interrupted);
+      assert.equal(interrupted.code, "HOST_CATEGORY_ACK_PENDING"); assert.equal(interrupted.completed, 0); assert.equal(interrupted.remaining, 1);
+      assert.equal(interrupted.undoCompleted, undefined); assert.equal(typeof interrupted.retry, "function");
+      assert.equal(commands.length - commandOffset, 2); assert.deepEqual(commands[commandOffset], commands[commandOffset + 1]);
+      const undoRetried = await interrupted.retry!();
+      assert.equal(commands.length - commandOffset, 3); assert.deepEqual(commands[commandOffset], commands[commandOffset + 2], "explicit Retry replays the same durable ID and captured payload");
+      assert.equal(conversationAttention(current()), "Other");
+      await store.classify([current()], "Important");
+      await assert.rejects(undoRetried(), error => error instanceof InboxClassificationError && error.code === "HOST_CATEGORY_UNDO_CONFLICT");
+      assert.equal(conversationAttention(current()), "Important", "Undo cannot overwrite a later explicit choice");
+    }
+    assert.equal(aiRequests, 0); assert.equal(providerWrites, 0); assert.equal(bodyReads, baseline.bodyReads);
+  } finally {
+    releasePage?.(); releaseDelta?.(); stop?.(); await host.close(); database.close();
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    Object.assign(MockInboxProvider.prototype, originals);
+    for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SDK-backed sending identities stay composer-scoped and preserve explicit draft senders", async () => {
+  // Isolate the irreversible owner lock from the other existing SDK cases.
+  if (process.env.INBOX_SENDER_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed sending identities", "--timeout", "30000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_SENDER_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output);
+    return;
+  }
+  const [{ createMockHost }, { InboxStore }, { ApiError }, { bindApplicationScope }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("inbox-sdk/client"), import("../src/application-scope.ts"),
+    import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "sending-identities-client-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  let host: Awaited<ReturnType<typeof createMockHost>> | undefined, stop: (() => void) | undefined;
+  let identityGate: Promise<void> | undefined, releaseIdentity: (() => void) | undefined, identityHeld = false, failIdentity = false;
+  const identityReads: URL[] = [], created: Array<Record<string, unknown>> = [];
+  const until = async (check: () => boolean) => {
+    for (let attempt = 0; attempt < 800 && !check(); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(check(), "SDK fixture reached the expected state");
+  };
+  try {
+    console.info = () => {}; console.warn = () => {};
+    host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 33).toString("base64"), token: "fictional-sender-client-token-for-tests", allowProviderWrites: true });
+    const [nativeBox, secondBox] = host.store.mailboxes(host.owner);
+    const sourceId = host.store.link(host.owner, nativeBox.id)!.accountId;
+    const alias = nativeBox.aliases[0]!;
+    host.store.receive({ owner: host.owner, storeId: nativeBox.id, accountId: sourceId }, {
+      from: "sender@example.test", to: alias, subject: "Explicit alias reply", text: "Fictional alias recipient.",
+    });
+    await host.inbox.sync(host.owner, sourceId, { folder: "all", lane: "latest", limit: 100 });
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL("http://localhost:41999"), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    const binding = bindApplicationScope("b".repeat(64));
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-sender-client" });
+      if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "all", includedMailboxIds: [], pinnedMailboxIds: [] });
+      if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
+      if (url.pathname === "/host/attention-feedback") return Response.json([]);
+      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
+        if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      const identities = url.pathname.endsWith("/sending-identities");
+      if (identities) {
+        identityReads.push(url);
+        assert.equal(new Headers(init?.headers).get("X-Superlocal-Scope"), binding.scope);
+        assert.equal(init?.cache, "no-store");
+        if (failIdentity) return Response.json({ code: "PROVIDER_UNAVAILABLE", error: "Sending addresses are temporarily unavailable." }, { status: 503 });
+      }
+      if (url.pathname === "/v1/drafts" && init?.method === "POST") created.push(JSON.parse(String(init.body)));
+      const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-sender-client-token-for-tests");
+      const response = await host!.fetch(new Request(url, { ...init, headers }));
+      if (identities && identityGate) { identityHeld = true; await identityGate; } // Deliberately ignore abort to exercise the owner fence.
+      return response;
+    }) as typeof fetch;
+    const store = new InboxStore(); stop = store.start();
+    await until(() => store.getSnapshot().loaded);
+    assert.equal(identityReads.length, 0, "inbox bootstrap never discovers sending identities");
+    const primary = store.getSnapshot().accounts.find(box => box.sourceId === sourceId)!;
+    const secondary = store.getSnapshot().accounts.find(box => box.sourceId === host!.store.link(host!.owner, secondBox.id)!.accountId)!;
+    assert.equal(primary.sourceGeneration, (await host.inbox.account(host.owner, sourceId)).generation);
+    const values = await store.sendingIdentities(primary.id);
+    assert.equal(values.sourceId, sourceId);
+    assert.ok(values.identities.some(identity => identity.email === alias));
+    assert.ok(identityReads.every(url => url.pathname === `/v1/accounts/${sourceId}/sending-identities`), "only the active composer's source is read");
+    const beforeFailure = identityReads.length;
+    failIdentity = true;
+    await assert.rejects(store.sendingIdentities(primary.id, { refresh: true }), error => error instanceof ApiError && error.code === "PROVIDER_UNAVAILABLE");
+    assert.equal(identityReads.length, beforeFailure + 1, "lookup failure does not poll or retry silently");
+    failIdentity = false;
+    await store.sendingIdentities(primary.id, { refresh: true });
+    assert.equal(identityReads.at(-1)!.searchParams.get("refresh"), "true", "manual retry forces a fresh lookup");
+
+    const compose = await store.newDraft(primary.id, { to: "recipient@example.test", subject: "Explicit sender", body: "<p>Keep this writing</p>" });
+    assert.equal(created.at(-1)!.from, primary.email, "new compose retains the existing mailbox default");
+    const [{ createElement }, { renderToStaticMarkup }, { mock }, runtime, developmentRuntime] = await Promise.all([
+      import("react"), import("react-dom/server"), import("bun:test"), import("react/jsx-runtime"), import("react/jsx-dev-runtime"),
+    ]);
+    const { jsx, jsxs, Fragment } = runtime, { jsxDEV } = developmentRuntime;
+    type FromControl = { value: string; disabled: boolean; "aria-busy": boolean; "aria-expanded": boolean };
+    let fromControl: FromControl | undefined;
+    const renderedOptions: Array<{ value: string; children: string; onClick: () => void }> = [], draftChanges: Draft[] = [], identityDemand: string[] = [];
+    // Observe the rendered control's real handler; keep React's actual server renderer and hooks.
+    const capture = (render: (...args: any[]) => any) => (...args: any[]) => {
+      const [type, props] = args;
+      if (type === "button" && props.role === "combobox" && props["aria-label"] === "From") fromControl = props;
+      if (type === "button" && props.role === "option") renderedOptions.push({ ...props, children: props["aria-label"] });
+      return render(...args);
+    };
+    mock.module("react/jsx-runtime", () => ({ Fragment, jsx: capture(jsx), jsxs: capture(jsxs) }));
+    mock.module("react/jsx-dev-runtime", () => ({ Fragment, jsxDEV: capture(jsxDEV) }));
+    try {
+      const { default: Composer, sendingAddressGroups } = await import("../src/Composer.tsx");
+      const addressBox: MailboxOption = { ...primary, id: "address-view", selectorKind: "address", selectorValue: alias, email: alias };
+      const domainBox: MailboxOption = { ...primary, id: "domain-view", selectorKind: "domain", selectorValue: primary.email.split("@")[1] };
+      const sourceCatalog = [{ email: primary.email }, { email: alias }, { email: "elsewhere@other.test" }];
+      const groups = sendingAddressGroups([primary, addressBox, domainBox, secondary], {
+        [primary.id]: sourceCatalog, [addressBox.id]: sourceCatalog, [domainBox.id]: sourceCatalog,
+        [secondary.id]: [{ email: secondary.email }, { email: secondBox.aliases[0]! }],
+      }, addressBox.id);
+      assert.deepEqual(groups.find(group => group.account.id === addressBox.id)!.identities.map(identity => identity.email), [alias]);
+      assert.equal(groups.flatMap(group => group.identities).filter(identity => identity.email === alias).length, 1, "overlapping receiving views never duplicate the same sender");
+      assert.ok(groups.find(group => group.account.id === secondary.id)!.identities.some(identity => identity.email === secondBox.aliases[0]), "all finite aliases from other sources are offered");
+      const domainOnly = sendingAddressGroups([domainBox], { [domainBox.id]: sourceCatalog }, domainBox.id);
+      assert.deepEqual(domainOnly[0].identities.map(identity => identity.email), [primary.email, alias], "domain views exclude source aliases outside their authorized receiving domain");
+      const readOnly = { ...secondary, id: "read-only-mailbox", email: "read-only@example.test", canSend: false };
+      const renderComposer = (draft: Draft) => {
+        fromControl = undefined; renderedOptions.length = 0;
+        const html = renderToStaticMarkup(createElement(Composer, { draft, preferences: defaultPreferences, accounts: [primary, secondary, readOnly],
+          loadSendingIdentities: (id, input) => { identityDemand.push(id); return store.sendingIdentities(id, input); },
+          onChange: next => { draftChanges.push(next); }, onSend: async () => false, onDiscard: async () => false, onClose: () => {}, autoFocus: false }));
+        assert.ok(fromControl, "the rendered composer exposes one From control");
+        return { html, from: html.slice(html.indexOf('class="compose-sender-picker"'), html.indexOf('class="compose-sender-status')), control: fromControl, options: [...renderedOptions] };
+      };
+      const unsaved = { ...compose, dirty: true, saving: false, to: "unfinished-recipient", cc: "copy@example.test" };
+      const initial = renderComposer(unsaved);
+      assert.equal(initial.control.disabled, false); assert.equal(initial.control["aria-busy"], true);
+      assert.deepEqual(identityDemand, [], "the synchronous render is usable before identity discovery starts");
+      assert.equal(initial.control["aria-expanded"], false);
+      assert.equal((initial.from.match(/role="group"/g) ?? []).length, 2);
+      assert.ok(initial.from.includes(`role="group" aria-label="${primary.email}"`)); assert.ok(initial.from.includes(`role="group" aria-label="${secondary.email}"`));
+      assert.ok(!initial.from.includes(readOnly.email)); assert.doesNotMatch(initial.html, /aria-label="Mailbox"|Unsaved recipient changes/);
+      const other = initial.options.find(option => option.children === secondary.email)!;
+      assert.ok(other); other.onClick();
+      assert.equal(draftChanges.length, 1, "a single From selection publishes one atomic draft update");
+      assert.deepEqual(draftChanges[0], { ...unsaved, account: secondary.id, from: secondary.email, updated: draftChanges[0].updated });
+      assert.equal(renderComposer(draftChanges[0]).control.value, other.value);
+      const chosen = renderComposer({ ...compose, from: alias });
+      assert.equal(chosen.control.value, JSON.stringify([primary.id, alias]), "an explicit saved alias is not replaced by a seed while discovery is pending");
+      for (const [mode, sourceMessageId] of [["new", "fictional-reply-origin"], ["reply", undefined], ["replyAll", undefined], ["forward", undefined]] as const) {
+        draftChanges.length = 0;
+        const reply = renderComposer({ ...compose, mode, sourceMessageId, from: alias });
+        assert.doesNotMatch(reply.from, /class="compose-sender-group"/); assert.ok(!reply.from.includes(secondary.email));
+        assert.ok(reply.options.some(option => option.children === primary.email));
+        assert.ok(!reply.options.some(option => option.value === other.value), "a source-bound draft exposes no cross-account option");
+      }
+      const unavailable = renderComposer({ ...compose, account: readOnly.id, from: "unavailable@example.test" });
+      assert.match(unavailable.html, /This address is not in the available senders\./); assert.match(unavailable.html, /Retry sending addresses/);
+      assert.ok(unavailable.from.includes("unavailable@example.test (Unavailable)"));
+      assert.ok(!unavailable.options.some(option => option.value === unavailable.control.value), "an unavailable saved address is visible but cannot be newly selected");
+    } finally {
+      mock.module("react/jsx-runtime", () => ({ Fragment, jsx, jsxs }));
+      mock.module("react/jsx-dev-runtime", () => ({ Fragment, jsxDEV }));
+    }
+    store.editDraft({ ...compose, from: alias, popOut: true });
+    await store.flushDraft(compose.id);
+    await store.reloadDraft(compose.id);
+    let saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.from, alias); assert.equal(saved.id, compose.id); assert.equal(saved.account, primary.id); assert.equal(saved.popOut, true);
+    assert.equal(created.length, 1, "same-source alias changes update rather than recreate the draft");
+    const mail = store.getSnapshot().mail.find(mail => mail.account === primary.id && mail.subject === "Explicit alias reply")!;
+    const sourceMessageId = mail.messages.at(-1)!.id;
+    assert.equal(mail.to, alias, "row To is the actual header recipient, not the source owner");
+    assert.deepEqual(mail.toAddresses, [alias]);
+    assert.deepEqual(store.getSnapshot().mail.find(value => value.account === UNIFIED_ACCOUNT && value.subject === mail.subject)!.toAddresses, [alias]);
+    for (const mode of ["reply", "replyAll"] as const) {
+      const reply = await store.newDraft(primary.id, { mode, mail, sourceMessageId });
+      assert.equal(Object.hasOwn(created.at(-1)!, "from"), false, "implicit replies leave sender selection to the SDK");
+      assert.equal(reply.from, alias, "SDK's chosen verified reply alias is retained");
+      await store.discardDraft(reply.id);
+    }
+    const forward = await store.newDraft(primary.id, { mode: "forward", mail, sourceMessageId });
+    assert.equal(created.at(-1)!.from, primary.email, "forward default is unchanged");
+    await store.discardDraft(forward.id);
+
+    store.editDraft({ ...saved, from: "removed@example.test" });
+    await store.flushDraft(saved.id);
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    await assert.rejects(store.submit(saved), error => error instanceof ApiError && error.code === "FORBIDDEN_SENDER");
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.from, "removed@example.test"); assert.equal(saved.body, "<p>Keep this writing</p>");
+    assert.equal(saved.sendError?.code, "FORBIDDEN_SENDER", "send rejection remains visible on the kept draft");
+    store.editDraft({ ...saved, body: "<p>Still kept</p>", popOut: false });
+    await store.flushDraft(saved.id);
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.sendError?.code, "FORBIDDEN_SENDER", "typing, autosave, and popout changes cannot erase a sender failure");
+    await store.reloadDraft(saved.id);
+    saved = store.getSnapshot().drafts.find(draft => draft.id === compose.id)!;
+    assert.equal(saved.from, "removed@example.test", "reload never replaces an unavailable saved sender");
+    store.editDraft({ ...saved, from: alias }); await store.flushDraft(saved.id);
+    assert.equal(store.getSnapshot().drafts.find(draft => draft.id === compose.id)!.sendError, undefined);
+
+    const crossSource = await store.newDraft(primary.id, { to: "recipient@example.test", subject: "Move exact sender", body: "<p>Preserve across mailboxes</p>" });
+    const secondaryAlias = secondBox.aliases[0]!;
+    const moved = await store.moveDraft(crossSource.id, secondary.id, secondaryAlias);
+    assert.equal(moved.from, secondaryAlias, "cross-source From selection retains the exact alias rather than the target default");
+    assert.equal(moved.account, secondary.id); assert.equal(moved.body, crossSource.body); assert.equal(moved.to, crossSource.to);
+    await store.reloadDraft(moved.id);
+    const reloadedMove = store.getSnapshot().drafts.find(draft => draft.id === moved.id)!;
+    assert.equal(reloadedMove.from, secondaryAlias);
+    const movedOperation = await store.submit(reloadedMove);
+    assert.ok(["pending", "processing", "succeeded"].includes(movedOperation.status), "the selected alias is accepted by the real SDK submission path");
+
+    identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
+    const detachedRead = store.sendingIdentities(secondary.id, { refresh: true });
+    const rejectedDetached = assert.rejects(detachedRead, error => error instanceof DOMException && error.name === "AbortError");
+    await until(() => identityHeld);
+    const box = await host.inbox.mailbox(host.owner, secondary.id);
+    await host.inbox.updateMailbox(host.owner, secondary.id, { status: "detached" }, box.revision);
+    await store.refresh(true);
+    releaseIdentity!(); identityGate = undefined; await rejectedDetached;
+
+    identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
+    const lateRead = store.sendingIdentities(primary.id, { refresh: true });
+    const rejectedLate = assert.rejects(lateRead, error => error instanceof DOMException && error.name === "AbortError");
+    await until(() => identityHeld); stop(); stop = undefined;
+    const stopped = store.getSnapshot();
+    releaseIdentity!(); identityGate = undefined; await rejectedLate;
+    assert.strictEqual(store.getSnapshot(), stopped, "late lookup cannot publish into a stopped store generation");
+    stop = store.start(); await store.refresh(true);
+    identityGate = new Promise(resolve => { releaseIdentity = resolve; }); identityHeld = false;
+    const ownerRead = store.sendingIdentities(primary.id, { refresh: true });
+    const rejectedOwner = assert.rejects(ownerRead, error => error instanceof DOMException && error.name === "AbortError");
+    await until(() => identityHeld); binding.lock(); releaseIdentity!(); identityGate = undefined; await rejectedOwner;
+    const lockedReads = identityReads.length;
+    await assert.rejects(store.sendingIdentities(primary.id), error => error instanceof DOMException && error.name === "AbortError");
+    assert.equal(identityReads.length, lockedReads, "owner lock fences cached lookups before dispatch");
+  } finally {
+    releaseIdentity?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
+  }
+});
+
+test("MailRow renders actual To recipients without mailbox or Bcc substitution", async () => {
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "MailRow renders actual To"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createElement }, { renderToStaticMarkup }, { default: MailRow }] = await Promise.all([
+    import("react"), import("react-dom/server"), import("../src/MailRow.tsx"),
+  ]);
+  const render = (to: string, sent = false, unified = false, toAddresses?: string[]) => renderToStaticMarkup(createElement(MailRow, {
+    mail: { ...inbox, to, toAddresses, account: unified ? UNIFIED_ACCOUNT : inbox.account, accountEmail: "owner@example.test",
+      mailboxNames: unified ? ["Receiving mailbox"] : undefined,
+      messages: [{ ...inbox.messages[0], to, cc: "cc-only@example.test", bcc: "private-bcc@example.test" }] },
+    index: 0, highlighted: false, selected: false, sent, showSnippets: false,
+  }));
+  const alias = render("Project <project@example.test>");
+  assert.match(alias, /To: Project &lt;project@example.test&gt;/);
+  assert.match(alias, /title="To: Project &lt;project@example.test&gt;"/);
+  const projectedAlias = render("Project <project@example.test>", false, false, ["project@example.test"]);
+  assert.match(projectedAlias, />To: project@example.test<\/span>/);
+  assert.match(projectedAlias, /title="To: Project &lt;project@example.test&gt;"/);
+  const multiple = render("first@example.test, second@example.test", false, true);
+  assert.match(multiple, /To: first@example.test, second@example.test/);
+  assert.match(render("recipient@example.test", true), /To: recipient@example.test/, "sent rows use the real To too");
+  const absent = render("");
+  assert.match(absent, /No To recipients/);
+  assert.match(render("owner@example.test", false, true, []), /No To recipients/, "an authoritative empty To never falls back to an ownership address");
+  for (const html of [alias, projectedAlias, multiple, absent, render("", true, true), render("owner@example.test", false, true, [])]) {
+    assert.doesNotMatch(html, /private-bcc@example.test|cc-only@example.test|owner@example.test/);
+  }
+});
 test("SDK-backed optimistic flags retain conditional intent through latency, failures and overlapping views", async () => {
   // The ordinary web runner is Node; the actual SDK intentionally uses
   // bun:sqlite. Run this same existing test in an isolated Bun process rather
@@ -44,7 +872,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.equal(result.code, 0, result.output);
     return;
   }
-  const [{ createMockHost }, { MockInboxProvider }, { ProviderError }, { InboxStore, InboxActionError }, fs, { tmpdir }, { join }, { Database }, { createAttentionFeedbackStore }] = await Promise.all([
+  const [{ createMockHost }, { MockInboxProvider }, { ProviderError }, { InboxStore, InboxActionError, dayGroup }, fs, { tmpdir }, { join }, { Database }, { createAttentionFeedbackStore }] = await Promise.all([
     import("../../mock-api/src/host.ts"), import("../../mock-api/src/provider.ts"), import("../../../packages/inbox-sdk/server/sdk/types.ts"),
     import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"), import("../../local-host/src/attention-feedback.ts"),
   ]);
@@ -85,6 +913,9 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   let liveEvents = false, readyEvents = 0, mailEvents = 0, inventoryRequests = 0, deltaRequests = 0;
   let gate: Promise<void> | undefined, loseResponses = 0, replayAuthFailures = 0, snapshotFailures = 0, bodyReads = 0, operationReads = 0;
   let unrelatedOperationReads = 0;
+  let draftSaveCalls = 0, loseDraftResponse = false, draftReadHeld = false, gatedDraftRead: string | undefined;
+  let draftSaveGate: Promise<void> | undefined, releaseDraftSave: (() => void) | undefined;
+  let draftReadGate: Promise<void> | undefined, releaseDraftRead: (() => void) | undefined;
   const posted: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
   const flagRequests: import("inbox-sdk/types").MutationInput[] = [];
   const membershipRequests: Array<Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1]> = [];
@@ -147,7 +978,14 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
           return Response.json({ code: "UNAUTHENTICATED", error: "The controlled session needs to reconnect." }, { status: 401 });
         }
       }
+      const savingDraft = /^\/v1\/drafts\/[^/]+$/.test(url.pathname) && init?.method === "PATCH";
+      if (savingDraft) draftSaveCalls++;
       const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (savingDraft && response.ok) {
+        if (draftSaveGate) await draftSaveGate;
+        if (loseDraftResponse) { loseDraftResponse = false; throw new TypeError("Controlled lost draft acknowledgement"); }
+      }
+      if (draftReadGate && url.pathname === `/v1/drafts/${gatedDraftRead}` && init?.method !== "PATCH") { draftReadHeld = true; await draftReadGate; }
       if (url.pathname === "/v1/mailbox-snapshot") inventoryRequests++;
       if (url.pathname === "/v1/mailbox-changes") {
         deltaRequests++;
@@ -170,9 +1008,14 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
         membershipRequests.push(JSON.parse(String(init.body)));
         if (response.ok && loseMembershipResponses > 0) { loseMembershipResponses--; throw new TypeError("Controlled lost Done response"); }
       }
-      if (url.pathname === "/v1/mailbox-snapshot" && response.ok && finalPageGate && !(await response.clone().json()).nextCursor) {
-        // Freeze a COMPLETE authoritative snapshot before any local command,
-        // avoiding a later page's legitimate STALE_CURSOR restart masking it.
+      if (url.pathname === "/v1/mailbox-snapshot" && response.ok && finalPageGate) {
+        // Drain through EOF before freezing the COMPLETE authoritative snapshot.
+        // Holding an earlier page would let a later page's legitimate cursor
+        // restart mask whether newer E/W/Undo receipts survive this old snapshot.
+        assert.match(response.headers.get("Content-Type") ?? "", /^application\/x-ndjson\b/);
+        const frames = (await response.clone().text()).trim().split("\n").map(line => JSON.parse(line));
+        assert.ok(frames.length > 0 && frames.every(frame => frame.type === "page"));
+        assert.equal(frames.at(-1).page.nextCursor, null);
         finalPageHeld = true; await finalPageGate; init?.signal?.throwIfAborted();
       }
       if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok) {
@@ -436,6 +1279,80 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     await store.undoSend(send.id);
     assert.ok(store.getSnapshot().drafts.some(saved => saved.id === draft.id));
 
+    // Correcting a local recipient error can save again; conflicts and lost
+    // acknowledgements still require reload, and recovery owns one incident.
+    const editable = await store.newDraft(primary.id, { to: "qa-other@example.test", subject: "Recipient recovery" });
+    const otherDraft = await store.newDraft(primary.id, { to: "other@example.test", subject: "Independent error" });
+    store.editDraft({ ...editable, to: "qa-other@example.test, other@" });
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    store.editDraft({ ...otherDraft, to: "other@" });
+    await assert.rejects(store.flushDraft(otherDraft.id), /Complete the recipient/);
+    const otherIssue = store.getSnapshot().issues.find(issue => issue.key === `draft:${otherDraft.id}`)!;
+    const recipientIssue = store.getSnapshot().issues.find(issue => issue.key === `draft:${editable.id}`)!;
+    assert.equal(recipientIssue.count, 2, "repeat validation errors coalesce without losing their local origin");
+    const beforeCorrection = draftSaveCalls;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, body: "<p>Still incomplete</p>" });
+    await sleep(550);
+    assert.equal(draftSaveCalls, beforeCorrection, "incomplete recipients never autosave");
+    assert.ok(store.getSnapshot().drafts.find(value => value.id === editable.id)!.saveError);
+    draftSaveGate = new Promise(resolve => { releaseDraftSave = resolve; });
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "qa-other@example.test", cc: "", bcc: "", body: "<p>Corrected body</p>" });
+    await until(() => draftSaveCalls > beforeCorrection, "corrected recipient triggers an actual automatic save");
+    assert.equal(store.getSnapshot().drafts.find(value => value.id === editable.id)!.saveError, undefined);
+    assert.equal(store.getSnapshot().drafts.find(value => value.id === editable.id)!.dirty, true);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === recipientIssue.key), recipientIssue, "editing or a pending acknowledgement cannot retire the failure");
+    releaseDraftSave!(); draftSaveGate = undefined;
+    await until(() => !store.getSnapshot().drafts.find(value => value.id === editable.id)!.dirty, "successful save acknowledges corrected recipients");
+    assert.equal((await host.inbox.draft(host.owner, editable.id)).bodyHtml, "<p>Corrected body</p>");
+    assert.equal(store.getSnapshot().issues.some(issue => issue.key === recipientIssue.key), false);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === otherIssue.key), otherIssue);
+    const savedCalls = draftSaveCalls;
+    await store.flushDraft(editable.id);
+    assert.equal(draftSaveCalls, savedCalls, "a clean flush is a no-op");
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === otherIssue.key), otherIssue);
+
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, body: "<p>Local conflict</p>" });
+    const serverDraft = await host.inbox.draft(host.owner, editable.id);
+    await host.inbox.updateDraft(host.owner, editable.id, { subject: "Newer server writing" }, serverDraft.revision);
+    await assert.rejects(store.flushDraft(editable.id));
+    assert.match(store.getSnapshot().drafts.find(value => value.id === editable.id)!.saveError!, /changed elsewhere/);
+    const conflictCalls = draftSaveCalls;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "corrected@example.test", body: "<p>Keep conflicting writing</p>" });
+    await sleep(550);
+    await assert.rejects(store.flushDraft(editable.id), /changed elsewhere/);
+    assert.equal(draftSaveCalls, conflictCalls, "complete recipients cannot retry an HTTP 412 conflict");
+    await store.reloadDraft(editable.id);
+    assert.equal(store.getSnapshot().drafts.find(value => value.id === editable.id)!.subject, "Newer server writing");
+    assert.equal(store.getSnapshot().issues.some(issue => issue.key === recipientIssue.key), false);
+
+    loseDraftResponse = true;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, body: "<p>Lost acknowledgement</p>" });
+    await assert.rejects(store.flushDraft(editable.id), TypeError);
+    const ambiguousCalls = draftSaveCalls;
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "complete@example.test", body: "<p>Keep ambiguous writing</p>" });
+    await sleep(550);
+    await assert.rejects(store.flushDraft(editable.id), /lost draft acknowledgement/);
+    assert.equal(draftSaveCalls, ambiguousCalls, "complete recipients cannot retry an ambiguous network save");
+    await store.reloadDraft(editable.id);
+    assert.equal((await host.inbox.draft(host.owner, editable.id)).bodyHtml, "<p>Lost acknowledgement</p>");
+
+    store.editDraft({ ...store.getSnapshot().drafts.find(value => value.id === editable.id)!, to: "newer@" });
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    gatedDraftRead = editable.id; draftReadGate = new Promise(resolve => { releaseDraftRead = resolve; });
+    const lateReload = store.reloadDraft(editable.id);
+    await until(() => draftReadHeld, "reload response is held before a newer validation incident");
+    await assert.rejects(store.flushDraft(editable.id), /Complete the recipient/);
+    const newerIssue = store.getSnapshot().issues.find(issue => issue.key === recipientIssue.key)!;
+    releaseDraftRead!(); draftReadGate = undefined; await lateReload;
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === newerIssue.key), newerIssue, "late recovery cannot retire a newer incident");
+    await store.flushDraft(editable.id);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === newerIssue.key), newerIssue, "cached no-op is not authoritative recovery");
+    await store.reloadDraft(editable.id);
+    assert.equal(store.getSnapshot().issues.some(issue => issue.key === newerIssue.key), false);
+    assert.strictEqual(store.getSnapshot().issues.find(issue => issue.key === otherIssue.key), otherIssue);
+    await store.reloadDraft(otherDraft.id);
+
     // Release a second acknowledgement exactly as the previous operation's
     // terminal snapshot publishes. The reconciler may be finishing its last
     // loop; the newly accepted operation must still be polled to its outcome.
@@ -502,7 +1419,8 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.equal(calendarView("today").date, calendarToday.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
     assert.equal(calendarView("today").group, "Today");
     assert.equal(calendarView("yesterday").group, "Yesterday");
-    assert.equal(calendarView("year").group, calendarPreviousYear.toLocaleDateString([], { month: "long", year: "numeric" }));
+    assert.equal(calendarView("year").group, dayGroup(calendarPreviousYear, calendarToday));
+    assert.match(calendarView("year").group, /^[A-Z][a-z]+ \d{1,2}(st|nd|rd|th), \d{4}$/);
     await store.loadThread(calendarView("today").id);
     const RealDate = Date, tomorrow = new Date(calendarToday); tomorrow.setDate(tomorrow.getDate() + 1);
     try {
@@ -640,7 +1558,7 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
     assert.ok(inventoryRequests > beforeScope);
     assert.ok(large().messages.length > 0, "another receiving view of the same source remains available");
   } finally {
-    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseDelta?.(); releaseProvider?.(); stopReloaded?.(); stop?.(); await providerWork;
+    releaseResponse?.(); releaseSnapshot?.(); releaseFinalPage?.(); releaseDelta?.(); releaseProvider?.(); releaseDraftSave?.(); releaseDraftRead?.(); stopReloaded?.(); stop?.(); await providerWork;
     MockInboxProvider.prototype.mutate = originalMutate;
     MockInboxProvider.prototype.send = originalSend;
     feedbackDatabase.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
@@ -648,10 +1566,11 @@ test("SDK-backed optimistic flags retain conditional intent through latency, fai
   }
 });
 test("SDK-backed startup catches signed changes before first display without repeating fresh metadata", async () => {
-  if (!process.versions.bun) {
+  // Keep the irreversible document-owner abort isolated from other SDK cases.
+  if (process.env.INBOX_STARTUP_TEST_CHILD !== "1") {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
       const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "SDK-backed startup", "--timeout", "30000"], {
-        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_STARTUP_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
       });
       let output = "";
       child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
@@ -660,8 +1579,8 @@ test("SDK-backed startup catches signed changes before first display without rep
     assert.equal(result.code, 0, result.output);
     return;
   }
-  const [{ createMockHost }, { InboxStore }, fs, { tmpdir }, { join }, { Database }] = await Promise.all([
-    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"),
+  const [{ createMockHost }, { InboxStore }, fs, { tmpdir }, { join }, { Database }, { bindApplicationScope }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("node:fs/promises"), import("node:os"), import("node:path"), import("bun:sqlite"), import("../src/application-scope.ts"),
   ]);
   const root = await fs.mkdtemp(join(tmpdir(), "startup-catchup-"));
   const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 31).toString("base64"), token: "fictional-startup-catchup-client-token", allowProviderWrites: true });
@@ -680,10 +1599,12 @@ test("SDK-backed startup catches signed changes before first display without rep
     const value = { promise: new Promise<void>(resolve => { release = resolve; }), release: () => release(), seen: false };
     gates.push(value); return value;
   };
-  let beforeSnapshot: ReturnType<typeof gate> | undefined, snapshot: ReturnType<typeof gate> | undefined;
+  let beforeSnapshot: ReturnType<typeof gate> | undefined, snapshot: ReturnType<typeof gate> | undefined, firstPage: ReturnType<typeof gate> | undefined;
   let delta: ReturnType<typeof gate> | undefined, redundantMetadata: ReturnType<typeof gate> | undefined;
   let stop: (() => void) | undefined, liveEvents = false, deltaFailures = 0, foreignState: string | undefined;
-  let inventories = 0, deltas = 0, scopeResets = 0, streams = 0, hostReads = 0;
+  let inventories = 0, deltas = 0, scopeResets = 0, streams = 0, hostReads = 0, snapshotPages = 0;
+  let smallSnapshot = true, snapshotSignal: AbortSignal | null | undefined;
+  let snapshotFailure: "interrupted" | "truncated" | "after-final" | "expired" | "scope" | "forbidden" | undefined, snapshotFailures = 0;
   let preferences = { revision: 1, unifiedMode: "all", includedMailboxIds: [] as string[], pinnedMailboxIds: [] as string[] };
   let splits = { ...normalizeSplits({}), revision: 1 };
   try {
@@ -705,6 +1626,7 @@ test("SDK-backed startup catches signed changes before first display without rep
       document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
       localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
     });
+    const binding = bindApplicationScope("c".repeat(64));
     globalThis.fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
       if (url.pathname === "/host/config") {
@@ -718,7 +1640,15 @@ test("SDK-backed startup catches signed changes before first display without rep
         const abort = () => reject(new DOMException("Request cancelled", "AbortError"));
         if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
       });
-      if (url.pathname === "/v1/mailbox-snapshot" && beforeSnapshot) { beforeSnapshot.seen = true; await beforeSnapshot.promise; }
+      if (url.pathname === "/v1/mailbox-snapshot") {
+        assert.equal(init?.method, "POST");
+        assert.equal(new Headers(init?.headers).get("Accept"), "application/x-ndjson");
+        snapshotSignal = init?.signal;
+        if (beforeSnapshot) { beforeSnapshot.seen = true; await beforeSnapshot.promise; }
+        // Exercise real multi-page inventory without adding a large fixture.
+        // Only this request is changed; later bootstraps retain the app's limit.
+        if (smallSnapshot) { smallSnapshot = false; init = { ...init, body: JSON.stringify({ ...JSON.parse(String(init?.body)), limit: 1 }) }; }
+      }
       if (url.pathname === "/v1/mailbox-changes" && deltaFailures > 0) {
         deltaFailures--;
         return Response.json({ code: "CONTROLLED_FAILURE", error: "Controlled catch-up failure." }, { status: 503 });
@@ -729,8 +1659,45 @@ test("SDK-backed startup catches signed changes before first display without rep
       if (url.pathname === "/v1/events" && response.ok) streams++;
       if (url.pathname === "/v1/mailbox-snapshot") {
         inventories++;
-        const held = snapshot;
-        if (held && response.ok && !(await response.clone().json()).nextCursor) { held.seen = true; await held.promise; }
+        if (response.ok) {
+          assert.match(response.headers.get("Content-Type") ?? "", /^application\/x-ndjson\b/);
+          const held = snapshot, first = firstPage, failure = snapshotFailures > 0 ? snapshotFailure : undefined;
+          if (snapshotFailures > 0) snapshotFailures--;
+          const decoder = new TextDecoder(), encoder = new TextEncoder();
+          let pending = "", pageCount = 0, lastPage: import("inbox-sdk/types").MailboxSnapshotPage | undefined;
+          return new Response(response.body!.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+            async transform(chunk, controller) {
+              pending += decoder.decode(chunk, { stream: true });
+              let end: number;
+              while ((end = pending.indexOf("\n")) !== -1) {
+                const frame = JSON.parse(pending.slice(0, end)); pending = pending.slice(end + 1);
+                assert.equal(frame.type, "page", "the controlled stream starts with real SDK summary pages");
+                lastPage = frame.page; pageCount++; snapshotPages++;
+              }
+              controller.enqueue(chunk);
+              if (pageCount === 1) {
+                if (first) { first.seen = true; await first.promise; }
+                if (failure === "interrupted") throw new TypeError("Controlled snapshot stream interruption");
+                if (failure === "truncated") { controller.terminate(); return; }
+                if (failure && failure !== "after-final") {
+                  const code = failure === "expired" ? "SNAPSHOT_EXPIRED" : failure === "scope" ? "SNAPSHOT_SCOPE_CHANGED" : "FORBIDDEN";
+                  controller.enqueue(encoder.encode(`${JSON.stringify({ type: "error", status: failure === "forbidden" ? 403 : 409, code, error: "Controlled terminal snapshot failure", retryable: failure !== "forbidden" })}\n`));
+                  controller.terminate();
+                }
+              }
+            },
+            async flush(controller) {
+              pending += decoder.decode();
+              assert.equal(pending, "", "snapshot EOF follows complete NDJSON frames");
+              assert.ok(pageCount > 0);
+              assert.equal(lastPage!.nextCursor, null, "freeze the complete authoritative inventory, not an earlier page");
+              if (failure === "after-final") controller.enqueue(encoder.encode(`${JSON.stringify({ type: "error", status: 503, code: "UPSTREAM", error: "Controlled failure after the final page", retryable: true })}\n`));
+              // All pages have reached the client, but successful EOF has not.
+              // Ignore abort here so the SDK/owner fence must reject late work.
+              if (held) { held.seen = true; await held.promise; }
+            },
+          })), { status: response.status, headers: response.headers });
+        }
       }
       if (url.pathname === "/v1/mailbox-changes") {
         deltas++;
@@ -746,13 +1713,28 @@ test("SDK-backed startup catches signed changes before first display without rep
       return response;
     }) as typeof fetch;
 
-    redundantMetadata = gate(); snapshot = gate();
-    let store = new InboxStore(); stop = store.start();
-    await until(() => snapshot!.seen, "complete initial SDK snapshot held");
-    assert.equal(store.getSnapshot().loaded, false, "a snapshot alone cannot expose rows or a false empty state");
+    redundantMetadata = gate(); firstPage = gate(); snapshot = gate();
+    let store = new InboxStore(), publishedBeforeEof = false;
+    const unsubscribePages = store.subscribe(() => { publishedBeforeEof ||= store.getSnapshot().loaded || store.getSnapshot().mail.length > 0; });
+    stop = store.start();
+    await until(() => firstPage!.seen, "first real snapshot page reached the client");
+    assert.equal(snapshotPages, 1);
+    assert.equal(store.getSnapshot().loaded, false);
+    assert.deepEqual(store.getSnapshot().mail, [], "a streamed partial inventory remains private");
+    assert.equal(deltas, 0, "catch-up cannot begin before snapshot completion");
+    firstPage.release(); firstPage = undefined;
+    await until(() => snapshot!.seen, "complete initial SDK snapshot held before EOF");
+    assert.ok(snapshotPages > 1, "the real SDK supplied multiple bounded pages");
+    assert.equal(inventories, 1, "one snapshot POST carries every page, without cursor fetches");
+    assert.equal(store.getSnapshot().loaded, false, "even the final page is not success before EOF");
+    assert.deepEqual(store.getSnapshot().mail, []);
+    assert.equal(publishedBeforeEof, false, "no subscriber ever saw a partial inventory");
+    assert.equal(deltas, 0); unsubscribePages();
     snapshot.release(); snapshot = undefined;
     await until(() => store.getSnapshot().loaded, "first ready does not wait for redundant host metadata");
     assert.equal(hostReads, 1, "fresh host metadata is not unconditionally read again during catch-up");
+    assert.equal(inventories, 1, "catch-up does not restart the completed inventory");
+    assert.ok(deltas > 0, "successful EOF still requires signed catch-up");
     assert.equal(redundantMetadata.seen, false);
     assert.ok(store.getSnapshot().mail.length > 0);
     redundantMetadata.release(); redundantMetadata = undefined; stop();
@@ -847,6 +1829,63 @@ test("SDK-backed startup catches signed changes before first display without rep
     stop(); stop = undefined; delta.release(); delta = undefined;
     await sleep(50);
     assert.equal(store.getSnapshot().loaded, false, "a late catch-up response cannot publish after stop");
+
+    for (const failure of ["interrupted", "truncated", "after-final", "forbidden"] as const) {
+      snapshotFailure = failure; snapshotFailures = 1; smallSnapshot = true; firstPage = gate();
+      const beforeInventories = inventories, beforeDelta = deltas;
+      store = new InboxStore(); let exposed = false;
+      const unsubscribe = store.subscribe(() => { exposed ||= store.getSnapshot().loaded || store.getSnapshot().mail.length > 0; });
+      stop = store.start();
+      await until(() => firstPage!.seen, `${failure} receives a real page before failure`);
+      assert.equal(store.getSnapshot().loaded, false); assert.deepEqual(store.getSnapshot().mail, []);
+      firstPage.release(); firstPage = undefined;
+      await until(() => !!store.getSnapshot().error, `${failure} stream is reported as a failed bootstrap`);
+      assert.equal(store.getSnapshot().loaded, false);
+      assert.deepEqual(store.getSnapshot().mail, []);
+      assert.equal(exposed, false, `${failure} never publishes its accumulated summaries`);
+      assert.equal(inventories, beforeInventories + 1, "stream retryable flags and transport failures do not broaden the existing automatic retry policy");
+      assert.equal(deltas, beforeDelta, "a failed stream never reaches signed catch-up");
+      unsubscribe(); snapshotFailure = undefined;
+      await store.retry();
+      assert.equal(store.getSnapshot().loaded, true, "explicit Retry starts a fresh complete inventory and catch-up");
+      assert.equal(inventories, beforeInventories + 2); stop();
+    }
+
+    for (const failure of ["expired", "scope"] as const) for (const failures of [1, 2]) {
+      snapshotFailure = failure; snapshotFailures = failures; smallSnapshot = true;
+      const beforeInventories = inventories, beforeMetadata = hostReads;
+      store = new InboxStore(); let partial = false;
+      const unsubscribe = store.subscribe(() => { partial ||= !store.getSnapshot().loaded && store.getSnapshot().mail.length > 0; });
+      stop = store.start();
+      await until(() => store.getSnapshot().loaded || !!store.getSnapshot().error, `${failure} recovery finishes`);
+      assert.equal(inventories, beforeInventories + 2, "recognized snapshot failures restart once, never indefinitely");
+      assert.equal(hostReads, beforeMetadata + 2, "restart rereads authorized metadata instead of resuming the old selection");
+      assert.equal(store.getSnapshot().loaded, failures === 1);
+      if (failures === 2) {
+        assert.equal(partial, false, "two failed attempts cannot publish either partial inventory");
+        assert.deepEqual(store.getSnapshot().mail, []);
+      } else assert.ok(store.getSnapshot().mail.length > 0);
+      unsubscribe(); stop(); snapshotFailure = undefined;
+    }
+
+    firstPage = gate(); smallSnapshot = true; store = new InboxStore(); stop = store.start();
+    await until(() => firstPage!.seen, "partial stream held before stopping its generation");
+    stop(); stop = undefined;
+    const stoppedSnapshot = store.getSnapshot();
+    assert.equal(snapshotSignal?.aborted, true, "stop aborts the in-flight snapshot request");
+    firstPage.release(); firstPage = undefined; await sleep(50);
+    assert.strictEqual(store.getSnapshot(), stoppedSnapshot, "late pages cannot publish after stop");
+    assert.equal(store.getSnapshot().loaded, false); assert.deepEqual(store.getSnapshot().mail, []);
+
+    snapshot = gate(); store = new InboxStore(); stop = store.start();
+    await until(() => snapshot!.seen, "complete stream held before owner access is revoked");
+    const lockedSnapshot = store.getSnapshot(), beforeOwnerDeltas = deltas;
+    binding.lock();
+    assert.equal(snapshotSignal?.aborted, true, "document-owner revocation aborts the snapshot transport");
+    snapshot.release(); snapshot = undefined; await sleep(50);
+    assert.strictEqual(store.getSnapshot(), lockedSnapshot, "EOF after owner abort cannot publish or report a new mail state");
+    assert.equal(store.getSnapshot().loaded, false); assert.deepEqual(store.getSnapshot().mail, []);
+    assert.equal(deltas, beforeOwnerDeltas, "owner-aborted inventory never proceeds to catch-up");
   } finally {
     stop?.(); for (const held of gates) held.release();
     database.close(); await host.close(); await fs.rm(root, { recursive: true, force: true });
@@ -854,6 +1893,29 @@ test("SDK-backed startup catches signed changes before first display without rep
     for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
   }
 });
+test("automatic sorting status never describes blocked or failed processing as healthy", () => {
+  const state: AiTriageState = { configured: true, provider: null, problemCode: null,
+    settings: { revision: 1, enabled: true, mode: "apply", model: "fixture-model", mailboxIds: null, personalization: true, readingSignals: false, interests: [] },
+    queue: { pending: 0, processing: 0, failed: 0 }, jobs: [], cursor: 0,
+    usage: { attempts: 0, completed: 0, failed: 0, reused: 0, unknownUsage: 0, unpriced: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0,
+      cacheWriteInputTokens: 0, reasoningOutputTokens: 0, estimatedMinimumUsd: 0, estimatedMaximumUsd: 0 } };
+  assert.deepEqual(aiSortingStatus(state), { tone: "normal", label: "Automatic sorting on" });
+  for (const problemCode of ["AI_DRAIN_FAILED", "AI_RECOVERY_LIMIT", "AI_MODEL_UNAVAILABLE", "AI_RESCORE_FAILED"]) {
+    const result = aiSortingStatus({ ...state, problemCode });
+    assert.equal(result.tone, "warning");
+    assert.equal(result.label, "Automatic sorting needs attention");
+    assert.ok(result.detail);
+  }
+  assert.equal(aiSortingStatus({ ...state, queue: { pending: 0, processing: 0, failed: 1 } }).label, "Some mail could not be sorted");
+  assert.equal(aiSortingStatus({ ...state, settings: { ...state.settings, mailboxIds: [] } }).tone, "warning");
+  assert.equal(aiSortingStatus(state, true).label, "Sorting status unavailable");
+  assert.equal(aiSortingStatus(null, true).tone, "warning");
+  assert.equal(aiSortingStatus({ ...state, configured: false }).tone, "warning");
+  assert.equal(aiSortingStatus({ ...state, settings: { ...state.settings, enabled: false } }).label, "Automatic sorting off");
+  assert.equal(aiSortingStatus({ ...state, settings: { ...state.settings, mode: "preview" } }).label, "Preview only");
+  assert.equal(aiSortingStatus({ ...state, queue: { pending: 1, processing: 0, failed: 0 } }).label, "Sorting new activity…");
+});
+
 test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bounded arrival holds and aborted generations", async () => {
   if (!process.versions.bun) {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -876,6 +1938,8 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
   let host: Awaited<ReturnType<typeof createMockHost>> | undefined, stop: (() => void) | undefined, releaseState: (() => void) | undefined;
   let stateGate: Promise<void> | undefined, gatedStates = 0, bodyReads = 0, inventories = 0, aiRequests = 0, changeRequests = 0;
   let releaseAction: (() => void) | undefined;
+  let aiCapability = false, resultRequests = 0, catchupRequests = 0;
+  let catchupGate: Promise<void> | undefined, releaseCatchup: (() => void) | undefined;
   let decision: AiDecision | undefined, queuedChange: AiDecision | undefined;
   let aiState: AiTriageState = { configured: false, provider: null, problemCode: null,
     settings: { revision: 1, enabled: false, mode: "preview", model: "fixture-model", mailboxIds: null, personalization: false, readingSignals: false, interests: [] },
@@ -898,7 +1962,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     const binding = bindApplicationScope("a".repeat(64));
     globalThis.fetch = (async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
-      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-ai-client" });
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], preferenceScope: "fictional-ai-client", aiTriage: aiCapability });
       if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "all", includedMailboxIds: [], pinnedMailboxIds: [] });
       if (url.pathname === "/host/split-preferences") return Response.json({ ...normalizeSplits({}), revision: 1 });
       if (url.pathname === "/host/attention-feedback") return Response.json([]);
@@ -921,6 +1985,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
         }
         if (url.pathname.endsWith("/lookup") || url.pathname.endsWith("/results")) {
           if (url.pathname.endsWith("/lookup")) assert.deepEqual(JSON.parse(String(init?.body)).keys, [{ sourceId: decision!.sourceId, threadId: decision!.threadId }]);
+          else resultRequests++;
           return Response.json({ decisions: decision ? [decision] : [], removed: [], cursor: aiState.cursor, hasMore: false, resetRequired: false });
         }
         throw new Error(`Unexpected AI endpoint ${url.pathname}`);
@@ -928,9 +1993,11 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
       if (/\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
       if (url.pathname === "/v1/mailbox-snapshot") inventories++;
       const headers = new Headers(init?.headers); headers.set("Authorization", "Bearer fictional-ai-triage-client-token-for-tests");
-      return host!.fetch(new Request(url, { ...init, headers }));
+      const response = await host!.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/mailbox-changes" && catchupGate) { catchupRequests++; await catchupGate; }
+      return response;
     }) as typeof fetch;
-    const store = new InboxStore(); stop = store.start();
+    let store = new InboxStore(); stop = store.start();
     for (let attempt = 0; attempt < 800 && !store.getSnapshot().loaded; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(store.getSnapshot().loaded, true, "real SDK fixture loaded");
     await store.retry();
@@ -1061,6 +2128,46 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     assert.equal(ready.aiHoldUntil, undefined, "resolved arrival holds never wait behind a pending mail action");
     releaseAction!(); await pendingArrivalAction; releaseAction = undefined;
 
+    // Reproduce the reload ordering: saved AI results arrive after the SDK
+    // snapshot was projected, but before its unchanged catch-up marks it loaded.
+    // This is the current host's ready/task-required shape, bound to the two real
+    // canonical SDK messages, not a separate mail or AI-client facade.
+    stop(); aiCapability = true;
+    decision = { ...decision, revision: 4, settingsRevision: aiState.settings.revision,
+      messageIds: replied.messages.map(message => message.id), latestMessageId: replied.messages.at(-1)!.id,
+      contextVersions: replied.messages.map(message => ({ messageId: message.id, bodyRevision: message.bodyRevision! })),
+      inputPolicyVersion: AI_INPUT_POLICY_VERSION,
+      assessment: { ...decision.assessment!, type: "notification", response: "not_needed", task: "required", actions: ["review", "confirm"] } };
+    aiState = { ...aiState, cursor: 4 };
+    const reloadBodies = bodyReads, reloadInventories = inventories, reloadResults = resultRequests, reloadChanges = changeRequests;
+    catchupGate = new Promise(resolve => { releaseCatchup = resolve; });
+    store = new InboxStore(); stop = store.start();
+    for (let attempt = 0; attempt < 800 && (!catchupRequests || changeRequests === reloadChanges); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(catchupRequests && changeRequests > reloadChanges, "saved results and their delta loaded while SDK catch-up was pending");
+    assert.equal(store.getSnapshot().loaded, false);
+    assert.equal(resultRequests, reloadResults + 1);
+    const reloadedViews = () => store.getSnapshot().mail.filter(mail => mail.sourceId === selected.sourceId && mail.sdkThreadId === selected.sdkThreadId);
+    assert.ok(reloadedViews().some(mail => mail.account === UNIFIED_ACCOUNT));
+    assert.ok(reloadedViews().every(mail => mail.messages.length === 2));
+    const unrelatedReload = new Map(store.getSnapshot().mail.filter(mail => mail.sdkThreadId !== selected.sdkThreadId).map(mail => [mail.id, mail]));
+    releaseCatchup!(); catchupGate = undefined;
+    for (let attempt = 0; attempt < 200 && (!store.getSnapshot().loaded || reloadedViews().some(mail => mail.triage?.revision !== 4)); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(store.getSnapshot().loaded, true);
+    for (const mail of reloadedViews()) {
+      assert.equal(mail.triage?.state, "ready", "reload must project the saved assessment after an unchanged SDK catch-up");
+      assert.equal(mail.triage?.revision, 4);
+      assert.equal(mail.triage?.assessment?.task, "required");
+      assert.equal(mail.attentionCategory, "Important");
+    }
+    for (const [id, mail] of unrelatedReload) assert.strictEqual(store.getSnapshot().mail.find(value => value.id === id), mail);
+    assert.equal(bodyReads, reloadBodies, "restoring saved AI results reads no bodies");
+    assert.equal(inventories, reloadInventories + 1, "restoring saved AI results needs only the initial SDK snapshot");
+    assert.equal(resultRequests, reloadResults + 1, "restoring saved AI results does not retry the result inventory");
+    const restoredMail = store.getSnapshot().mail;
+    const savedResults = await store.ai.results();
+    assert.equal(savedResults.decisions[0].revision, 4);
+    assert.strictEqual(store.getSnapshot().mail, restoredMail, "Settings loading the same saved result does not replace an already-restored mail model");
+
     const currentAi = store.getSnapshot().ai;
     aiState = { ...aiState, settings: { ...aiState.settings, revision: 999, model: "obsolete-owner-model" } };
     stateGate = new Promise(resolve => { releaseState = resolve; });
@@ -1089,7 +2196,7 @@ test("SDK-backed AI triage preserves opt-in, scoped updates, cached opens, bound
     await assert.rejects(ownerBoundStore.ai.lookup(keys), error => error instanceof DOMException && error.name === "AbortError");
     assert.equal(aiRequests, requestsAtLock, "a locked owner cannot dispatch AI requests");
   } finally {
-    releaseAction?.(); releaseState?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
+    releaseAction?.(); releaseState?.(); releaseCatchup?.(); stop?.(); await host?.close(); await fs.rm(root, { recursive: true, force: true });
     globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
     for (const [key, descriptor] of globals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key);
   }
@@ -1655,6 +2762,2293 @@ test("sender selection follows the exact message or outgoing recipient, never th
   assert.equal(senderContact({ ...thread, messages: [thread.messages[2]] }, history, boxes).role, "recipient");
 });
 
+test("demand-driven host windows bound automatic requests and render unknown totals without false empty states", async () => {
+  if (process.env.INBOX_DEMAND_WINDOW_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "demand-driven host windows", "--timeout", "15000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_DEMAND_WINDOW_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ InboxStore }, { mock }, { createElement }, { renderToStaticMarkup }] = await Promise.all([
+    import("../src/inbox.ts"), import("bun:test"), import("react"), import("react-dom/server"),
+  ]);
+  type Page = import("../../shared/inbox-window").InboxWindowPage;
+  type Row = import("../../shared/inbox-window").InboxWindowRow;
+  type PageInput = import("../../shared/inbox-window").InboxPageInput;
+  type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
+  type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
+  type MessagesInput = import("../../shared/inbox-window").InboxMessagesInput;
+  type MessagesPage = import("../../shared/inbox-window").InboxMessagesPage;
+  type SenderInput = import("../../shared/inbox-window").InboxSenderInput;
+  type SenderResult = import("../../shared/inbox-window").InboxSenderResult;
+  const source: import("inbox-sdk/types").Account = { id: "fictional-source", providerId: "mock", email: "owner@example.test", name: "Fictional account", generation: 1,
+    status: "connected", revision: 1, sync: { lastSyncAt: null, coverage: "partial", problem: null },
+    features: { localDrafts: true, localLabels: true, snooze: true, scheduledSend: false, undoSend: false },
+    capabilities: { sync: true, incrementalSync: true, deltaSync: false, send: false, reply: false, threads: true, nativeThreads: true,
+      folders: false, createFolders: false, labels: false, archive: false, trash: false, permanentDelete: false, markRead: false, markUnread: false,
+      star: false, attachments: false, attachmentDownload: false, search: true, drafts: false, scheduledSend: false, snooze: false, readReceipts: false, pushNotifications: false } };
+  const box: import("inbox-sdk/types").Mailbox = { id: "fictional-box", sourceId: source.id, connectionId: "fictional-connection", name: "Fictional inbox",
+    selector: { kind: "all" }, status: "active", defaultSender: source.email, revision: 1, receiving: "ready" };
+  const totals: Page["totals"] = { conversations: null, messages: null, inbox: null, splits: { Important: null, Other: null }, folders: {}, holding: null };
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage", "history", "matchMedia", "innerHeight"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (check: () => boolean, message: string) => {
+    for (let attempt = 0; attempt < 300 && !check(); attempt++) await sleep(5);
+    assert.ok(check(), message);
+  };
+  let store: InstanceType<typeof InboxStore>, stop: (() => void) | undefined, releaseQuery: (() => void) | undefined, releaseReverse: (() => void) | undefined, releaseHistory: (() => void) | undefined, releaseChanges: (() => void) | undefined, releaseReader: (() => void) | undefined, releasePinnedReads: (() => void) | undefined;
+  let renderedAi: AiTriageState | null = null, renderedAiError: string | null = "Saved sorting diagnostics are unavailable.";
+  try {
+    console.info = () => {}; console.warn = () => {};
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL(`http://localhost:41999/#/account=${box.id}&folder=Inbox&split=Important`), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+      history: { state: null }, matchMedia: () => ({ matches: false }), innerHeight: 1000,
+    });
+    mock.module("../src/use-inbox.ts", () => ({ useInbox: () => ({ ...store.getSnapshot(), store, ai: renderedAi, aiError: renderedAiError }) }));
+    const { default: App } = await import("../src/App.tsx");
+    const render = () => renderToStaticMarkup(createElement(App));
+    for (const [name, sizes] of [["full", [100, 100, 0, 1]], ["sparse", [3, 2, 0, 1]], ["empty", [0, 0, 0, 1]], ["exhausted", [0]], ["unfinished", [0]]] as const) {
+      const pages: PageInput[] = [], changes: ChangesInput[] = [], querySignals: AbortSignal[] = [], published: number[] = [], mismatchedCheckpoints: number[] = [];
+      const captures: Array<{ path: string; id: string; account: string; queryId?: string }> = [];
+      let queries = 0, revision = 1, holdQuery = false, heldQuery = false, remoteImages = false, stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+      // The host count pager is resumable: unknown until its bounded passes finish, then exact.
+      const countRequests: string[] = [], countsKnownAfter = name === "sparse" ? 8 : Infinity;
+      const knownTotals: Page["totals"] = { conversations: 6, messages: 6, inbox: 7, splits: { Important: 7, Other: 0 }, folders: { Inbox: 7 }, holding: false };
+      let reversePage: ((input: PageInput) => Page | Promise<Page>) | undefined;
+      let reverseDelta: { upserts?: Row[]; newHead: Row[]; removed: Array<{ key: string; reason: "deleted" }> } | undefined;
+      let scopeChanges: ((input: ChangesInput) => Promise<Response>) | undefined;
+      let detailRead: ((input: MessagesInput) => MessagesPage | Promise<MessagesPage>) | undefined;
+      let lookupRead: ((ids: string[]) => Row[]) | undefined;
+      let bodyRead: ((id: string) => import("inbox-sdk/types").Message | Promise<import("inbox-sdk/types").Message>) | undefined;
+      const bodyPaths: string[] = [];
+      let summaryRead: ((id: string, signal: AbortSignal) => Promise<import("inbox-sdk/types").MailboxMessageSummary | Response>) | undefined;
+      let senderRead: ((input: SenderInput) => SenderResult) | undefined;
+      let signedState = name === "full";
+      const readCursors = new Map<string, string | undefined>();
+      const state = (): Page["state"] => {
+        const queryId = `query-${queries}`, readCursor = signedState ? `${queryId}:read-${revision}` : undefined;
+        readCursors.set(`${queryId}:${revision}`, readCursor);
+        return { queryId, queryGeneration: 1, indexRevision: revision, readCursor, scopeState: "fictional-scope",
+          preferenceRevision: "1", sources: [{ sourceId: source.id, generation: 1 }], sdkState: "fictional-state", indexing: true, catchup: "current" };
+      };
+      const row = (index: number): Row => {
+        const id = `${box.id}:thread-${index}`, messageId = `message-${index}`;
+        return { key: id, sourceId: source.id, threadId: `thread-${index}`, sourceGeneration: 1, revision: 1, pageCursor: `row-${index}`,
+          mail: { ...inbox, id, account: box.id, mailboxId: box.id, sourceId: source.id, sourceGeneration: source.generation, sdkThreadId: `thread-${index}`, subject: `Fictional page row ${index}`,
+            receivedAt: Date.parse(deadline) - index * 1000, folder: "Inbox", locations: ["Inbox"], messages: [{ ...inbox.messages[0], id: messageId, body: "", loaded: false }] },
+          summaries: [], messagesComplete: false, counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 },
+          targets: [{ mailboxId: box.id, messageId, revision: 1 }], targetsComplete: true, actionContextComplete: false, contextVersion: `context-${index}` };
+      };
+      const page = (index: number): Page => ({ state: state(), totals, rows: Array.from({ length: sizes[index] ?? 0 }, (_, i) => row(index * 100 + i)),
+        nextCursor: index < sizes.length - 1 ? `cursor-${index + 1}` : null, exhausted: index >= sizes.length - 1 && (name !== "unfinished" || queries > 1) });
+      globalThis.fetch = (async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+        if (url.pathname === "/v1/accounts") return Response.json([source]);
+        if (url.pathname === "/v1/mailboxes") return Response.json([box]);
+        if (url.pathname === "/v1/changes") return Response.json({ state: "fictional-state", events: [], hasMore: false, resetRequired: false });
+        if (["/v1/labels", "/v1/drafts", `/v1/accounts/${source.id}/folders`].includes(url.pathname)) return Response.json([]);
+        if (url.pathname === "/v1/policy") return Response.json({ remoteImages, undoSendSeconds: 0 });
+        if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: false, providers: [], inboxWindow: true });
+        if (url.pathname === "/host/inbox-preferences") return Response.json({ revision: 1, unifiedMode: "selected", includedMailboxIds: [box.id], pinnedMailboxIds: [] });
+        if (url.pathname === "/host/inbox/query") {
+          queries++; querySignals.push(init!.signal!);
+          if (holdQuery) { heldQuery = true; await new Promise<void>(resolve => { releaseQuery = resolve; }); }
+          return Response.json(page(0));
+        }
+        if (url.pathname === "/host/inbox/page") {
+          const body = JSON.parse(String(init?.body)) as PageInput; pages.push(body);
+          assert.equal(body.queryId, state().queryId); assert.ok(body.limit! <= 100);
+          if (reversePage) return Response.json(await reversePage(body));
+          return Response.json(page(Number(body.cursor!.slice("cursor-".length))));
+        }
+        if (url.pathname === "/host/inbox/changes") {
+          const body = JSON.parse(String(init?.body)) as ChangesInput; changes.push(body);
+          assert.ok(body.residentKeys.length <= 1000); assert.equal(body.limit, 100);
+          assert.ok(readCursors.has(`${body.queryId}:${body.sinceRevision}`));
+          assert.equal(body.sinceCursor, readCursors.get(`${body.queryId}:${body.sinceRevision}`), "each request preserves one matching revision/token pair, including legacy omission");
+          if (scopeChanges) return scopeChanges(body);
+          const delta = reverseDelta; reverseDelta = undefined;
+          if (delta) revision++;
+          return Response.json({ state: state(), upserts: delta?.upserts ?? [], newHead: delta?.newHead ?? [], removed: delta?.removed ?? [], totals, nextCursor: null, throughRevision: revision, resetReason: null });
+        }
+        if (url.pathname === "/host/inbox/counts") {
+          const body = JSON.parse(String(init?.body)) as { queryId: string }; countRequests.push(body.queryId);
+          return Response.json({ state: { ...state(), queryId: body.queryId }, totals: countRequests.length >= countsKnownAfter ? knownTotals : totals, ...(name === "sparse" ? { progress: countRequests.length * 500 } : name === "empty" ? { progress: 0 } : {}) });
+        }
+        if (url.pathname === "/host/inbox/messages" && detailRead) return Response.json(await detailRead(JSON.parse(String(init?.body))));
+        if (url.pathname === "/host/inbox/lookup" && lookupRead) return Response.json({ state: state(), entries: lookupRead(JSON.parse(String(init?.body)).ids).map(row => ({ key: row.key, status: "found", row })) });
+        if (url.pathname.startsWith(`/v1/mailboxes/${box.id}/messages/`) && url.pathname.endsWith("/summary") && summaryRead) {
+          const result = await summaryRead(decodeURIComponent(url.pathname.split("/").at(-2)!), init!.signal!);
+          return result instanceof Response ? result : Response.json(result);
+        }
+        if (/^\/v1\/mailboxes\/[^/]+\/messages\/[^/]+$/.test(url.pathname) && bodyRead) { bodyPaths.push(url.pathname); return Response.json(await bodyRead(decodeURIComponent(url.pathname.split("/").at(-1)!))); }
+        if (url.pathname === "/host/inbox/sender" && senderRead) return Response.json(senderRead(JSON.parse(String(init?.body))));
+        if (["/host/inbox/zero/create", "/host/inbox/selection/create"].includes(url.pathname)) {
+          captures.push({ path: url.pathname, ...JSON.parse(String(init?.body)) });
+          return Response.json({ code: "HOST_INBOX_PREPARING", error: "Capture preparation is not ready." }, { status: 503 });
+        }
+        if (url.pathname === "/v1/events") return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+          stream = controller; controller.enqueue(new TextEncoder().encode('event: ready\ndata: {"state":"fictional-state"}\n\n'));
+        } }), { headers: { "content-type": "text/event-stream" } });
+        assert.fail(`Unexpected request in demand-only fixture: ${url.pathname}`);
+      }) as typeof fetch;
+      store = new InboxStore();
+      const unsubscribe = store.subscribe(() => {
+        const snapshot = store.getSnapshot(), current = snapshot.window?.state;
+        if (snapshot.loaded) published.push(snapshot.window!.keys.length);
+        if (current && current.readCursor !== readCursors.get(`${current.queryId}:${current.indexRevision}`)) mismatchedCheckpoints.push(current.indexRevision);
+      });
+      stop = store.start();
+      await until(() => !!store.getSnapshot().window && !store.getSnapshot().window!.paging && !!stream, `${name}: bounded initial response settled`);
+      assert.equal(published[0], sizes[0], `${name}: the first response is usable before the buffer arrives`);
+      assert.equal(store.getSnapshot().loaded, true); assert.equal(store.getSnapshot().loading, false);
+      assert.equal(store.getSnapshot().window!.keys.length, sizes[0] + (sizes[1] ?? 0));
+      await sleep(650);
+      assert.equal(queries, 1); assert.equal(pages.length, sizes.length > 1 ? 1 : 0, `${name}: initial response plus at most one automatic buffer`);
+      assert.equal(changes.length, 0, `${name}: incomplete context does not start an index-completion poller`);
+      // Progressing passes finish beyond the old five-request cap; stalled passes stop.
+      await until(() => countRequests.length === (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: the count fill settles`);
+      await sleep(120); assert.equal(countRequests.length, (name === "empty" ? 1 : Number.isFinite(countsKnownAfter) ? countsKnownAfter : 5), `${name}: a fill stops at completion or lack of progress`);
+      assert.ok(countRequests.every(id => id === "query-1"), "count fills address the opened view's query");
+      if (name === "sparse") assert.deepEqual(store.getSnapshot().window!.totals, knownTotals, "complete totals are published without a rebuild");
+      else assert.equal(store.getSnapshot().window!.totals.conversations, null, "unknown totals never become zero");
+      const html = render();
+      assert.doesNotMatch(html, /ai-sorting-warning|Sorting details|Indexing conversations|Loading conversations…/);
+      assert.doesNotMatch(html, /…<\/span>/, "unknown counts render nothing, not an ellipsis");
+      if (name === "sparse") {
+        assert.match(html, /split-tab-count">7</, "known split totals render as exact numbers");
+        assert.match(html, /split-tab-count">0</, "known zero is distinct from an unfinished count");
+      }
+      else assert.doesNotMatch(html, /split-tab-count/, "unknown split totals render the tab label alone");
+      if (name === "full") {
+        const healthy: AiTriageState = { configured: true, provider: null, problemCode: null,
+          settings: { revision: 1, enabled: true, mode: "apply", model: "fixture-model", mailboxIds: null, personalization: true, readingSignals: false, interests: [] },
+          queue: { pending: 0, processing: 0, failed: 0 }, jobs: [], cursor: 0,
+          usage: { attempts: 0, completed: 0, failed: 0, reused: 0, unknownUsage: 0, unpriced: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0,
+            cacheWriteInputTokens: 0, reasoningOutputTokens: 0, estimatedMinimumUsd: 0, estimatedMaximumUsd: 0 } };
+        const sortingCases: Array<{ ai: AiTriageState | null; error: string | null; label: string | null }> = [
+          { ai: healthy, error: null, label: null },
+          { ai: { ...healthy, queue: { ...healthy.queue, failed: 56 } }, error: null, label: null },
+          { ai: healthy, error: "Current sorting status could not be read.", label: "Sorting status unavailable" },
+          { ai: { ...healthy, configured: false }, error: null, label: "Automatic sorting unavailable" },
+          { ai: { ...healthy, problemCode: "AI_MODEL_UNAVAILABLE" }, error: null, label: "Automatic sorting needs attention" },
+          { ai: { ...healthy, settings: { ...healthy.settings, mailboxIds: [] } }, error: null, label: "No mailboxes selected" },
+          { ai: { ...healthy, configured: false, problemCode: "AI_MODEL_UNAVAILABLE", settings: { ...healthy.settings, enabled: false, mailboxIds: [] } }, error: "Unavailable", label: null },
+          { ai: { ...healthy, configured: false, problemCode: "AI_MODEL_UNAVAILABLE", settings: { ...healthy.settings, mode: "preview", mailboxIds: [] } }, error: "Unavailable", label: null },
+          { ai: null, error: null, label: null },
+          { ai: null, error: "Saved sorting diagnostics are unavailable.", label: null },
+        ];
+        for (const { ai, error, label } of sortingCases) {
+          renderedAi = ai; renderedAiError = error;
+          const current = render(), hints = [...current.matchAll(/<button\b[^>]*aria-label="Settings — ([^"]+)"[^>]*>/g)];
+          assert.deepEqual(hints.map(match => match[1]), label ? [label, label] : [], "only current enabled-Apply outages hint on both existing Settings gears");
+          assert.equal([...current.matchAll(/data-sorting-issue="true"/g)].length, label ? 2 : 0, "historical failures, off/preview and missing state never add a status dot");
+          for (const [button] of hints) assert.ok(button.includes(`title="Settings — ${label}"`), "the tooltip matches the accessible gear name");
+          assert.doesNotMatch(current, /ai-sorting-warning|Sorting details/);
+        }
+        renderedAi = null; renderedAiError = "Saved sorting diagnostics are unavailable.";
+        const [{ GuidedZero }, { Notice, default: Notices }, { InboxViewPreferencesError }] = await Promise.all([
+          import("../src/GuidedZero.tsx"), import("../src/Notices.tsx"), import("../src/host.ts"),
+        ]);
+        const noop = () => {};
+        const preparation: import("../src/GuidedZero.tsx").GuidedZeroState = { session: null, active: false, scoped: false, preparing: true, busy: false, error: "", retry: null,
+          storageError: false, undo: null, undoBlocked: false, remainingNow: null, remainingCount: null, decidedCount: 0, initialCount: null, overflowCount: 0,
+          offers: [], checked: [], confirming: false, handling: false, currentOutside: false, hasNextPage: false,
+          start: noop, pause: noop, review: noop, decide: noop, captureLater: () => false, remind: async () => {}, toggleChecked: noop, setConfirming: noop,
+          moveBatch: noop, browse: noop, continueReview: noop, handle: noop };
+        // Render contracts only: browser acceptance exercises actual Start/Back and scoped Select all callbacks.
+        for (const busy of [false, true]) {
+          const markup = renderToStaticMarkup(createElement(GuidedZero, { state: { ...preparation, busy }, onHandle: noop, onLater: noop }));
+          assert.match(markup, /Preparing cleanup\. You can return to your inbox while it gets ready\./);
+          assert.doesNotMatch(markup, /role="alert"|zero-error|Retry existing request|conversations selected/);
+          const start = markup.match(/<button\b([^>]*)>Start session<\/button>/)!;
+          assert.ok(start); assert.equal(start[1].includes("disabled"), busy, "Start is an explicit retry only when the prior request is settled");
+          assert.doesNotMatch(markup.match(/<button\b[^>]*>Back to inbox<\/button>/)![0], /disabled/, "leaving preparation remains available during its request");
+        }
+        const readyBody = renderToStaticMarkup(createElement(GuidedZero, { state: { ...preparation, preparing: false }, onHandle: noop, onLater: noop }));
+        assert.match(readyBody, /Work through unhandled Important conversations, including already-read mail\./);
+        assert.doesNotMatch(readyBody, /Preparing cleanup/);
+        const realFailure = renderToStaticMarkup(createElement(GuidedZero, { state: { ...preparation, preparing: false, error: "Existing action remains unconfirmed.", retry: async () => {} }, onHandle: noop, onLater: noop }));
+        assert.match(realFailure, /role="alert"/); assert.match(realFailure, />Retry existing request<\/button>/);
+        const selectionNotice = renderToStaticMarkup(createElement(Notices, { issues: [], onRetry: noop, onDismiss: noop },
+          createElement("div", { role: "status" }, createElement(Notice, { quiet: true, title: "Preparing selection…", action: { label: "Select all", onClick: noop }, onDismiss: noop }))));
+        assert.match(selectionNotice, /notice-quiet/); assert.match(selectionNotice, /Preparing selection…/); assert.match(selectionNotice, />Select all<\/button>/);
+        assert.doesNotMatch(selectionNotice, /role="alert"|conversations selected/);
+        const isPreparing = (error: unknown) => error instanceof InboxViewPreferencesError && error.code === "HOST_INBOX_PREPARING" && error.status === 503;
+        await assert.rejects(store.windowTransport.zeroCreate({ id: crypto.randomUUID(), account: box.id }), isPreparing);
+        await assert.rejects(store.createWindowSelection(), isPreparing);
+        await sleep(30); assert.equal(captures.length, 2, "preparation rejection does not trigger a transport retry or create an accepted reference");
+        await assert.rejects(store.createWindowSelection(), isPreparing);
+        assert.notEqual(captures[1].id, captures[2].id, "another explicit selection attempt uses a fresh capture ID");
+        assert.ok(captures.every(capture => capture.account === box.id));
+      }
+      if (name === "unfinished") {
+        assert.match(html, /Could not finish loading this view\./);
+        assert.match(html, />Retry<\/button>/);
+        assert.doesNotMatch(html, /No matches in the conversations checked\.|No matching conversations in cached mail\.|Load older conversations/);
+        await store.refresh();
+        assert.equal(queries, 2, "the Retry refresh operation opens a fresh query rather than rereading an unfinished delta");
+        assert.equal(store.getSnapshot().window!.exhausted, true);
+        assert.match(render(), /No matching conversations in cached mail\./);
+        assert.doesNotMatch(render(), /Could not finish loading this view\./);
+      } else if (sizes.length === 1) {
+        assert.match(html, /No matching conversations in cached mail\./, "exhausted Inbox renders its existing empty view with unknown global totals");
+        assert.doesNotMatch(html, /Load older conversations/);
+        await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Trash" });
+        assert.doesNotMatch(render(), /No matching conversations in cached mail\./, "a different query's exhaustion cannot empty the current route");
+        location.hash = `#/account=${box.id}&folder=Trash&split=Important`;
+        assert.match(render(), /No matches in cached mail\./, "an exhausted non-Inbox view keeps its appropriate empty state");
+        location.hash = `#/account=${box.id}&folder=Inbox&split=Important`;
+      } else {
+        assert.match(html, /Load older conversations/);
+        assert.doesNotMatch(html, /No matching conversations in cached mail\./, "an empty bounded page with a cursor is not exhaustion");
+        if (name === "empty") assert.match(html, /No matches in the conversations checked\./, "a partial empty scan explains only the checked conversations");
+        else assert.doesNotMatch(html, /No matches in the conversations checked\./, "nonempty pages do not add status prose");
+        const first = store.getSnapshot().mail[0];
+        await store.loadMoreWindow();
+        assert.equal(pages.length, 2); assert.equal(pages[1].cursor, "cursor-2");
+        assert.equal(store.getSnapshot().window!.nextCursor, "cursor-3", "an explicit empty response retains its next cursor");
+        if (name === "empty") assert.match(render(), /No matches in the conversations checked\./, "empty explicit scans keep the useful line and continuation");
+        await store.loadMoreWindow();
+        assert.equal(pages.length, 3); assert.equal(pages[2].cursor, "cursor-3");
+        assert.ok(store.getSnapshot().mail.some(mail => mail.id === `${box.id}:thread-300`), "explicit demand reaches a match beyond empty scans");
+        if (first) assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), first, "unchanged resident identities survive demand paging");
+        if (name === "full") {
+          const reader = store.getSnapshot().mail.find(mail => mail.id === row(0).key)!;
+          const draft = store.getSnapshot().mail.find(mail => mail.id === row(1).key)!;
+          const draftsBefore = structuredClone(store.getSnapshot().drafts);
+          store.pinWindow("reader", [reader.id], [reader]); store.pinWindow("draft:reverse", [draft.id], [draft]);
+          let arrived = false, firstNewer = true;
+          const older = (start: number, limit = 100): Page => {
+            const end = Math.min(start + limit, arrived ? 1049 : 1050);
+            return { state: state(), totals, rows: Array.from({ length: Math.max(0, end - start) }, (_, i) => row(start + i)),
+              nextCursor: end < (arrived ? 1049 : 1050) ? `older-page-${end}` : null, exhausted: end >= (arrived ? 1049 : 1050) };
+          };
+          reversePage = async input => {
+            if (input.seek === "start") return older(arrived ? -1 : 0, input.limit);
+            if (input.seek === "end") return { state: state(), totals, rows: [], nextCursor: "empty-end-newer", exhausted: false };
+            if (input.cursor === "empty-end-newer") return { state: state(), totals, rows: [row(1048)], nextCursor: "end-next-newer", exhausted: false };
+            if (input.cursor?.startsWith("older-page-")) return older(Number(input.cursor.slice("older-page-".length)), input.limit);
+            if (input.cursor?.startsWith("newer-gap-")) {
+              const anchor = Number(input.cursor.slice("newer-gap-".length));
+              const result: Page = { state: state(), totals, rows: [anchor - 2, anchor - 1].map(i => ({ ...row(i), pageCursor: `newer-row-${i}` })),
+                nextCursor: `newer-progress-${anchor - 2}`, exhausted: false };
+              await new Promise<void>(resolve => { releaseReverse = resolve; }); return result;
+            }
+            if (input.cursor?.startsWith("newer-progress-")) return { state: state(), totals, rows: [], nextCursor: "newer-after-sparse", exhausted: false };
+            const anchor = Number(input.cursor?.replace(/^(?:row-|newer-row-|terminal-row-)/, ""));
+            assert.ok(Number.isInteger(anchor), "reverse requests use an exact row bookmark or the last directional continuation");
+            if (input.direction !== "newer") return older(anchor + 1, input.limit);
+            if (firstNewer) { firstNewer = false; return { state: state(), totals, rows: [], nextCursor: `newer-gap-${anchor}`, exhausted: false }; }
+            const indices = [...(arrived ? [-1] : []), ...Array.from({ length: anchor }, (_, i) => i)];
+            assert.ok(indices.length <= input.limit!);
+            return { state: state(), totals, rows: indices.map(i => ({ ...row(i), pageCursor: `terminal-row-${i}` })), nextCursor: null, exhausted: true };
+          };
+          await store.seekWindow("start");
+          for (let i = 0; i < 10; i++) await store.loadMoreWindow();
+          assert.equal(store.getSnapshot().window!.keys[0], row(52).key, "two pinned parents force a mid-page head eviction at the unchanged 1000-row cap");
+          assert.equal(store.getSnapshot().window!.exhausted, true); assert.equal(store.getSnapshot().window!.nextCursor, null);
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "row-52", "head eviction uses the exact first resident row, not its page boundary");
+          assert.equal(store.getSnapshot().window!.keys[0], row(52).key); assert.equal(store.getSnapshot().window!.hasNewer, true);
+          const reverseBaseline = store.getSnapshot().window!.state.indexRevision;
+          const pending = store.loadNewerWindow();
+          await until(() => !!releaseReverse, "sparse newer response is held");
+          assert.equal(pages.at(-1)!.cursor, "newer-gap-52", "an empty newer response advances its separate continuation");
+          assert.strictEqual(store.loadNewerWindow(), pending); assert.strictEqual(store.loadMoreWindow(), pending, "both paging directions share the in-flight guard");
+          const { pageCursor: _bookmark, ...arrival } = row(-1);
+          reverseDelta = { newHead: [arrival], removed: [{ key: row(1049).key, reason: "deleted" }] }; arrived = true;
+          await store.retry();
+          assert.equal(store.getSnapshot().window!.keys[0], arrival.key);
+          const reverseChanges = changes.length, savedReverse = row(50);
+          const changedReverse = { ...savedReverse, revision, mail: { ...savedReverse.mail, starred: !savedReverse.mail.starred } };
+          scopeChanges = async input => {
+            assert.equal(input.sinceRevision, reverseBaseline, "a delayed newer page replays its original baseline, not the completed drain");
+            assert.ok(input.residentKeys.includes(changedReverse.key));
+            return Response.json({ state: state(), upserts: [changedReverse], newHead: [], removed: [], totals, nextCursor: null, throughRevision: revision, resetReason: null } satisfies ChangesPage);
+          };
+          releaseReverse!(); releaseReverse = undefined; await pending;
+          assert.equal(store.getSnapshot().window!.state.indexRevision, 2, "a late page cannot regress a concurrent delta revision");
+          assert.equal(store.getSnapshot().window!.keys[0], arrival.key, "newer paging merges the latest resident head");
+          assert.ok(!store.getSnapshot().window!.keys.includes(row(1049).key));
+          assert.equal(store.getSnapshot().window!.nextCursor, "row-1046", "tail eviction retains a bookmark from a terminal older page");
+          await until(() => store.getSnapshot().mail.find(mail => mail.id === changedReverse.key)?.starred === changedReverse.mail.starred, "the newly resident reverse row reconciles the flag delta it missed");
+          assert.equal(changes.length, reverseChanges + 1, "reverse catch-up is one bounded changes pass");
+          scopeChanges = undefined;
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "newer-progress-50", "sparse continuation wins over the concurrently arrived first row");
+          await store.loadMoreWindow(2);
+          assert.equal(pages.at(-1)!.cursor, "row-1046");
+          assert.equal(store.getSnapshot().window!.keys[0], row(51).key);
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "newer-row-51", "head-evicting older demand rebases an in-progress newer walk");
+          assert.equal(store.getSnapshot().window!.hasNewer, false);
+          await store.loadMoreWindow(20);
+          assert.equal(pages.at(-1)!.cursor, "row-998", "older demand resumes at the exact retained tail");
+          assert.equal(store.getSnapshot().window!.keys[0], row(21).key);
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "terminal-row-21", "terminal newer responses retain each row's reversible bookmark");
+          assert.deepEqual(store.getSnapshot().window!.keys.slice(1, 101), Array.from({ length: 100 }, (_, i) => row(i).key));
+          assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === reader.id), reader);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === draft.id), draft); assert.deepEqual(store.getSnapshot().drafts, draftsBefore);
+          await store.seekWindow("end");
+          assert.deepEqual(store.getSnapshot().window!.keys, []); assert.equal(store.getSnapshot().window!.exhausted, true); assert.equal(store.getSnapshot().window!.hasNewer, true);
+          assert.match(render(), /Load newer conversations/);
+          assert.doesNotMatch(render(), /No matching conversations in cached mail\./, "an empty oldest scan with newer continuation is not an empty mailbox");
+          await store.loadNewerWindow();
+          assert.equal(pages.at(-1)!.cursor, "empty-end-newer", "empty end pages do not fall back to seek:start");
+          assert.deepEqual(store.getSnapshot().window!.keys, [row(1048).key]); assert.equal(store.getSnapshot().window!.nextCursor, null);
+          await store.seekWindow("start");
+          const afterSeek = pages.length; await store.loadNewerWindow(); await sleep(30);
+          assert.equal(pages.length, afterSeek, "explicit seeks neither retain stale newer continuations nor restart automatic prefetch");
+          store.pinWindow("reader", []); store.pinWindow("draft:reverse", []);
+
+          type Summary = import("inbox-sdk/types").MailboxMessageSummary;
+          const { projectMailboxMail } = await import("../../shared/mail-projection.ts");
+          const giantKey = `${box.id}:giant`, deepId = "giant-501";
+          let deepRevision = 1, deepBodyRevision = 1, giantRevision = revision, holdHistory = false;
+          const summary = (index: number, threadId = "giant"): Summary => {
+            const id = `${threadId}-${index}`, deep = threadId === "giant" && index === 501;
+            return { id, accountId: source.id, sourceId: source.id, threadId, revision: deep ? deepRevision : 1,
+              bodyRevision: deep ? `giant-body-${deepBodyRevision}` : `body-${id}`, from: { name: "Fictional sender", email: "sender@example.test" },
+              to: [{ name: "Owner", email: source.email }], cc: [], subject: "Fictional conversation", preview: "Fictional history.",
+              receivedAt: new Date(Date.parse(deadline) + index * 1000).toISOString(), isRead: deep && deepRevision === 2, isStarred: index === 1 || deep && deepRevision === 2,
+              folder: "inbox", folderIds: ["inbox"], labelIds: [], hasAttachments: false,
+              memberships: [{ mailboxId: box.id, messageId: id, revision: deep ? deepRevision : 1, done: false,
+                snoozedUntil: index === 2 ? deadline : deep && deepRevision === 2 ? "2026-10-03T12:00:00.000Z" : null }] };
+          };
+          const projected = (summaries: Summary[]) => projectMailboxMail({ sources: [source], mailboxes: [box], labels: [], summaries,
+            includedMailboxIds: [], allowProviderWrites: false, now: Date.now(), displayTime: () => ({ date: "Today", group: "Today" }) }).mail[0];
+          const factsSummary = { ...summary(1, "facts"), facts: { version: 1 as const, listId: true, listUnsubscribe: true } };
+          assert.deepEqual(projected([factsSummary]).messages[0]?.facts, { version: 1, listId: true, listUnsubscribe: true },
+            "projected messages carry body-free source facts so the reader can offer the sender's unsubscribe");
+          const giantRow = (): Row => {
+            const preview = Array.from({ length: 50 }, (_, i) => summary(651 + i));
+            return { key: giantKey, sourceId: source.id, threadId: "giant", sourceGeneration: 1, revision: giantRevision,
+              mail: { ...projected(preview), starred: true }, summaries: preview, messagesComplete: false,
+              counts: { messages: 700, memberships: 700, unread: deepRevision === 2 ? 699 : 700, done: 0, snoozed: deepRevision === 2 ? 2 : 1 },
+              targets: Array.from({ length: 500 }, (_, i) => ({ mailboxId: box.id, messageId: `giant-${i + 1}`, revision: 1 })),
+              targetsComplete: false, actionContextComplete: false, contextVersion: "same-giant-context" };
+          };
+          let otherSummary = summary(1, "companion");
+          const companionRow: Row = { key: `${box.id}:companion`, sourceId: source.id, threadId: "companion", sourceGeneration: 1, revision: 1,
+            mail: projected([otherSummary]), summaries: [otherSummary], messagesComplete: true,
+            counts: { messages: 1, memberships: 1, unread: 1, done: 0, snoozed: 0 }, targets: [{ mailboxId: box.id, messageId: otherSummary.id, revision: 1 }],
+            targetsComplete: true, actionContextComplete: true, contextVersion: "companion-context" };
+          const detailReads: MessagesInput[] = [], bodyReads: string[] = [];
+          reversePage = () => ({ state: state(), totals, rows: [giantRow(), companionRow], nextCursor: null, exhausted: true });
+          lookupRead = ids => ids.map(id => { assert.equal(id, giantKey); return giantRow(); });
+          detailRead = async input => {
+            assert.equal(input.id, giantKey); assert.equal(input.limit, 100); detailReads.push(structuredClone(input));
+            const offset = input.cursor ? Number(input.cursor.slice("detail-".length)) : 0, end = 700 - offset * 100;
+            const result: MessagesPage = { state: state(), key: giantKey, contextVersion: "same-giant-context", total: 700, messages: [],
+              summaries: Array.from({ length: 100 }, (_, i) => summary(end - 99 + i)), nextCursor: end > 100 ? `detail-${offset + 1}` : null, exhausted: end <= 100 };
+            if (holdHistory && offset === 2) await new Promise<void>(resolve => { releaseHistory = resolve; });
+            return result;
+          };
+          let failWarm = true, holdBody = false, releaseBody: (() => void) | undefined;
+          bodyRead = async id => {
+            assert.ok(id === deepId || id === otherSummary.id || id === "giant-700" || id === "giant-699"); bodyReads.push(id);
+            if (failWarm) { failWarm = false; throw new Error("Fictional background failure"); }
+            const message = id === deepId ? summary(501) : id === "giant-700" ? summary(700) : id === "giant-699" ? summary(699) : otherSummary;
+            if (holdBody) { holdBody = false; await new Promise<void>(resolve => { releaseBody = resolve; }); }
+            return { ...message, snoozedUntil: null, bcc: [], attachments: [], bodyFormat: "html", bodyHtml: `<p>${message.bodyRevision}</p>`, bodyText: message.bodyRevision! };
+          };
+          await store.seekWindow("start");
+          assert.ok(!giantRow().summaries.some(message => message.id === deepId) && !giantRow().targets.some(target => target.messageId === deepId));
+          let beforeWarm = store.getSnapshot();
+          const pageCountBeforeWarm = pages.length;
+          store.warmAdjacentBodies(undefined, []);
+          store.warmAdjacentBodies(giantKey, [companionRow.key]);
+          await until(() => bodyReads.length === 1, "a synchronous empty-to-nonempty warming transition drains the queue");
+          await sleep(20);
+          assert.strictEqual(store.getSnapshot(), beforeWarm, "background failures are silent");
+          bodyReads.length = 0;
+          holdBody = true;
+          store.warmAdjacentBodies(undefined, ["nonresident-conversation"]);
+          store.warmAdjacentBodies(giantKey, [companionRow.key]);
+          await until(() => !!releaseBody, "work queued as a drain completes is not stranded");
+          const foreground = store.loadThread(companionRow.key);
+          assert.equal(bodyReads.length, 1, "foreground shares the in-flight speculative request");
+          otherSummary = { ...otherSummary, revision: 2, bodyRevision: "companion-body-2" };
+          Object.assign(companionRow, { revision: revision + 1, summaries: [otherSummary], mail: projected([otherSummary]) });
+          reverseDelta = { upserts: [companionRow], newHead: [], removed: [] }; await store.retry();
+          assert.strictEqual(store.loadThread(companionRow.key), foreground, "a rerender shares the existing foreground load");
+          releaseBody!(); releaseBody = undefined;
+          await foreground;
+          assert.equal(bodyReads.length, 2, "a superseded foreground request retries the current body");
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!.messages[0].body, "<p>companion-body-2</p>");
+          const internals = store as unknown as { details: Map<string, import("inbox-sdk/types").Message>; speculativeDetails: Map<string, unknown>; summaries: Map<string, Summary[]>; messageRows: Map<string, Summary>; publish: (state: unknown) => void; rebuild: (threads: Set<string>) => void; windowBytes: () => number; windowPinnedBytes: Map<string, number>; windowRows: Map<string, Row>; windowDetails: Map<string, unknown>; saveThreadHistory: (row: Row, history: unknown) => void; trimWindow: (keys: string[]) => string[] };
+          internals.details.delete(otherSummary.id);
+          internals.rebuild(new Set([`${source.id}\0companion`]));
+          holdBody = true;
+          const membershipPaths = bodyPaths.length;
+          const moving = store.loadThread(companionRow.key);
+          await until(() => !!releaseBody, "body request is held while membership changes");
+          const alternative = "fictional-other-box", moved = { ...otherSummary, memberships: [{ ...otherSummary.memberships[0], mailboxId: alternative }] };
+          const originalRows = internals.summaries.get(box.id)!;
+          internals.summaries.set(box.id, originalRows.filter(row => row.id !== otherSummary.id));
+          internals.summaries.set(alternative, [moved]);
+          internals.messageRows.set(`${source.id}\0${otherSummary.id}`, moved);
+          const currentMail = store.getSnapshot().mail;
+          internals.publish({ mail: currentMail.map(mail => mail.id !== companionRow.key ? mail : { ...mail, mailboxId: alternative, messages: mail.messages.map(message => ({ ...message, memberships: moved.memberships })) }) });
+          releaseBody!(); releaseBody = undefined; await moving;
+          assert.deepEqual(bodyPaths.slice(membershipPaths), [`/v1/mailboxes/${box.id}/messages/${otherSummary.id}`, `/v1/mailboxes/${alternative}/messages/${otherSummary.id}`], "a changed membership retries against the current mailbox");
+          assert.ok(internals.details.has(otherSummary.id), "the moved message body is admitted");
+          internals.summaries.set(box.id, originalRows); internals.summaries.delete(alternative);
+          internals.messageRows.set(`${source.id}\0${otherSummary.id}`, otherSummary);
+          internals.publish({ mail: currentMail });
+          internals.details.delete(otherSummary.id);
+          internals.rebuild(new Set([`${source.id}\0companion`]));
+          beforeWarm = store.getSnapshot(); bodyReads.length = 0;
+          store.warmAdjacentBodies(giantKey, [companionRow.key]);
+          await until(() => bodyReads.includes(otherSummary.id), "adjacent body is warmed");
+          await sleep(20);
+          assert.strictEqual(store.getSnapshot(), beforeWarm, "warming does not publish a replacement model");
+          assert.equal(pages.length, pageCountBeforeWarm, "warming does not request additional window metadata");
+          await store.loadThread(companionRow.key);
+          assert.equal(bodyReads.length, 1, "foreground promotion uses the warmed body without another request");
+          assert.ok(store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!.messages[0].loaded, "foreground promotion publishes the admitted body");
+          const windowLimit = 32 * 1024 * 1024, beforeWindowPressure = bodyReads.length;
+          internals.windowPinnedBytes.set("fictional-pressure", windowLimit - internals.windowBytes() - 50);
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => bodyReads.length > beforeWindowPressure, "window-budget speculative read is attempted");
+          await sleep(30);
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "speculation is rejected when it would exceed the window budget");
+          assert.ok(internals.windowBytes() <= windowLimit);
+          internals.windowPinnedBytes.delete("fictional-pressure");
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => internals.speculativeDetails.has("giant-700"), "body is admitted when window pressure is removed");
+          const windowKeys = store.getSnapshot().window!.keys;
+          internals.windowPinnedBytes.set("fictional-pressure", windowLimit / 2 - internals.windowBytes() + 100);
+          assert.deepEqual(internals.trimWindow(windowKeys), windowKeys, "speculation does not displace resident rows when the window trims");
+          assert.ok(internals.details.has(otherSummary.id), "speculation is evicted before published bodies when the window trims");
+          assert.equal(internals.speculativeDetails.has("giant-700"), false);
+          internals.windowPinnedBytes.delete("fictional-pressure");
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => internals.speculativeDetails.has("giant-700"), "body can be warmed again after trimming");
+          const savedRow = internals.windowRows.get(giantKey)!, savedHistory = internals.windowDetails.get(giantKey);
+          internals.windowPinnedBytes.set("fictional-pressure", windowLimit - internals.windowBytes() - 200);
+          internals.saveThreadHistory(savedRow, { contextVersion: savedRow.contextVersion, summaries: [summary(1)], cursor: null, exhausted: true });
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "foreground history evicts speculation before rejecting its window");
+          assert.ok(internals.windowBytes() <= windowLimit);
+          internals.windowPinnedBytes.delete("fictional-pressure");
+          internals.windowRows.set(giantKey, savedRow);
+          if (savedHistory) internals.windowDetails.set(giantKey, savedHistory); else internals.windowDetails.delete(giantKey);
+          bodyReads.length = 1;
+          const normalDetail = internals.details.get(otherSummary.id)!;
+          const largeText = "x".repeat(2_200_000);
+          internals.details.set(otherSummary.id, { ...normalDetail, bodyText: largeText });
+          internals.rebuild(new Set([`${source.id}\0companion`]));
+          const pressuredSnapshot = store.getSnapshot();
+          const ordinaryRead = bodyRead;
+          bodyRead = async id => ({ ...await ordinaryRead!(id), bodyText: largeText });
+          // Speculative admission must protect even unpinned published details.
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => bodyReads.includes("giant-700"), "cache-pressure speculative request completes");
+          await sleep(50);
+          assert.strictEqual(store.getSnapshot(), pressuredSnapshot, "cache pressure causes no speculative publication");
+          assert.equal(internals.details.get(otherSummary.id)?.bodyText, largeText, "speculation cannot evict a published unpinned body");
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "speculation is skipped when published bodies consume the budget");
+          const readsUnderPressure = bodyReads.length; await store.loadThread(companionRow.key);
+          assert.equal(bodyReads.length, readsUnderPressure, "the published body remains cached under speculation pressure");
+          store.warmAdjacentBodies(companionRow.key, []);
+          store.pinWindow("reader", [giantKey]);
+          await store.loadThread(giantKey);
+          assert.equal(internals.details.has(otherSummary.id), false, "foreground admission may evict the formerly displayed body after the reader pin moves");
+          assert.equal(internals.details.get("giant-700")?.bodyText, largeText, "the newly displayed large body is admitted");
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.at(-1)!.loaded, true);
+          internals.details.delete("giant-700");
+          internals.rebuild(new Set([`${source.id}\0giant`]));
+          store.pinThreadMessages(giantKey, ["giant-699", "giant-700"], ["giant-699"]);
+          await store.loadThread(giantKey, "giant-699");
+          store.pinThreadMessages(giantKey, ["giant-699", "giant-700"], ["giant-699", "giant-700"]);
+          await assert.rejects(store.loadThread(giantKey, "giant-700"), /Collapse another message/, "simultaneously expanded bodies that exceed the cap fail honestly");
+          assert.ok(internals.details.has("giant-699"), "an expanded body is not evicted to admit another expanded body");
+          store.pinThreadMessages(giantKey, ["giant-699", "giant-700"], ["giant-700"]);
+          await store.loadThread(giantKey, "giant-700");
+          assert.equal(internals.details.has("giant-699"), false, "a collapsed body in the same conversation can be evicted");
+          assert.equal(internals.details.get("giant-700")?.bodyText, largeText);
+          bodyRead = async id => ({ ...await ordinaryRead!(id), accountId: "foreign-source" });
+          await assert.rejects(store.loadThread(giantKey, "giant-699"), /another source/, "source fences still reject foreign bodies under pressure");
+          assert.ok(internals.details.has("giant-700"), "a foreign response cannot evict the visible body");
+          store.pinWindow("reader", []);
+          store.pinThreadMessages(giantKey, []);
+          internals.details.delete("giant-700");
+          internals.details.set(otherSummary.id, normalDetail);
+          internals.rebuild(new Set([`${source.id}\0companion`, `${source.id}\0giant`]));
+          bodyRead = ordinaryRead;
+          holdBody = true;
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => !!releaseBody, "navigation-fenced speculative body is held");
+          store.warmAdjacentBodies(undefined, []);
+          const afterNavigation = store.getSnapshot();
+          releaseBody!(); releaseBody = undefined; await sleep(50);
+          assert.strictEqual(store.getSnapshot(), afterNavigation);
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "a cancelled navigation cannot admit its late body");
+          holdBody = true;
+          store.warmAdjacentBodies(undefined, [giantKey]);
+          await until(() => !!releaseBody, "policy-fenced speculative body is held");
+          remoteImages = true; await store.retry();
+          const afterPolicy = store.getSnapshot();
+          releaseBody!(); releaseBody = undefined; await sleep(50);
+          assert.strictEqual(store.getSnapshot(), afterPolicy, "a pre-policy speculative reply cannot publish after the policy change");
+          assert.equal(internals.speculativeDetails.has("giant-700"), false, "a pre-policy speculative reply is not admitted");
+          await store.loadThread(companionRow.key);
+          bodyReads.length = 1;
+          const companion = store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!;
+          await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey); await store.loadThread(giantKey, deepId);
+          let cachedMail = store.getSnapshot().mail;
+          const cachedGiant = cachedMail.find(mail => mail.id === giantKey)!;
+          assert.equal(cachedGiant.messages.length, 200); assert.equal(cachedGiant.messages.find(message => message.id === deepId)!.body, "<p>giant-body-1</p>");
+          await store.lookupWindow([giantKey]);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), cachedGiant, "an unchanged giant lookup keeps its valid deep detail window");
+          cachedMail = store.getSnapshot().mail;
+          await store.loadThread(giantKey, deepId); await store.loadThread(companionRow.key);
+          assert.strictEqual(store.getSnapshot().mail, cachedMail); assert.equal(bodyReads.length, 2, "valid cached opens publish no model and issue no body request");
+          holdHistory = true;
+          const lateHistory = store.loadMoreMessages(giantKey);
+          void lateHistory.catch(() => {});
+          await until(() => !!releaseHistory, "old giant detail page is held");
+          deepRevision = 2; deepBodyRevision = 2; giantRevision = revision + 1;
+          reverseDelta = { upserts: [giantRow()], newHead: [], removed: [] }; await store.retry();
+          let updated = store.getSnapshot().mail.find(mail => mail.id === giantKey)!;
+          assert.equal(updated.window!.contextVersion, cachedGiant.window!.contextVersion, "deep body/flag/membership changes intentionally retain the host's bounded context hash");
+          assert.equal(updated.messages.length, 50, "an affected giant upsert drops deep summaries even when the context hash matches");
+          assert.ok(!updated.messages.some(message => message.id === deepId)); assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+          assert.equal(bodyReads.length, 2, "delta invalidation does not fetch bodies or clear an unrelated cached reader");
+          holdHistory = false;
+          await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey);
+          assert.equal(detailReads.at(-2)!.cursor, undefined, "fresh demand restarts bounded detail metadata instead of continuing an invalidated window");
+          let deep = store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === deepId)!;
+          assert.equal(deep.bodyRevision, "giant-body-2"); assert.equal(deep.loaded, false); assert.equal(deep.isRead, true); assert.equal(deep.isStarred, true);
+          assert.equal(deep.memberships![0].snoozedUntil, "2026-10-03T12:00:00.000Z");
+          await store.loadThread(giantKey, deepId);
+          assert.equal(bodyReads.length, 3); assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === deepId)!.body, "<p>giant-body-2</p>");
+          cachedMail = store.getSnapshot().mail;
+          releaseHistory!(); releaseHistory = undefined; await lateHistory;
+          assert.strictEqual(store.getSnapshot().mail, cachedMail, "a held same-context page from the old giant revision cannot restore stale deep summaries");
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.length, 200);
+          deepRevision = 3; giantRevision = revision + 1;
+          reverseDelta = { upserts: [giantRow()], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.length, 50);
+          await store.loadMoreMessages(giantKey); await store.loadMoreMessages(giantKey);
+          deep = store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === deepId)!;
+          assert.equal(deep.loaded, true); assert.equal(deep.isRead, false); assert.equal(deep.isStarred, false); assert.equal(deep.memberships![0].snoozedUntil, null);
+          assert.equal(deep.body, "<p>giant-body-2</p>", "a metadata-only deep update reuses the still-valid body cache after fresh summaries arrive");
+          cachedMail = store.getSnapshot().mail;
+          await store.loadThread(giantKey, deepId); await store.loadThread(companionRow.key);
+          assert.strictEqual(store.getSnapshot().mail, cachedMail); assert.equal(bodyReads.length, 3);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+          assert.ok(detailReads.every(input => input.limit === 100)); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+
+          const offscreen = Array.from({ length: 4 }, (_, i) => { const value = row(1500 + i); return { ...value, mail: { ...value.mail, starred: false } }; });
+          const offscreenKeys = offscreen.map(row => row.key); let lookupReads = 0;
+          lookupRead = ids => { lookupReads++; return ids.map(id => offscreen.find(row => row.key === id)!); };
+          await store.lookupWindow(offscreenKeys);
+          store.pinWindow("reader", [companionRow.key]);
+          const stableGiant = store.getSnapshot().mail.find(mail => mail.id === giantKey), bodiesBefore = bodyReads.length;
+          const queriesBefore = queries, pagesBefore = pages.length;
+          for (const expand of [true, false]) {
+            const checkpoint = store.getSnapshot().window!.state.indexRevision, requests: ChangesInput[] = [];
+            const head = row(expand ? -2 : -4), nextHead = row(-3);
+            const changed = { ...offscreen[0], revision: ++revision, mail: { ...offscreen[0].mail, starred: true } };
+            let frozen: ChangesInput | undefined, conflicts = 0;
+            const response = (patch: Partial<ChangesPage> = {}) => Response.json({ state: state(), upserts: [], newHead: [], removed: [], totals,
+              nextCursor: null, throughRevision: revision, resetReason: null, ...patch } satisfies ChangesPage);
+            scopeChanges = async input => {
+              requests.push(structuredClone(input));
+              if (!frozen) {
+                frozen = structuredClone(input);
+                await new Promise<void>(resolve => { releaseChanges = resolve; });
+                return response({ newHead: [head], removed: expand ? [] : [{ key: nextHead.key, reason: "deleted" }], nextCursor: "frozen-scope-next" });
+              }
+              if (input.cursor) {
+                if (JSON.stringify([input.queryId, input.sinceRevision, input.sinceCursor, input.residentKeys, input.pinnedKeys]) !==
+                  JSON.stringify([frozen.queryId, frozen.sinceRevision, frozen.sinceCursor, frozen.residentKeys, frozen.pinnedKeys])) {
+                  conflicts++; return Response.json({ code: "HOST_INBOX_CURSOR_INVALID", error: "The inbox cursor does not match this request." }, { status: 409 });
+                }
+                assert.equal(input.cursor, "frozen-scope-next"); return response();
+              }
+              assert.equal(expand, true, "reordering/removing pins or pinning an existing resident never schedules a scope replay");
+              assert.equal(input.sinceRevision, checkpoint, "newly pinned rows replay from the original checkpoint, not the completed pass's revision");
+              assert.deepEqual(new Set(input.pinnedKeys), new Set([giantKey, ...offscreenKeys]));
+              return response({ upserts: [changed], newHead: [nextHead], removed: [{ key: head.key, reason: "deleted" }] });
+            };
+            const draining = store.retry();
+            await until(() => !!releaseChanges, "the first change page is held before its continuation");
+            assert.equal(requests[0].sinceRevision, checkpoint, "a completed scope replay releases its older checkpoint");
+            const beforePins = store.getSnapshot().mail;
+            store.pinWindow("reader", [expand ? giantKey : companionRow.key]);
+            store.pinWindow("sender", expand ? offscreenKeys : [...offscreenKeys].reverse().slice(1));
+            await store.loadThread(giantKey, deepId); await store.loadThread(companionRow.key);
+            assert.strictEqual(store.getSnapshot().mail, beforePins, "pin changes and valid cached opens publish no replacement mail model");
+            assert.equal(bodyReads.length, bodiesBefore);
+            releaseChanges!(); releaseChanges = undefined; await draining;
+            assert.equal(conflicts, 0, "a pin change cannot invalidate a continuation's strict host scope binding");
+            assert.deepEqual(requests[1], { ...requests[0], cursor: "frozen-scope-next" });
+            assert.equal(store.getSnapshot().error, null);
+            if (expand) {
+              assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint);
+              assert.equal(store.getSnapshot().mail.find(mail => mail.id === changed.key)!.starred, false, "the old wanted set did not reconcile the newly pinned row");
+              await store.seekWindow("start");
+              assert.equal(store.getSnapshot().window!.state.indexRevision, revision, "an explicit replacement seek can advance the published revision before the scheduled replay");
+              await until(() => requests.length === 3 && store.getSnapshot().mail.some(mail => mail.id === changed.key && mail.starred), "one current-scope replay reconciles the missed pin");
+              assert.ok(store.getSnapshot().window!.keys.includes(nextHead.key)); assert.ok(!store.getSnapshot().window!.keys.includes(head.key));
+            }
+            await sleep(200);
+            assert.equal(requests.length, expand ? 3 : 2, "this pass's own arrivals/removals cannot cause a replay loop");
+            assert.equal(store.getSnapshot().window!.state.indexRevision, revision);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), stableGiant);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+          }
+          scopeChanges = undefined;
+          const settledMail = store.getSnapshot().mail, settledChanges = changes.length;
+          store.pinWindow("sender", []); store.pinWindow("reader", [giantKey]);
+          await store.loadThread(giantKey, deepId); await sleep(120);
+          assert.strictEqual(store.getSnapshot().mail, settledMail); assert.equal(changes.length, settledChanges, "pins outside a drain do not introduce a refresh or lookup");
+          assert.equal(bodyReads.length, bodiesBefore); assert.equal(lookupReads, 1, "only the explicit fixture lookup reads off-view rows");
+          assert.equal(queries, queriesBefore); assert.equal(pages.length, pagesBefore + 1, "only the explicit seek issues a demand page during reconciliation");
+          store.pinWindow("reader", []);
+
+          for (const withToken of [true, false]) {
+            signedState = withToken; revision++;
+            const baseline = state(), saved = row(withToken ? 1600 : 1601);
+            const oldRow = { ...saved, revision, mail: { ...saved.mail, starred: false } };
+            reversePage = async input => {
+              if (input.seek === "start") return { state: baseline, totals, rows: [giantRow(), companionRow], nextCursor: "held-checkpoint-page", exhausted: false };
+              assert.equal(input.cursor, "held-checkpoint-page");
+              const result: Page = { state: baseline, totals, rows: [oldRow], nextCursor: null, exhausted: true };
+              await new Promise<void>(resolve => { releaseReverse = resolve; }); return result;
+            };
+            await store.seekWindow("start");
+            const delayed = store.loadMoreWindow(); void delayed.catch(() => {});
+            await until(() => !!releaseReverse, "the old signed or legacy page is held");
+            signedState = true;
+            reverseDelta = { upserts: [], newHead: [], removed: [] }; await store.retry();
+            assert.ok(store.getSnapshot().window!.state.readCursor, "the completed newer state has a token even when the queued old page does not");
+            const requests: ChangesInput[] = [];
+            let failRead = withToken;
+            scopeChanges = async input => {
+              requests.push(structuredClone(input));
+              assert.equal(input.sinceRevision, baseline.indexRevision);
+              assert.equal(input.sinceCursor, baseline.readCursor, "replay never borrows the newer state's token for an older revision");
+              if (failRead) { failRead = false; throw new TypeError("Fictional checkpoint network failure"); }
+              return Response.json({ state: state(), upserts: [{ ...oldRow, revision, mail: { ...oldRow.mail, starred: true } }], newHead: [], removed: [], totals,
+                nextCursor: null, throughRevision: revision, resetReason: null } satisfies ChangesPage);
+            };
+            releaseReverse!(); releaseReverse = undefined; await delayed;
+            if (withToken) {
+              await until(() => requests.length === 1 && store.getSnapshot().error !== null, "a network failure interrupts the signed replay");
+              await sleep(150); assert.equal(requests.length, 1, "a failed replay does not introduce an automatic retry");
+              assert.equal(store.getSnapshot().mail.find(mail => mail.id === oldRow.key)!.starred, false);
+              await store.retry();
+              assert.deepEqual(requests[1], requests[0], "explicit retry retains the entire consumed checkpoint and wanted scope");
+            }
+            await until(() => store.getSnapshot().mail.some(mail => mail.id === oldRow.key && mail.starred), "the preserved signed or legacy checkpoint reconciles its old page");
+            assert.equal(requests.length, withToken ? 2 : 1); assert.equal(store.getSnapshot().error, null);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), stableGiant);
+            assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+            assert.equal(bodyReads.length, bodiesBefore); assert.equal(queries, queriesBefore); assert.equal(lookupReads, 1);
+            scopeChanges = undefined;
+          }
+
+          const senderRequests: SenderInput[] = [], requestOrder: string[] = [];
+          const senderBodyBaseline = bodyReads.length, senderQueryBaseline = queries, senderPageBaseline = pages.length;
+          const senderInput: SenderInput = { account: box.id, id: giantKey, domain: null };
+          const senderFetch = globalThis.fetch, doneRow = store.getSnapshot().mail.find(mail => mail.id === row(1601).key)!;
+          assert.ok(doneRow, "the Done target is separate from the pending reader and its companion");
+          const doneMail = { ...doneRow, sourceGeneration: source.generation };
+          let releaseDone: (() => void) | undefined, rejectDone = false, doneRequests = 0;
+          globalThis.fetch = (async (input, init) => {
+            const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+            if (url.pathname !== "/v1/mailbox-actions" || init?.method !== "POST") return senderFetch(input, init);
+            const command = JSON.parse(String(init.body)) as Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1];
+            assert.equal(command.done, true); assert.deepEqual(command.targets, doneMail.window!.targets.map(({ mailboxId, messageId, revision }) => ({ mailboxId, messageId, revision })));
+            doneRequests++; requestOrder.push("done");
+            await new Promise<void>(resolve => { releaseDone = resolve; });
+            requestOrder.push(rejectDone ? "done:failed" : "done:ack");
+            return rejectDone ? Response.json({ code: "CONFLICT", error: "Fictional Done conflict." }, { status: 412 })
+              : Response.json({ id: command.id, retracted: false, states: command.targets.map(target => ({ ...target, revision: target.revision + 1, done: true, snoozedUntil: null })) } satisfies import("inbox-sdk/types").MailboxStateReceipt);
+          }) as typeof fetch;
+          let readerError: Error | undefined, cachedAtDispatch: readonly Mail[] | undefined;
+          bodyRead = async id => {
+            assert.ok(["giant-700", "giant-699", "giant-698", "giant-697"].includes(id));
+            bodyReads.push(id); requestOrder.push(`body:${id}`);
+            const message = summary(Number(id.slice("giant-".length))), failure = readerError;
+            await new Promise<void>(resolve => { releaseReader = resolve; });
+            if (failure) throw failure;
+            requestOrder.push(`ready:${id}`);
+            return { ...message, snoozedUntil: null, bcc: [], attachments: [], bodyFormat: "html", bodyHtml: `<p>Priority body ${id}.</p>`, bodyText: `Priority body ${id}.` };
+          };
+          senderRead = input => {
+            if (cachedAtDispatch) assert.strictEqual(store.getSnapshot().mail, cachedAtDispatch, "the cached body gate publishes no replacement mail model before sender dispatch");
+            senderRequests.push(structuredClone(input)); requestOrder.push("sender");
+            const message = summary(Number((input.selectedMessageId ?? "giant-700").slice("giant-".length)));
+            return { state: state(), status: "ready", contact: { ...message.from, messageId: message.id, role: "sender" },
+              activity: { ...senderActivity([{ ...message, mailboxIds: [box.id], outgoing: false }], message.from.email, [box.id], input.domain ?? null, Date.parse(message.receivedAt)), level: 1 },
+              recent: [giantRow()] };
+          };
+          const readerReady = store.loadThread(giantKey), senderReady = store.senderWindow(senderInput, readerReady);
+          const opening = Promise.all([readerReady, senderReady]); void opening.catch(() => {});
+          await until(() => !!releaseReader, "the actual current-reader body request is held");
+          assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700"]); assert.equal(senderRequests.length, 0, "secondary statistics cannot dispatch while the reader body is pending");
+          assert.strictEqual(store.loadThread(giantKey), readerReady, "the parent reader effect shares the already-started body request");
+          const done = store.action([doneMail], "done"); void done.catch(() => {});
+          await until(() => !!releaseDone, "the actual Done POST is held after the reader and sender requests began");
+          releaseReader!(); releaseReader = undefined; await readerReady; await sleep(30);
+          assert.equal(senderRequests.length, 0, "settled reader statistics cannot compete with an already-queued durable Done write");
+          assert.equal(store.getSnapshot().pending, 1);
+          releaseDone!(); releaseDone = undefined;
+          const doneReceipt = await done; await opening;
+          assert.ok(doneReceipt.receipts?.some(receipt => receipt.kind === "mailbox-state"), "the durable Done receipt releases optional statistics");
+          assert.deepEqual(requestOrder, ["body:giant-700", "done", "ready:giant-700", "done:ack", "sender"]);
+          assert.deepEqual(senderRequests, [senderInput]);
+          assert.equal(store.getSnapshot().mail.find(mail => mail.id === giantKey)!.messages.find(message => message.id === "giant-700")!.body, "<p>Priority body giant-700.</p>");
+          const cachedReader = store.getSnapshot().mail.find(mail => mail.id === giantKey);
+          cachedAtDispatch = store.getSnapshot().mail;
+          await store.senderWindow(senderInput, store.loadThread(giantKey));
+          cachedAtDispatch = undefined;
+          assert.equal(bodyReads.length, senderBodyBaseline + 1); assert.equal(senderRequests.length, 2);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), cachedReader);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), companion);
+
+          const clearedReader = store.loadThread(giantKey, "giant-699");
+          const clearedSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-699" }, clearedReader);
+          const cleared = Promise.all([clearedReader, assert.rejects(clearedSender, error => error instanceof DOMException && error.name === "AbortError")]); void cleared.catch(() => {});
+          await until(() => !!releaseReader, "the reader body is pending when its sidebar is cleared");
+          store.clearSenderWindow(); releaseReader!(); releaseReader = undefined; await cleared;
+          assert.equal(senderRequests.length, 2, "clearing the sidebar cancels its queued request before HTTP dispatch");
+          await store.retry(); assert.deepEqual(changes.at(-1)!.pinnedKeys, [], "a cancelled queued sidebar cannot restore sender pins");
+
+          readerError = new Error("Fictional reader body failed.");
+          const failedReader = store.loadThread(giantKey, "giant-698");
+          const failedSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-698" }, failedReader);
+          const failed = Promise.all([assert.rejects(failedReader, error => error === readerError), failedSender]); void failed.catch(() => {});
+          await until(() => !!releaseReader, "the reader failure is held before delivery");
+          assert.equal(senderRequests.length, 2, "statistics still wait until the body attempt settles");
+          releaseReader!(); releaseReader = undefined; await failed; await sleep(120);
+          assert.equal(senderRequests.length, 3, "a separately surfaced body failure does not make saved sender statistics unavailable");
+          assert.equal(bodyReads.length, senderBodyBaseline + 3, "reader failure is not swallowed or automatically retried");
+          assert.ok(store.getSnapshot().issues.some(issue => issue.scope === "thread"));
+          readerError = undefined;
+          await store.senderWindow({ ...senderInput, selectedMessageId: "giant-698" });
+          assert.equal(senderRequests.length, 4); assert.equal(bodyReads.length, senderBodyBaseline + 3, "ungated sender reads remain body-free even for an unloaded reader message");
+
+          rejectDone = true;
+          for (const clearWhileWaiting of [false, true]) {
+            const before = senderRequests.length;
+            const failedDone = assert.rejects(store.action([doneMail], "done"), /Fictional Done conflict/);
+            await until(() => !!releaseDone, "the conflicting Done POST is held before its acknowledgement");
+            const waitingSender = store.senderWindow(senderInput, store.loadThread(giantKey));
+            const settledSender = clearWhileWaiting
+              ? assert.rejects(waitingSender, error => error instanceof DOMException && error.name === "AbortError") : waitingSender;
+            void settledSender.catch(() => {});
+            await sleep(30);
+            assert.equal(senderRequests.length, before, "even a cached reader waits for an already-queued action");
+            if (clearWhileWaiting) store.clearSenderWindow();
+            releaseDone!(); releaseDone = undefined; await Promise.all([failedDone, settledSender]);
+            assert.equal(store.getSnapshot().pending, 0);
+            assert.equal(senderRequests.length, before + (clearWhileWaiting ? 0 : 1), clearWhileWaiting
+              ? "clearing the sender while it waits on Done prevents dispatch after queue release"
+              : "a failed durable action releases optional sender statistics without hiding its error");
+          }
+          assert.equal(doneRequests, 3, "the controlled conflicts do not retry their Done POSTs");
+          globalThis.fetch = senderFetch;
+
+          // Optimistic Done is a bounded presentation overlay, not a fabricated membership receipt.
+          type DoneInput = Parameters<import("inbox-sdk/types").Inbox["setMailboxStates"]>[1];
+          type DoneReceipt = import("inbox-sdk/types").MailboxStateReceipt;
+          type Recovery = import("../src/inbox").InboxCommandRecovery;
+          const heldDone: Array<{ input: DoneInput; release: (response: Response) => void }> = [];
+          const receiptReads: string[] = [];
+          let recoveredReceipt: DoneReceipt | undefined;
+          const receiptFor = (input: DoneInput): DoneReceipt => ({ id: input.id, retracted: false,
+            states: input.targets.map(target => ({ ...target, revision: target.revision + 1, done: true, snoozedUntil: null })) });
+          globalThis.fetch = (async (input, init) => {
+            const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+            if (url.pathname === `/v1/accounts/${source.id}`) return Response.json(source);
+            if (url.pathname === `/v1/mailboxes/${box.id}`) return Response.json(box);
+            if (url.pathname.startsWith("/v1/mailbox-actions/")) {
+              receiptReads.push(url.pathname.split("/").at(-1)!);
+              return recoveredReceipt ? Response.json(recoveredReceipt) : Response.json({ code: "NOT_FOUND", error: "Not found" }, { status: 404 });
+            }
+            if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST")
+              return new Promise<Response>(release => heldDone.push({ input: JSON.parse(String(init.body)), release }));
+            return senderFetch(input, init);
+          }) as typeof fetch;
+          const pendingRow = row(9000), pendingKey = pendingRow.key;
+          pendingRow.summaries = [{ ...summary(9000, pendingRow.threadId), id: pendingRow.targets[0].messageId,
+            memberships: [{ ...pendingRow.targets[0], done: false, snoozedUntil: null }] }];
+          reverseDelta = { upserts: [pendingRow], newHead: [pendingRow], removed: [] }; await store.retry();
+          const pendingMail = () => store.getSnapshot().mail.find(mail => mail.id === pendingKey)!;
+          const beforeOptimism = store.getSnapshot(), bodyBaseline = bodyReads.length, queryBaseline = queries, pageBaseline = pages.length;
+          let capturedDone: Recovery | undefined;
+          const captureDone = (plan: Recovery) => { capturedDone = plan; };
+          const optimistic = store.doneOptimistically([pendingMail()], captureDone);
+          let settled = false; void optimistic.then(() => { settled = true; }, () => { settled = true; });
+          assert.ok(capturedDone?.kind === "mailbox-state");
+          const firstId = capturedDone.input.id;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: firstId, status: "pending", count: 1 }]);
+          assert.equal(store.isPendingDone(pendingMail()), true);
+          assert.equal(store.pendingDoneFor(pendingMail()), firstId);
+          assert.strictEqual(store.getSnapshot().mail, beforeOptimism.mail);
+          assert.strictEqual(store.getSnapshot().window, beforeOptimism.window);
+          const presented = store.presentWindow(beforeOptimism.window!);
+          assert.ok(!presented.keys.includes(pendingKey)); assert.ok(beforeOptimism.window!.keys.includes(pendingKey));
+          assert.strictEqual(presented.totals, beforeOptimism.window!.totals); assert.strictEqual(presented.state, beforeOptimism.window!.state);
+          assert.equal(presented.nextCursor, beforeOptimism.window!.nextCursor); assert.equal(presented.residentBytes, beforeOptimism.window!.residentBytes);
+          assert.equal(pendingMail().folder, "Inbox"); assert.deepEqual(pendingMail().window!.targets, pendingRow.targets);
+          for (const query of [{ ...presented.query, folder: "Sent" }, { ...presented.query, search: true }]) {
+            const elsewhere = { ...beforeOptimism.window!, query }; assert.strictEqual(store.presentWindow(elsewhere), elsewhere);
+          }
+          assert.equal(store.isPendingDone({ ...pendingMail(), sourceGeneration: 2 }), false);
+          assert.equal(store.isPendingDone({ ...pendingMail(), window: { ...pendingMail().window!, targetsComplete: false } }), false);
+          await assert.rejects(store.doneOptimistically([pendingMail()]), /still pending/);
+          await until(() => heldDone.length === 1, "optimistic Done reaches its held durable POST");
+          assert.equal(settled, false); assert.equal(bodyReads.length, bodyBaseline); assert.equal(queries, queryBaseline); assert.equal(pages.length, pageBaseline);
+          heldDone[0].release(Response.json(receiptFor(heldDone[0].input)));
+          const acceptedDone = await optimistic;
+          assert.deepEqual(acceptedDone.receipts, [{ kind: "mailbox-state", id: firstId }]);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(pendingMail().folder, "Done");
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === giantKey), beforeOptimism.mail.find(mail => mail.id === giantKey), "pending presentation does not invalidate cached bodies");
+
+          // A newer target revision can carry its own intent while an older command settles.
+          const freshRow: Row = { ...pendingRow, revision: 3, targets: pendingRow.targets.map(target => ({ ...target, revision: 3 })),
+            summaries: pendingRow.summaries.map(summary => ({ ...summary, revision: 3, memberships: summary.memberships.map(state => ({ ...state, revision: 3 })) })) };
+          reverseDelta = { upserts: [freshRow], newHead: [freshRow], removed: [] }; await store.retry();
+          assert.ok(pendingMail(), "the next scenario recaptures the authoritative newer Inbox head after accepted Done eviction");
+          const olderDone = store.doneOptimistically([pendingMail()], captureDone);
+          const olderRejected = assert.rejects(olderDone, /Fictional optimistic conflict/);
+          await until(() => heldDone.length === 2, "older revision write is held");
+          const newerRow: Row = { ...freshRow, revision: 4, contextVersion: "current-revision-4", mail: { ...freshRow.mail, subject: "Latest canonical subject" },
+            targets: freshRow.targets.map(target => ({ ...target, revision: 4 })),
+            summaries: freshRow.summaries.map(summary => ({ ...summary, revision: 4, memberships: summary.memberships.map(state => ({ ...state, revision: 4 })) })) };
+          reverseDelta = { upserts: [newerRow], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.isPendingDone(pendingMail()), false); assert.equal(store.pendingDoneFor(pendingMail()), undefined);
+          assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+          const newer = store.doneOptimistically([pendingMail()], captureDone);
+          const newerRejected = assert.rejects(newer, /Fictional optimistic conflict/);
+          const newerId = (capturedDone as Extract<Recovery, { kind: "mailbox-state" }>).input.id;
+          assert.equal(store.getSnapshot().pendingDone.length, 2); assert.equal(store.isPendingDone(pendingMail()), true);
+          heldDone[1].release(Response.json({ code: "CONFLICT", error: "Fictional optimistic conflict" }, { status: 412 })); await olderRejected;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: newerId, status: "pending", count: 1 }]);
+          assert.equal(store.isPendingDone(pendingMail()), true, "rejecting an older owner cannot retire a newer revision's mask");
+          assert.equal(pendingMail().subject, "Latest canonical subject");
+          await until(() => heldDone.length === 3, "newer revision write reaches the queue head");
+          const replyRow: Row = { ...newerRow, revision: 5, contextVersion: "native-reply", counts: { ...newerRow.counts, messages: 2, memberships: 2 },
+            targets: [...newerRow.targets, { mailboxId: box.id, messageId: "native-reply-after-done", revision: 1 }],
+            mail: { ...newerRow.mail, subject: "Latest canonical reply", messages: [...newerRow.mail.messages, { ...newerRow.mail.messages[0], id: "native-reply-after-done" }] } };
+          reverseDelta = { upserts: [replyRow], newHead: [], removed: [] }; await store.retry();
+          assert.equal(store.isPendingDone(pendingMail()), false, "complete targets, not preview membership, expose a later native reply");
+          assert.equal(store.pendingDoneFor(pendingMail()), newerId, "partial exact overlap still blocks a fresh duplicate");
+          heldDone[2].release(Response.json({ code: "CONFLICT", error: "Fictional optimistic conflict" }, { status: 412 })); await newerRejected;
+          assert.equal(pendingMail().subject, "Latest canonical reply"); assert.equal(pendingMail().window!.targets.length, 2);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+
+          // A lost first acknowledgement followed by auth failure is still ambiguous.
+          const issuesBeforeAmbiguous = store.getSnapshot().issues;
+          const ambiguous = store.doneOptimistically([pendingMail()], captureDone);
+          const unconfirmed = assert.rejects(ambiguous, /Fictional retry authorization/);
+          await until(() => heldDone.length === 4, "first ambiguous attempt is held");
+          const ambiguousId = heldDone[3].input.id;
+          recoveredReceipt = receiptFor(heldDone[3].input);
+          heldDone[3].release(Response.json({ code: "TEMPORARY", error: "Lost first acknowledgement" }, { status: 503 }));
+          await until(() => heldDone.length === 5, "the existing same-ID second attempt is held");
+          assert.deepEqual(heldDone[4].input, heldDone[3].input);
+          heldDone[4].release(Response.json({ code: "UNAUTHENTICATED", error: "Fictional retry authorization" }, { status: 401 })); await unconfirmed;
+          assert.deepEqual(store.getSnapshot().pendingDone, [{ id: ambiguousId, status: "unconfirmed", count: 1 }]);
+          assert.equal(capturedDone!.kind === "mailbox-state" && capturedDone!.status, "uncertain");
+          assert.strictEqual(store.getSnapshot().issues, issuesBeforeAmbiguous, "ambiguous completion belongs only to the command Retry notice, not a generic failure");
+          assert.equal(store.isPendingDone(pendingMail()), false); assert.equal(store.pendingDoneFor(pendingMail()), ambiguousId);
+          assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+          await assert.rejects(store.doneOptimistically([pendingMail()]), /still pending/);
+          const retryDone = store.retryPendingDone(ambiguousId);
+          assert.equal(store.isPendingDone(pendingMail()), true, "explicit same-ID Retry reactivates only applicable targets");
+          assert.strictEqual(store.retryPendingDone(ambiguousId), retryDone, "repeated retry joins the already-pending original command");
+          const recoveredDone = await retryDone;
+          assert.deepEqual(recoveredDone.receipts, [{ kind: "mailbox-state", id: ambiguousId }]);
+          assert.deepEqual(receiptReads, [ambiguousId]); assert.equal(heldDone.length, 5, "the authoritative stored receipt avoids a third POST");
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(pendingMail().folder, "Done");
+
+          // The initial recovery write and preflight must succeed before any mask or POST exists.
+          const failedStorage = store.getSnapshot();
+          await assert.rejects(store.doneOptimistically([pendingMail()], () => { throw new Error("storage full"); }), /could not be saved/);
+          await assert.rejects(store.doneOptimistically([{ ...pendingMail(), window: { ...pendingMail().window!, targetsComplete: false } }]), /500 message memberships/);
+          assert.deepEqual(store.getSnapshot().pendingDone, []); assert.strictEqual(store.getSnapshot().mail, failedStorage.mail);
+          assert.strictEqual(store.getSnapshot().window, failedStorage.window); assert.equal(heldDone.length, 5);
+          assert.equal(bodyReads.length, bodyBaseline); assert.equal(queries, queryBaseline); assert.equal(pages.length, pageBaseline);
+          globalThis.fetch = senderFetch;
+          reverseDelta = { newHead: [], removed: [{ key: pendingKey, reason: "deleted" }] }; await store.retry();
+
+          store.clearSenderWindow();
+          const oldReader = store.loadThread(giantKey, "giant-697");
+          const oldSender = store.senderWindow({ ...senderInput, selectedMessageId: "giant-697" }, oldReader);
+          const switched = Promise.all([oldReader, assert.rejects(oldSender, error => error instanceof DOMException && error.name === "AbortError")]); void switched.catch(() => {});
+          await until(() => !!releaseReader, "an old-view reader is pending before a query change");
+          reversePage = undefined;
+          await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Sent" });
+          await until(() => !store.getSnapshot().window!.paging, "the replacement view finishes its single buffer");
+          releaseReader!(); releaseReader = undefined; await switched;
+          assert.equal(senderRequests.length, 5, "a changed window epoch rejects queued old-view statistics before dispatch");
+          await store.retry(); assert.deepEqual(changes.at(-1)!.pinnedKeys, []);
+          assert.equal(changes.at(-1)!.queryId, store.getSnapshot().window!.state.queryId); assert.equal(store.getSnapshot().error, null);
+          assert.ok(!store.getSnapshot().mail.some(mail => mail.id === giantKey));
+          assert.deepEqual(bodyReads.slice(senderBodyBaseline), ["giant-700", "giant-699", "giant-698", "giant-697"], "only the four explicitly requested message bodies were fetched");
+          assert.equal(queries, senderQueryBaseline + 1); assert.equal(pages.length, senderPageBaseline + 1, "only the explicit query switch loads another buffer");
+          assert.equal(lookupReads, 1, "reader priority introduces no lookup or inventory work");
+
+          reversePage = () => ({ state: state(), totals, rows: [giantRow()], nextCursor: null, exhausted: true });
+          await store.seekWindow("start");
+          const readsBeforeDeepWindow = bodyReads.length;
+          for (let page = 0; page < 7; page++) await store.loadMoreMessages(giantKey);
+          const movedHistory = store.getSnapshot().mail.find(mail => mail.id === giantKey)!;
+          assert.equal(movedHistory.historyExhausted, true); assert.equal(movedHistory.messages.length, 500);
+          assert.ok(movedHistory.messages.some(message => message.id === "giant-700"), "canonical anchors now share, rather than extend, the 500-summary budget");
+          assert.equal(bodyReads.length, readsBeforeDeepWindow); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+
+          const deepKey = `${box.id}:deep620`, latestId = "deep620-620", oldId = "deep620-20", draftOrigin = "deep620-400";
+          let deepCount = 620, deepRowRevision = revision, oldRevision = 1, oldBodyRevision = 1, missingOld = false;
+          const deepSummary = (index: number): Summary => ({ ...summary(index, "deep620"), revision: index === 20 ? oldRevision : 1,
+            bodyRevision: index === 20 ? `deep-body-${oldBodyRevision}` : `body-deep620-${index}`,
+            isRead: index === 20 && oldRevision > 1, isStarred: index === 20 && oldRevision > 1 });
+          const deepRow = (): Row => {
+            const preview = Array.from({ length: 50 }, (_, i) => deepSummary(deepCount - 49 + i));
+            return { ...giantRow(), key: deepKey, threadId: "deep620", revision: deepRowRevision, mail: projected(preview), summaries: preview,
+              counts: { messages: deepCount, memberships: deepCount, unread: null, done: 0, snoozed: 1 }, contextVersion: `deep-context-${deepCount}`,
+              targets: Array.from({ length: 500 }, (_, i) => ({ mailboxId: box.id, messageId: `deep620-${deepCount - i}`, revision: 1, messageRevision: 1 })) };
+          };
+          const deepPages: MessagesInput[] = [], metadataReads: string[] = [], metadataSignals: AbortSignal[] = [];
+          let metadataActive = 0, metadataMax = 0, metadataGate: Promise<void> | undefined;
+          detailRead = async input => {
+            assert.equal(input.id, deepKey); assert.equal(input.limit, 100); deepPages.push(structuredClone(input));
+            const offset = input.cursor ? Number(input.cursor.slice("deep-".length)) : 0;
+            const end = deepCount - offset, start = Math.max(1, end - 99);
+            return { state: state(), key: deepKey, contextVersion: `deep-context-${deepCount}`, total: deepCount, messages: [],
+              summaries: Array.from({ length: end - start + 1 }, (_, i) => deepSummary(start + i)), nextCursor: start > 1 ? `deep-${offset + 100}` : null, exhausted: start === 1 };
+          };
+          summaryRead = async (id, signal) => {
+            assert.ok(id.startsWith("deep620-")); metadataReads.push(id); metadataSignals.push(signal);
+            metadataActive++; metadataMax = Math.max(metadataMax, metadataActive);
+            try {
+              if (metadataGate) await metadataGate;
+              return id === oldId && missingOld ? Response.json({ code: "NOT_FOUND", error: "Message is not in this mailbox." }, { status: 404 })
+                : deepSummary(Number(id.slice("deep620-".length)));
+            } finally { metadataActive--; }
+          };
+          bodyRead = id => {
+            assert.ok([latestId, oldId, draftOrigin].includes(id)); bodyReads.push(id);
+            const value = deepSummary(Number(id.slice("deep620-".length)));
+            return { ...value, bcc: [], snoozedUntil: null, attachments: [], bodyFormat: "text", bodyHtml: `<p>${id}:${value.bodyRevision}</p>`, bodyText: `${id}:${value.bodyRevision}` };
+          };
+          reversePage = () => ({ state: state(), totals, rows: [deepRow(), companionRow], nextCursor: null, exhausted: true });
+          await store.seekWindow("start"); store.pinWindow("reader", [deepKey]);
+          const deepCompanion = store.getSnapshot().mail.find(mail => mail.id === companionRow.key)!;
+          const deepMail = () => store.getSnapshot().mail.find(mail => mail.id === deepKey)!;
+          await store.loadThread(deepKey); store.pinThreadMessages(deepKey, [latestId, oldId]);
+          const latestBody = deepMail().messages.at(-1)!.body, readerBodyReads = bodyReads.length;
+          for (let page = 0; page < 7; page++) {
+            await store.loadMoreMessages(deepKey);
+            if (page === 2) store.pinThreadMessages(deepKey, [latestId, draftOrigin]);
+            assert.equal(deepMail().messages.at(-1)!.id, latestId, "metadata paging cannot switch App/SenderContext's default latest message");
+            assert.equal(deepMail().messages.at(-1)!.body, latestBody); assert.ok(deepMail().messages.length <= 500);
+            const model = store.getSnapshot().mail; await store.loadThread(deepKey);
+            assert.strictEqual(store.getSnapshot().mail, model); assert.equal(bodyReads.length, readerBodyReads);
+          }
+          assert.equal(deepPages.length, 7); assert.equal(deepMail().historyExhausted, true); assert.equal(deepMail().messages.length, 500);
+          assert.equal(deepMail().window!.messagesComplete, false); assert.equal(deepMail().window!.actionContextComplete, false);
+          assert.ok(deepMail().messages.some(message => message.id === draftOrigin)); assert.ok(!deepMail().messages.some(message => message.id === "deep620-550"));
+          assert.equal(deepMail().historyTruncated, true); assert.equal(metadataReads.length, 0, "pinning and paging alone do not fetch metadata per message");
+          await assert.rejects(store.action([deepMail()], "done"), /exceeds 500/);
+          const previousHash = location.hash; location.hash = `#/account=${box.id}&folder=Sent&split=Important&thread=${deepKey}`;
+          assert.match(render(), />Show recent messages<\/button>/); location.hash = previousHash;
+          await store.loadThread(deepKey, oldId); await store.loadThread(deepKey, draftOrigin);
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin]);
+          const loadedBodies = bodyReads.length, oldBody = deepMail().messages.find(message => message.id === oldId)!.body;
+          await store.resetThreadHistory(deepKey);
+          assert.equal(deepPages.at(-1)!.cursor, undefined); assert.equal(deepMail().historyTruncated, undefined); assert.equal(deepMail().historyExhausted, false);
+          assert.ok(deepMail().messages.some(message => message.id === "deep620-550")); assert.equal(deepMail().messages.length, 102);
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.body, oldBody);
+          assert.equal(deepMail().messages.find(message => message.id === draftOrigin)!.loaded, true); assert.equal(bodyReads.length, loadedBodies);
+          location.hash = `#/account=${box.id}&folder=Sent&split=Important&thread=${deepKey}`;
+          assert.doesNotMatch(render(), />Show recent messages<\/button>/); location.hash = previousHash;
+
+          const expanded = deepMail().messages.map(message => message.id); assert.ok(expanded.length > 32);
+          store.pinThreadMessages(deepKey, expanded);
+          for (let page = 0; page < 4; page++) await store.loadMoreMessages(deepKey);
+          assert.ok(expanded.every(id => deepMail().messages.some(message => message.id === id)), "Expand all protects every resident card, not an artificial 32-pin subset");
+          assert.equal(deepMail().messages.length, 500);
+          store.pinThreadMessages(deepKey, deepMail().messages.map(message => message.id));
+          const beforeCapacity = deepPages.length, capacityMail = store.getSnapshot().mail;
+          await assert.rejects(store.loadMoreMessages(deepKey), /Collapse messages to load more history\./);
+          await assert.rejects(store.resetThreadHistory(deepKey), /Collapse messages to load more history\./);
+          assert.equal(deepPages.length, beforeCapacity); assert.strictEqual(store.getSnapshot().mail, capacityMail);
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin]); await store.loadMoreMessages(deepKey);
+          assert.equal(deepPages.at(-1)!.cursor, "deep-500", "a capacity refusal consumes no older cursor");
+          await store.loadMoreMessages(deepKey); assert.equal(deepMail().historyExhausted, true); assert.equal(bodyReads.length, loadedBodies);
+
+          oldRevision = 2; deepRowRevision = revision + 1;
+          const missingPinned: string[] = [], watchPins = store.subscribe(() => {
+            const current = deepMail(); if (current) for (const id of [latestId, oldId, draftOrigin]) if (!current.messages.some(message => message.id === id)) missingPinned.push(id);
+          });
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry(); watchPins();
+          assert.deepEqual(new Set(metadataReads), new Set([oldId, draftOrigin])); assert.deepEqual(missingPinned, []);
+          assert.equal(deepMail().messages.length, 52, "a changed giant discards closed history but atomically retains freshly validated open identities");
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.isRead, true); assert.equal(deepMail().messages.find(message => message.id === oldId)!.isStarred, true);
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.body, oldBody); assert.equal(bodyReads.length, loadedBodies);
+          assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === companionRow.key), deepCompanion);
+
+          await store.resetThreadHistory(deepKey);
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin, ...Array.from({ length: 40 }, (_, i) => `deep620-${530 + i}`)]);
+          metadataGate = new Promise<void>(resolve => { releasePinnedReads = resolve; });
+          const beforeValidation = metadataReads.length; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; const validating = store.retry();
+          await until(() => metadataReads.length === beforeValidation + 4, "only four open-summary metadata reads may be in flight");
+          assert.equal(metadataActive, 4); metadataGate = undefined; releasePinnedReads!(); releasePinnedReads = undefined; await validating;
+          assert.equal(metadataReads.length - beforeValidation, 42); assert.equal(metadataMax, 4); assert.equal(bodyReads.length, loadedBodies);
+
+          store.pinThreadMessages(deepKey, [latestId, oldId, draftOrigin]);
+          oldRevision = 3; oldBodyRevision = 2; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry();
+          assert.equal(deepMail().messages.find(message => message.id === oldId)!.loaded, false, "a changed body identity never reuses the old cached body");
+          assert.equal(bodyReads.length, loadedBodies); await store.loadThread(deepKey, oldId);
+          assert.equal(bodyReads.length, loadedBodies + 1); assert.match(deepMail().messages.find(message => message.id === oldId)!.body, /deep-body-2/);
+          const cached = store.getSnapshot().mail; await store.loadThread(deepKey, oldId); await store.loadThread(deepKey);
+          assert.strictEqual(store.getSnapshot().mail, cached); assert.equal(bodyReads.length, loadedBodies + 1);
+
+          missingOld = true; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry();
+          assert.ok(!deepMail().messages.some(message => message.id === oldId)); assert.match(deepMail().historyError!, /not in this mailbox/);
+          assert.equal(deepMail().messages.at(-1)!.id, latestId);
+          const afterMissing = metadataReads.length; await store.retry(); assert.equal(metadataReads.length, afterMissing, "a failed pin is not automatically retried or restored as authority");
+          missingOld = false;
+          await store.resetThreadHistory(deepKey); for (let page = 0; page < 4; page++) await store.loadMoreMessages(deepKey);
+          store.pinThreadMessages(deepKey, deepMail().messages.map(message => message.id));
+          const fullyPinned = new Set(deepMail().messages.map(message => message.id)); assert.equal(fullyPinned.size, 500);
+          deepCount = 621; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; await store.retry();
+          assert.deepEqual(new Set(deepMail().messages.map(message => message.id)), fullyPinned, "a fresh arrival cannot evict any of 500 explicitly open cards");
+          assert.equal(deepMail().messages.length, 500); assert.equal(deepMail().historyTruncated, true); assert.ok(metadataMax <= 4);
+          assert.ok(!deepMail().messages.some(message => message.id === "deep620-621")); assert.equal(bodyReads.length, loadedBodies + 1);
+          store.pinThreadMessages(deepKey, [latestId, draftOrigin]);
+          await store.resetThreadHistory(deepKey); assert.ok(deepMail().messages.some(message => message.id === "deep620-621"));
+
+          metadataGate = new Promise<void>(resolve => { releasePinnedReads = resolve; });
+          const beforeLate = metadataReads.length; deepRowRevision = revision + 1;
+          reverseDelta = { upserts: [deepRow()], newHead: [], removed: [] }; const lateValidation = store.retry();
+          await until(() => metadataReads.length > beforeLate, "old-view pinned validation is held");
+          const lateSignal = metadataSignals.at(-1)!;
+          store.pinThreadMessages(deepKey, []); store.pinWindow("reader", []); reversePage = undefined;
+          await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Trash" });
+          await until(() => !store.getSnapshot().window!.paging, "the replacement view has its bounded initial buffer");
+          const replacement = store.getSnapshot().mail, sentBeforeRelease = metadataReads.length;
+          metadataGate = undefined; releasePinnedReads!(); releasePinnedReads = undefined; await lateValidation;
+          assert.equal(lateSignal.aborted, true); assert.equal(metadataReads.length, sentBeforeRelease);
+          assert.strictEqual(store.getSnapshot().mail, replacement); assert.ok(!store.getSnapshot().mail.some(mail => mail.id === deepKey));
+          assert.equal(bodyReads.length, loadedBodies + 1); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+          store.pinWindow("reader", []);
+        }
+        if (name === "sparse") {
+          holdQuery = true;
+          const foreground = store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Sent" });
+          await until(() => heldQuery, "foreground query is held");
+          for (let i = 1; i <= 3; i++) {
+            const event = { id: `event-${i}`, type: i === 1 ? "account.updated" : "mail.changed", accountId: source.id, entityId: source.id,
+              change: "updated", reason: "mutation", at: deadline };
+            stream!.enqueue(new TextEncoder().encode(`event: ${event.type}\nid: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`));
+          }
+          await sleep(150);
+          assert.equal(queries, 2); assert.equal(changes.length, 0, "SSE reconciliation waits behind the active foreground query");
+          assert.equal(querySignals[1].aborted, false, "background events cannot abort an explicit query transition");
+          holdQuery = false; releaseQuery!(); releaseQuery = undefined; await foreground;
+          await until(() => changes.length === 1, "coalesced metadata/mail events reconcile after the foreground page");
+          const buffered = pages.length; await sleep(650);
+          assert.equal(changes.length, 1); assert.equal(pages.length, buffered, "ordinary deltas cannot restart automatic prefetch");
+          assert.equal(store.getSnapshot().window!.query.folder, "Sent"); assert.equal(store.getSnapshot().error, null);
+          const fillsBeforeWake = countRequests.length;
+          await store.retry(); await sleep(400);
+          assert.equal(countRequests.length, fillsBeforeWake, "wakes and reconciliation never re-run the count fill");
+
+          // Returning to a retained view publishes its rows at once, then reconciles with one bounded drain.
+          const inboxQuery = { ...store.getSnapshot().window!.query, folder: "Inbox" };
+          const queriesBefore = queries, drainsBefore = changes.length, pagesBefore = pages.length, fillsBefore = countRequests.length;
+          const restoring = store.setWindowQuery(inboxQuery);
+          const immediate = store.getSnapshot();
+          assert.equal(immediate.window!.query.folder, "Inbox"); assert.equal(immediate.loading, false); assert.equal(immediate.loaded, true);
+          assert.equal(immediate.window!.keys.length, 6, "the retained Inbox rows are visible before any request");
+          assert.ok(immediate.mail.some(mail => mail.id === row(0).key) && immediate.mail.some(mail => mail.id === row(300).key));
+          assert.equal(immediate.window!.paging, false); assert.equal(immediate.window!.nextCursor, null);
+          assert.doesNotMatch(render(), /Loading conversations…/);
+          await restoring;
+          assert.equal(queries, queriesBefore, "returning to a retained view issues no query");
+          assert.equal(changes.length, drainsBefore + 1); assert.equal(changes.at(-1)!.cursor, undefined);
+          assert.deepEqual(new Set(changes.at(-1)!.residentKeys), new Set(immediate.window!.keys), "the drain reconciles exactly the restored rows");
+          assert.equal(changes.at(-1)!.sinceRevision, immediate.window!.state.indexRevision, "the drain resumes from the view's saved checkpoint");
+          await sleep(450);
+          assert.equal(changes.length, drainsBefore + 1, "exactly one catch-up drain, no poller");
+          assert.equal(pages.length, pagesBefore, "a restored view never restarts automatic prefetch");
+          assert.equal(countRequests.length, fillsBefore + 1, "a restored view with unknown totals fills once; the host answers from its cache");
+          assert.deepEqual(store.getSnapshot().window!.totals, knownTotals);
+          assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+
+          // Three inactive views are retained; leaving a fourth distinct view evicts the oldest (Sent, then Inbox).
+          for (const folder of ["Trash", "Done", "Reminders"]) {
+            const before = queries; await store.setWindowQuery({ ...inboxQuery, folder });
+            assert.equal(queries, before + 1, `${folder} is a fresh view`);
+          }
+          const beforeReturn = queries;
+          await store.setWindowQuery({ ...inboxQuery, folder: "Sent" });
+          assert.equal(queries, beforeReturn + 1, "the oldest inactive view (Sent) was evicted by the fourth");
+          for (const folder of ["Reminders", "Done", "Trash"]) {
+            await store.setWindowQuery({ ...inboxQuery, folder });
+            assert.equal(queries, beforeReturn + 1, `${folder} stays retained`);
+            assert.equal(store.getSnapshot().window!.query.folder, folder); assert.equal(store.getSnapshot().loading, false);
+          }
+          const evicted = queries; await store.setWindowQuery(inboxQuery);
+          assert.equal(queries, evicted + 1, "Inbox, the oldest after Sent, was evicted in turn and reopens normally");
+          assert.equal(store.getSnapshot().error, null);
+
+          const { syncNotices } = await import("../src/MailSyncStatus.tsx");
+          type SyncRow = import("inbox-sdk/types").MailboxSyncStatus & { coverage?: "empty" | "partial" | "complete" };
+          const syncRow = (patch: Partial<SyncRow>): SyncRow => ({ sourceId: source.id, scopeKey: "scope", state: "idle", activeLanes: [], retryAt: null, problemCode: null,
+            lastBatch: { lane: "latest", processed: 40, completedAt: deadline, hasMore: false }, lastSyncAt: deadline, ...patch });
+          const complete = { ...source, sync: { ...source.sync, coverage: "complete" as const } };
+          assert.deepEqual(syncNotices([syncRow({}), syncRow({ state: "syncing", activeLanes: ["latest"] }), syncRow({ lastBatch: { lane: "latest", processed: 3, completedAt: deadline, hasMore: true } })], [source]), [],
+            "healthy, idle and routine latest-lane syncing show nothing");
+          assert.deepEqual(syncNotices([syncRow({ state: "syncing", activeLanes: ["backfill"], coverage: "complete" })], [source]), [], "a complete inbox hides backfill housekeeping");
+          assert.deepEqual(syncNotices([syncRow({ state: "syncing", activeLanes: ["backfill"] })], [complete]), [], "source coverage stands in when the row has none");
+          assert.deepEqual(syncNotices([syncRow({ state: "syncing", activeLanes: ["backfill"] })], [source]).map(notice => [notice.kind, notice.text]), [["importing", "Importing older mail…"]]);
+          assert.deepEqual(syncNotices([syncRow({ lastBatch: { lane: "backfill", processed: 100, completedAt: deadline, hasMore: true } })], [source]).map(notice => notice.kind), ["importing"], "an unfinished first import stays visible between batches");
+          const actionable = syncNotices([syncRow({ state: "paused" }), syncRow({ sourceId: "other", state: "error", problemCode: "CREDENTIALS_REVOKED" }), syncRow({ sourceId: "third", state: "error", problemCode: "NETWORK", coverage: "complete" })], [complete]);
+          assert.deepEqual(actionable.map(notice => [notice.kind, notice.text]), [["reconnect", "Reconnect to resume syncing"], ["error", "Couldn’t reach the mail provider"], ["paused", "Sync paused"]]);
+          for (const notice of actionable) assert.doesNotMatch(notice.text, /[A-Z]{2,}|between batches|Last batch/);
+        }
+      }
+      assert.deepEqual(mismatchedCheckpoints, [], "every published checkpoint keeps its revision and token paired, including a deferred pin replay");
+      if (name === "full") {
+        await store.setWindowQuery({ ...store.getSnapshot().window!.query, folder: "Inbox", search: false });
+        const boundedRows = Array.from({ length: 33 }, (_, index) => {
+          const item = row(9500 + index), count = index < 8 ? 500 : 1;
+          return { ...item, counts: { ...item.counts, memberships: count }, targets: Array.from({ length: count }, (_, target) => ({ mailboxId: box.id, messageId: `bounded-${index}-${target}`, revision: 1 })) };
+        });
+        reverseDelta = { upserts: boundedRows, newHead: boundedRows, removed: [] }; await store.retry();
+        const selected = (index: number) => store.getSnapshot().mail.find(mail => mail.id === boundedRows[index].key)!;
+        const priorFetch = globalThis.fetch;
+        let backendWrites = 0, releaseHeld: ((response: Response) => void) | undefined;
+        globalThis.fetch = (async (input, init) => {
+          const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+          if (url.pathname === "/v1/mailbox-actions" && init?.method === "POST") {
+            backendWrites++; return new Promise<Response>(resolve => { releaseHeld = resolve; });
+          }
+          return priorFetch(input, init);
+        }) as typeof fetch;
+        const commands: Promise<unknown>[] = [];
+        for (let index = 0; index < 8; index++) commands.push(store.doneOptimistically([selected(index)]).catch(error => error));
+        const beforeTargetLimit = store.getSnapshot();
+        let recoveryWrites = 0;
+        const tooManyTargets = { ...selected(8), window: { ...selected(8).window!, targets: Array.from({ length: 100 }, (_, target) => ({ mailboxId: box.id, messageId: `overflow-${target}`, revision: 1 })) } };
+        await assert.rejects(store.doneOptimistically([tooManyTargets], () => { recoveryWrites++; }), /Wait for existing Done commands/);
+        assert.strictEqual(store.getSnapshot().pendingDone, beforeTargetLimit.pendingDone); assert.equal(recoveryWrites, 0);
+        assert.equal(store.getSnapshot().pendingDone.length, 8);
+        for (let index = 8; index < 32; index++) commands.push(store.doneOptimistically([selected(index)]).catch(error => error));
+        const beforeCommandLimit = store.getSnapshot();
+        await assert.rejects(store.doneOptimistically([selected(32)], () => { recoveryWrites++; }), /Wait for existing Done commands/);
+        assert.strictEqual(store.getSnapshot().pendingDone, beforeCommandLimit.pendingDone); assert.equal(recoveryWrites, 0);
+        assert.equal(store.getSnapshot().pendingDone.length, 32);
+        await until(() => !!releaseHeld, "only the admitted queue head reaches the backend"); assert.equal(backendWrites, 1);
+        const captured = selected(0);
+        source.generation = 2; await store.retry();
+        assert.deepEqual(store.getSnapshot().pendingDone, [], "source generation replacement retires every old visual owner");
+        assert.equal(store.isPendingDone(captured), false); assert.equal(store.pendingDoneFor(captured), undefined);
+        releaseHeld!(Response.json({ code: "CONFLICT", error: "Old generation response" }, { status: 412 }));
+        assert.ok((await Promise.all(commands)).every(value => value instanceof Error));
+        assert.equal(backendWrites, 1, "queued source-invalidated commands never send");
+        source.generation = 1; await store.retry();
+        const activeQuery = store.getSnapshot().window!.query;
+        await store.setWindowQuery({ ...activeQuery, folder: "Sent" });
+        await assert.rejects(store.doneOptimistically([captured]), /only available in the Inbox/);
+        assert.strictEqual(store.presentWindow(store.getSnapshot().window!), store.getSnapshot().window);
+        await store.setWindowQuery(activeQuery);
+        const closing = store.doneOptimistically([selected(0)]);
+        const closed = assert.rejects(closing, error => error instanceof DOMException && error.name === "AbortError");
+        assert.equal(store.getSnapshot().pendingDone.length, 1);
+        stop!(); assert.deepEqual(store.getSnapshot().pendingDone, []); assert.equal(store.isPendingDone(captured), false);
+        await closed; assert.equal(backendWrites, 1, "close cancels a queued command before its POST");
+        globalThis.fetch = priorFetch;
+      }
+      unsubscribe(); stop(); stop = undefined;
+      await sleep(0);
+    }
+  } finally {
+    releasePinnedReads?.(); releaseReader?.(); releaseChanges?.(); releaseHistory?.(); releaseReverse?.(); releaseQuery?.(); stop?.(); mock.restore(); globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
+  }
+});
+
+test("host-service-backed bounded startup pages, lookup and search without browser inventories", async () => {
+  if (process.env.INBOX_WINDOW_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "host-service-backed bounded", "--timeout", "60000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_WINDOW_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createMockHost }, { InboxStore }, { Database }, { createInboxWindowService }, { createInboxViewPreferencesStore },
+    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, { createAttentionFeedbackStore }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("../src/inbox.ts"), import("bun:sqlite"), import("../../local-host/src/inbox-window.ts"),
+    import("../../local-host/src/inbox-preferences.ts"), import("../../local-host/src/split-preferences.ts"), import("../../local-host/src/attention-overrides.ts"),
+    import("../../local-host/src/ai-triage.ts"), import("../../local-host/src/attention-feedback.ts"), import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  const root = await fs.mkdtemp(join(tmpdir(), "host-window-client-"));
+  const originalFetch = globalThis.fetch, originalInfo = console.info, originalWarn = console.warn;
+  const globals = ["location", "window", "document", "localStorage"].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  console.info = () => {}; console.warn = () => {};
+  const token = "fictional-window-client-token-only";
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 48).toString("base64"), token, allowProviderWrites: true });
+  const database = new Database(join(root, "host-window.sqlite"));
+  const preferences = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+  const splits = createSplitPreferencesStore(database, host.owner);
+  const categories = createAttentionOverridesStore(database, host.inbox, host.owner);
+  const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
+  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: true,
+    inboxPreferences: preferences, splitPreferences: splits, attentionOverrides: categories, ai });
+  const feedback = createAttentionFeedbackStore(database, host.inbox, host.owner);
+  type ChangesInput = import("../../shared/inbox-window").InboxChangesInput;
+  type ChangesPage = import("../../shared/inbox-window").InboxWindowChanges;
+  type Page = import("../../shared/inbox-window").InboxWindowPage;
+  let stop: (() => void) | undefined, releaseChanges: (() => void) | undefined, releasePage: (() => void) | undefined;
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (check: () => boolean, message: string) => {
+    const deadline = Date.now() + 20000; while (!check() && Date.now() < deadline) await sleep(20); assert.ok(check(), message);
+  };
+  try {
+    const nativeBox = host.store.mailboxes(host.owner)[0];
+    const source = { owner: host.owner, storeId: nativeBox.id, accountId: host.store.link(host.owner, nativeBox.id)!.accountId };
+    let firstNative: ReturnType<typeof host.store.receive> | undefined;
+    const nativeIds = new Map<string, string>();
+    for (let index = 0; index < 1200; index++) {
+      const received = host.store.receive(source, { from: "window-fixture@example.test", to: nativeBox.email,
+        subject: `Window fixture ${String(index).padStart(4, "0")}`, text: "Fictional bounded inbox context." });
+      nativeIds.set(received.subject, received.id);
+      if (!index) firstNative = received;
+    }
+    let more = true;
+    while (more) more = (await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    const box = (await host.inbox.mailboxes(host.owner)).find(box => box.sourceId === source.accountId)!;
+    const storage = new Map<string, string>();
+    Object.assign(globalThis, { location: new URL(`http://localhost:41999/#/account=${box.id}&folder=All%20Mail&split=Important`), window: new EventTarget(),
+      document: { visibilityState: "visible", createElement: () => ({ innerHTML: "", content: { querySelectorAll: () => [] } }) },
+      localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
+    });
+    let inventories = 0, pages = 0, bodyReads = 0, queries = 0, lookups = 0, detailPages = 0;
+    const pinnedMetadataReads: string[] = [];
+    const nativeWrites: Array<{ input: import("inbox-sdk/types").MutationInput; operation: import("inbox-sdk/types").Operation }> = [];
+    const observedFlags = new Set<string>(), feedbackRequests: Array<{ id: string; targets: import("../src/host.ts").AttentionFeedbackTarget[] }> = [];
+    const feedbackReplies: Array<{ status: number; code?: string }> = [];
+    let holdQuery = false, heldQuery = false, releaseQuery: (() => void) | undefined, holdChanges = false, heldChanges = false;
+    let holdPage = false, heldPage: Page | undefined, holdTerminalChanges = false;
+    const changes: ChangesInput[] = [], changeFailures: Array<{ status?: number; code?: string }> = [];
+    const published: number[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
+      if (url.pathname === "/host/config") return Response.json({ mode: "mock", allowProviderWrites: true, providers: [], inboxWindow: true, preferenceScope: "fictional-window-client" });
+      if (url.pathname === "/host/inbox-preferences") return Response.json(await preferences.read());
+      if (url.pathname === "/host/split-preferences") return Response.json(splits.read());
+      if (url.pathname === "/host/attention-feedback" || /^\/host\/attention-feedback\/[^/]+\/undo$/.test(url.pathname)) {
+        try {
+          if (url.pathname.endsWith("/undo")) return Response.json(await feedback.undo(url.pathname.split("/")[3]));
+          if (init?.method !== "POST") return Response.json(await feedback.list());
+          const body = JSON.parse(String(init.body)); feedbackRequests.push(body);
+          const event = await feedback.record(body); feedbackReplies.push({ status: 200 }); return Response.json(event);
+        } catch (cause) {
+          const error = cause as { status: number; code: string; message: string };
+          feedbackReplies.push({ status: error.status, code: error.code });
+          return Response.json({ code: error.code, error: error.message, retryable: false }, { status: error.status });
+        }
+      }
+      if (url.pathname.startsWith("/host/inbox/")) {
+        assert.equal(init?.method, "POST"); assert.equal(init?.credentials, "include");
+        if (url.pathname === "/host/inbox/page") pages++;
+        if (url.pathname === "/host/inbox/query") queries++;
+        if (url.pathname === "/host/inbox/lookup") lookups++;
+        if (url.pathname === "/host/inbox/messages") detailPages++;
+        try {
+          const body = JSON.parse(String(init?.body));
+          if (url.pathname === "/host/inbox/changes") changes.push(structuredClone(body));
+          const result = await service.dispatch(url.pathname, body);
+          if (holdPage && url.pathname === "/host/inbox/page") {
+            holdPage = false; heldPage = result as Page;
+            const response = Response.json(result);
+            await new Promise<void>(resolve => { releasePage = resolve; init?.signal?.addEventListener("abort", () => resolve(), { once: true }); });
+            return response;
+          }
+          if (holdChanges && url.pathname === "/host/inbox/changes" && !body.cursor) {
+            if (holdTerminalChanges) assert.equal((result as ChangesPage).nextCursor, null, "the no-change pass is held at its final publication");
+            else assert.ok((result as ChangesPage).nextCursor, "a real SDK mutation produces a bound host changes continuation");
+            holdChanges = false; heldChanges = true;
+            await new Promise<void>(resolve => { releaseChanges = resolve; init?.signal?.addEventListener("abort", () => resolve(), { once: true }); });
+          }
+          if (holdQuery && url.pathname === "/host/inbox/query" && body.folder === "Trash") {
+            heldQuery = true;
+            await new Promise<void>(resolve => { releaseQuery = resolve; init?.signal?.addEventListener("abort", () => setTimeout(resolve, 100), { once: true }); });
+          }
+          return Response.json(result);
+        }
+        catch (cause) {
+          const error = cause as { status?: number; code?: string; message?: string };
+          if (url.pathname === "/host/inbox/changes") changeFailures.push({ status: error.status, code: error.code });
+          return Response.json({ code: error.code, error: error.message }, { status: error.status ?? 500 });
+        }
+      }
+      if (url.pathname.includes("mailbox-snapshot") || url.pathname === "/v1/mailbox-messages") inventories++;
+      if (/\/messages\/[^/]+$/.test(url.pathname)) bodyReads++;
+      if (url.pathname === "/v1/events") return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(new DOMException("Stopped", "AbortError")); if (init?.signal?.aborted) abort(); else init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      if (/^\/v1\/mailboxes\/[^/]+\/messages\/[^/]+\/summary$/.test(url.pathname)) pinnedMetadataReads.push(decodeURIComponent(url.pathname.split("/").at(-2)!));
+      const headers = new Headers(init?.headers); headers.set("Authorization", `Bearer ${token}`);
+      const response = await host.fetch(new Request(url, { ...init, headers }));
+      if (url.pathname === "/v1/operations" && init?.method === "POST" && response.ok)
+        nativeWrites.push({ input: JSON.parse(String(init.body)), operation: await response.clone().json() });
+      if (url.pathname.startsWith("/v1/operations/") && response.ok) {
+        const operation = await response.clone().json(); if (operation.status === "succeeded") observedFlags.add(operation.id);
+      }
+      return response;
+    }) as typeof fetch;
+    // Opening the app must not depend on a prewarmed global index.
+    const query = { account: box.id, folder: "All Mail", split: "Important", search: false, query: "", filter: null };
+    const store = new InboxStore(); store.subscribe(() => { if (store.getSnapshot().loaded) published.push(store.getSnapshot().window?.keys.length ?? 0); }); stop = store.start();
+    await until(() => store.getSnapshot().window?.keys.length === 200, "first 200 conversations prefetched");
+    assert.equal(published[0], 100, "first 100 are usable before prefetch");
+    const prefetched = pages; await sleep(150); assert.equal(pages, prefetched, "automatic paging stops at 200");
+    assert.equal(prefetched, 1, "only one response buffers the initial page");
+    assert.equal(inventories, 0, "new host never uses the legacy browser inventory"); assert.equal(bodyReads, 0, "initial rows are body-free");
+    const initialKeys = [...store.getSnapshot().window!.keys];
+    const first = store.getSnapshot().mail[0]; store.pinWindow("reader", [first.id]);
+    for (let count = 0; count < 9; count++) await store.loadMoreWindow();
+    assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), first, "pinned unchanged row identity survives paging");
+    assert.ok(!store.getSnapshot().window!.keys.includes(first.id), "a pinned evicted reader does not inflate the active window");
+    for (let count = 0; count < 3 && store.getSnapshot().window!.hasNewer; count++) await store.loadNewerWindow();
+    assert.deepEqual(store.getSnapshot().window!.keys.slice(0, initialKeys.length), initialKeys, "reverse paging restores the initial rows after mid-page eviction without skipping a suffix");
+    assert.ok(store.getSnapshot().mail.length <= 1000); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+    await store.loadThread(first.id);
+    const cached = store.getSnapshot().mail.find(mail => mail.id === first.id), reads = bodyReads;
+    await store.loadThread(first.id);
+    assert.equal(bodyReads, reads, "cached open performs no additional body read");
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), cached, "cached open preserves row identity");
+
+    for (const [duringDrain, idleDrains] of [[false, 0], [true, 0], [false, 18]] as const) {
+      await store.seekWindow("start");
+      const beforePage = store.getSnapshot().window!, beforePageMail = store.getSnapshot().mail.find(mail => mail.id === first.id);
+      const pageBodies = bodyReads, pageQueries = queries, pageLookups = lookups;
+      holdPage = true;
+      const delayedPage = store.loadMoreWindow();
+      void delayedPage.catch(() => {});
+      await until(() => !!releasePage, "the real older page is serialized before its response is released");
+      assert.equal(heldPage!.rows.length, 100);
+      assert.equal(heldPage!.state.indexRevision, beforePage.state.indexRevision, "the actual host cursor retains its immutable original baseline");
+      assert.ok(heldPage!.state.readCursor); assert.equal(heldPage!.state.readCursor, beforePage.state.readCursor);
+      const delayedRow = heldPage!.rows.find(row => row.mail.subject.startsWith("Window fixture ") && !row.mail.starred && row.mail.unread)!;
+      assert.ok(!beforePage.keys.includes(delayedRow.key)); assert.equal(delayedRow.mail.starred, false); assert.equal(delayedRow.mail.unread, true);
+      // An upstream flag event reaches the real SDK without changing the host's provider-write policy.
+      host.store.mutate(source, nativeIds.get(delayedRow.mail.subject)!, { isStarred: true, isRead: true });
+      await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+      const currentSummary = await host.inbox.mailboxMessageSummary(host.owner, box.id, delayedRow.summaries[0].id);
+      assert.equal(currentSummary.isStarred, true); assert.equal(currentSummary.isRead, true);
+      await store.retry();
+      for (let count = 0; count < idleDrains; count++) await store.retry();
+      if (idleDrains) {
+        const expiredNumeric = await store.windowTransport.changes({ queryId: beforePage.state.queryId, sinceRevision: heldPage!.state.indexRevision,
+          residentKeys: [...store.getSnapshot().window!.keys], pinnedKeys: [first.id], limit: 100 });
+        assert.equal(expiredNumeric.resetReason, "history", "18 ordinary drains retire the numeric checkpoint while its signed SDK baseline is still usable");
+      }
+      const completedCheckpoint = store.getSnapshot().window!.state, completedRevision = completedCheckpoint.indexRevision;
+      let afterDrain = changes.length, overlappingDrain: Promise<void> | undefined;
+      assert.ok(completedRevision > heldPage!.state.indexRevision);
+      assert.ok(!store.getSnapshot().mail.some(mail => mail.id === delayedRow.key), "the delta cannot upsert or prepend this still-offscreen older row");
+      if (duringDrain) {
+        holdChanges = true; heldChanges = false; holdTerminalChanges = true;
+        overlappingDrain = store.retry();
+        await until(() => !!releaseChanges, "a subsequent drain is held at its final response");
+        assert.equal(changes.at(-1)!.sinceRevision, completedRevision, "this drain started after the missed flags were already checkpointed");
+        assert.equal(changes.at(-1)!.sinceCursor, completedCheckpoint.readCursor);
+        afterDrain = changes.length;
+      }
+      releasePage!(); releasePage = undefined; await delayedPage;
+      assert.equal(store.getSnapshot().window!.state.indexRevision, completedRevision, "a delayed page must not replace the completed checkpoint");
+      assert.equal(store.getSnapshot().window!.state.readCursor, completedCheckpoint.readCursor);
+      if (overlappingDrain) { releaseChanges!(); releaseChanges = undefined; await overlappingDrain; holdTerminalChanges = false; }
+      for (let attempt = 0; attempt < 100 && (!store.getSnapshot().mail.find(mail => mail.id === delayedRow.key)?.starred || store.getSnapshot().window!.state.indexRevision <= completedRevision); attempt++) await sleep(20);
+      const reconciledRow = store.getSnapshot().mail.find(mail => mail.id === delayedRow.key)!;
+      assert.deepEqual({ starred: reconciledRow.starred, unread: reconciledRow.unread }, { starred: true, unread: false },
+        `a held R${heldPage!.state.indexRevision} page arriving ${duringDrain ? "during a later drain" : "after the drain"} at R${completedRevision} must reconcile its missed flags; catch-up requests=${changes.length - afterDrain}`);
+      const pageReplay = changes.slice(afterDrain).find(input => !input.cursor)!;
+      assert.ok(pageReplay); assert.equal(pageReplay.sinceRevision, heldPage!.state.indexRevision); assert.equal(pageReplay.sinceCursor, heldPage!.state.readCursor);
+      assert.ok(pageReplay.residentKeys.includes(delayedRow.key));
+      assert.equal(bodyReads, pageBodies); assert.equal(inventories, 0); assert.equal(queries, pageQueries); assert.equal(lookups, pageLookups);
+      assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), beforePageMail);
+      const settledPageMail = store.getSnapshot().mail;
+      await store.loadThread(first.id); assert.equal(bodyReads, pageBodies); assert.strictEqual(store.getSnapshot().mail, settledPageMail);
+      assert.deepEqual(changeFailures, []);
+    }
+
+    await store.seekWindow("start"); await store.retry();
+    const outside = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: 'subject:"Window fixture 0000"', limit: 1 })).items[0]!;
+    const outsideKey = `${box.id}:${outside.threadId}`, resident = [...store.getSnapshot().window!.keys];
+    assert.ok(!resident.includes(outsideKey), "the changed sender conversation starts outside the resident window");
+    const [savedOutside] = await store.lookupWindow([outsideKey]);
+    const unchanged = store.getSnapshot().mail.find(mail => mail.id === first.id);
+    const checkpoint = store.getSnapshot().window!.state, firstChange = changes.length;
+    assert.ok(checkpoint.readCursor);
+    const queriesBefore = queries, lookupsBefore = lookups, bodiesBefore = bodyReads;
+    const changedState = await host.inbox.setMailboxStates(host.owner, { id: "held-window-pin-change", done: true,
+      targets: [{ mailboxId: box.id, messageId: outside.id, revision: outside.memberships.find(state => state.mailboxId === box.id)!.revision }] });
+    holdChanges = true; heldChanges = false;
+    const draining = store.retry();
+    await until(() => heldChanges || changeFailures.length > 0, "first real changes page is held");
+    assert.deepEqual(changeFailures, []);
+    assert.equal(changes[firstChange].pinnedKeys.length, 1);
+    const newPins = [outsideKey, ...resident.slice(2, 5)];
+    store.pinWindow("reader", [resident[1]]); store.pinWindow("sender", newPins);
+    releaseChanges!(); releaseChanges = undefined; await draining;
+    assert.deepEqual(changeFailures, [], "changing reader/sender pins never causes HOST_INBOX_CURSOR_INVALID");
+    const firstPass = changes.slice(firstChange);
+    assert.ok(firstPass.length > 1, "the strict host cursor was actually exercised");
+    for (const input of firstPass.slice(1)) assert.deepEqual(input, { ...firstPass[0], cursor: input.cursor }, "all continuations use the captured resident/pinned scope");
+    assert.equal(store.getSnapshot().window!.state.indexRevision, checkpoint.indexRevision, "the completed old scope cannot advance past an unreconciled new pin");
+    assert.equal(store.getSnapshot().window!.state.readCursor, checkpoint.readCursor, "the deferred old revision keeps its own token, not the new response's token");
+    assert.equal(store.getSnapshot().mail.find(mail => mail.id === outsideKey)!.folder, savedOutside.folder);
+    await until(() => store.getSnapshot().mail.some(mail => mail.id === outsideKey && mail.folder === "Done"), "the scheduled current-scope replay reconciles the missed SDK receipt");
+    const replay = changes.slice(firstChange + 1).find(input => !input.cursor)!;
+    assert.ok(replay); assert.equal(replay.sinceRevision, checkpoint.indexRevision); assert.equal(replay.sinceCursor, checkpoint.readCursor);
+    assert.deepEqual(new Set(replay.pinnedKeys), new Set([resident[1], ...newPins]));
+    await sleep(200);
+    assert.equal(changes.slice(firstChange).filter(input => !input.cursor).length, 2, "one scope expansion schedules one follow-up pass, not a loop");
+    assert.deepEqual(changeFailures, []); assert.equal(store.getSnapshot().error, null);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === first.id), unchanged);
+    const settled = store.getSnapshot().mail;
+    await store.loadThread(first.id);
+    assert.strictEqual(store.getSnapshot().mail, settled);
+    assert.equal(bodyReads, bodiesBefore); assert.equal(inventories, 0); assert.equal(queries, queriesBefore); assert.equal(lookups, lookupsBefore);
+    store.pinWindow("sender", []); store.pinWindow("reader", [first.id]);
+    await host.inbox.undoMailboxStates(host.owner, changedState.id); await store.retry();
+
+    await store.setWindowQuery({ ...query, search: true, query: "subject:\"Window fixture 0000\"" });
+    for (let count = 0; count < 20 && !store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000") && store.getSnapshot().window?.nextCursor; count++) await store.loadMoreWindow();
+    assert.ok(store.getSnapshot().mail.some(mail => mail.subject === "Window fixture 0000"), "explicit search paging reaches outside the old browser window");
+    const before = [...store.getSnapshot().window!.keys]; await store.lookupWindow([first.id]);
+    assert.deepEqual(store.getSnapshot().window!.keys, before, "off-view lookup never inflates active rows or totals");
+    // Reader/flag work may have advanced the SDK since the last query page.
+    // A 503 is an explicit refusal to capture, not a partially frozen selection.
+    let selected: Awaited<ReturnType<typeof store.createWindowSelection>> | undefined;
+    for (let attempt = 0; !selected && attempt < 400; attempt++) {
+      try { selected = await store.createWindowSelection(); }
+      catch (error) { assert.equal((error as { status?: number }).status, 503, "only index-not-current capture rejection is retryable here"); await sleep(25); }
+    }
+    assert.ok(selected, "capture is accepted only after the host index is current");
+    let selectionPage = await store.windowTransport.selectionPage({ selectionId: selected.id });
+    for (let attempt = 0; !selectionPage.selection.captureComplete && attempt < 100; attempt++) { await sleep(20); selectionPage = await store.windowTransport.selectionPage({ selectionId: selected.id }); }
+    assert.ok(selectionPage.selection.captureComplete, "selection capture completes server-side");
+    const captured = await store.resolveWindowSelection(selected); assert.ok(captured.every(mail => mail.window?.targetsComplete));
+    assert.equal(captured.length, 1);
+    const later = host.store.receive(source, { from: "window-fixture@example.test", to: nativeBox.email, subject: "Window fixture 0000", text: "Fictional later reply.", threadId: firstNative!.threadId });
+    await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 });
+    const reverse = await store.action(captured, "done");
+    assert.ok(reverse.receipts?.some(receipt => receipt.kind === "mailbox-state"), "accepted Done exposes typed receipt references for cleanup");
+    const original = await host.inbox.mailboxMessageSummary(host.owner, box.id, captured[0].messages[0].id);
+    assert.equal(original.memberships[0].done, true);
+    const threadPage = await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: 'subject:"Window fixture 0000"', limit: 100 });
+    const newer = threadPage.items.find(message => message.id !== original.id && message.threadId === original.threadId)!;
+    assert.ok(newer, `later fictional reply ${later.id} is indexed`); assert.equal(newer.memberships[0].done, false, "captured Done never inherits a later reply");
+    store.pinWindow("reader", []); await store.setWindowQuery({ ...query, folder: "Sent" });
+    assert.ok(!store.getSnapshot().mail.some(mail => mail.id === captured[0].id), "captured action row is evicted outside its view");
+    await reverse();
+    assert.equal((await host.inbox.mailboxMessageSummary(host.owner, box.id, original.id)).memberships[0].done, false, "Undo restores its receipt after eviction");
+    holdQuery = true;
+    const stale = store.setWindowQuery({ ...query, folder: "Trash" }).catch(error => error);
+    await until(() => heldQuery, "old host response is held");
+    await store.setWindowQuery(query); releaseQuery?.();
+    assert.equal((await stale)?.name, "AbortError");
+    assert.equal(store.getSnapshot().window?.query.folder, "All Mail", "late prior-view response cannot replace the active window");
+
+    await until(() => !store.getSnapshot().window!.paging, "the preceding view is settled before the long-thread case");
+    const unaffected = store.getSnapshot().mail[0]; store.pinWindow("draft:long-guard", [unaffected.id]);
+    let longNative: ReturnType<typeof host.store.receive> | undefined;
+    const longAt = Date.now(), longSubject = "Expanded long W fixture";
+    for (let index = 0; index < 120; index++) {
+      const received = host.store.receive(source, { from: "long-fixture@example.test", to: nativeBox.email, subject: longSubject,
+        threadId: longNative?.threadId, receivedAt: new Date(longAt - (119 - index) * 1000).toISOString(), isRead: index < 119,
+        text: index === 119 ? "EXPANDED-LONG-LATEST-120" : `Expanded long history ${index + 1}.` });
+      longNative ??= received;
+    }
+    more = true; while (more) more = (await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    const longSummaries: import("inbox-sdk/types").MailboxMessageSummary[] = []; let longCursor: string | undefined;
+    do {
+      const page = await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: `subject:"${longSubject}"`, limit: 100, cursor: longCursor });
+      longSummaries.push(...page.items); longCursor = page.nextCursor ?? undefined;
+    } while (longCursor);
+    longSummaries.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)); assert.equal(longSummaries.length, 120);
+    const latestLong = longSummaries[0], longKey = `${box.id}:${latestLong.threadId}`;
+    const preparation = await host.inbox.setMailboxStates(host.owner, { id: "web-long-prep-119-done", done: true,
+      targets: longSummaries.slice(1).map(message => ({ mailboxId: box.id, messageId: message.id, revision: message.memberships[0].revision })) });
+    assert.equal(preparation.states.filter(state => state.done).length, 119);
+    store.pinWindow("reader", [longKey]);
+    await store.setWindowQuery({ ...query, search: true, query: `subject:"${longSubject}"` });
+    const long = () => store.getSnapshot().mail.find(mail => mail.id === longKey)!;
+    assert.equal(long().messages.length, 50); assert.equal(long().window!.targets.length, 120);
+    const context = long().window!.contextVersion, initialDetails = detailPages;
+    await store.loadThread(longKey);
+    assert.ok(long().messages.at(-1)!.bodyText?.includes("EXPANDED-LONG-LATEST-120"));
+    const loadedBodies = bodyReads, beforeRead = nativeWrites.length, loadedLatest = long().messages.at(-1)!;
+    await store.action([long()], "read");
+    assert.equal(detailPages - initialDetails, 2); assert.equal(long().messages.length, 120);
+    assert.equal(nativeWrites.length, beforeRead + 1); assert.deepEqual(nativeWrites.at(-1)!.input.messageIds, [latestLong.id]);
+    const readOperation = nativeWrites.at(-1)!.operation;
+    await host.inbox.runDue();
+    assert.equal((await host.inbox.operation(host.owner, readOperation.id)).status, "succeeded");
+    await until(() => observedFlags.has(readOperation.id), "the client observes native read settlement before W");
+    await store.retry();
+    const freshLatest = await host.inbox.mailboxMessageSummary(host.owner, box.id, latestLong.id);
+    assert.ok(freshLatest.revision > latestLong.revision); assert.equal(freshLatest.isRead, true);
+    assert.equal(long().window!.contextVersion, context, "read settlement keeps the canonical body/context identity");
+    assert.equal(long().window!.targets.find(target => target.messageId === latestLong.id)!.messageRevision, freshLatest.revision, "a trusted host upsert has already delivered the current action fence");
+    assert.equal(long().messages.length, 120); assert.equal(long().historyExhausted, true); assert.equal(detailPages - initialDetails, 2);
+    const cachedLong = store.getSnapshot().mail;
+    await store.loadThread(longKey); assert.equal(bodyReads, loadedBodies); assert.strictEqual(store.getSnapshot().mail, cachedLong);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === unaffected.id), unaffected);
+    const currentLong = long(); let longUndo: import("../src/inbox.ts").InboxUndo | undefined, longError: unknown;
+    try { longUndo = await store.action([currentLong], "not-important"); } catch (error) { longError = error; }
+    const postedLong = feedbackRequests.at(-1)!;
+    assert.deepEqual({ status: feedbackReplies.at(-1)?.status, messageRevision: postedLong?.targets.find(target => target.messageId === latestLong.id)?.messageRevision },
+      { status: 200, messageRevision: freshLatest.revision }, `expanded summary revision=${currentLong.messages.find(message => message.id === latestLong.id)!.revision}; host target revision=${freshLatest.revision}; W error=${longError instanceof Error ? longError.message : String(longError)}`);
+    assert.ok(longUndo); assert.equal(postedLong.targets.length, 120);
+    const projectedLatest = currentLong.messages.find(message => message.id === latestLong.id)!;
+    assert.equal(projectedLatest.revision, freshLatest.revision); assert.equal(projectedLatest.isRead, true);
+    assert.equal(projectedLatest.loaded, true); assert.equal(projectedLatest.bodyRevision, loadedLatest.bodyRevision); assert.equal(projectedLatest.body, loadedLatest.body);
+    assert.deepEqual(new Set(postedLong.targets.map(target => target.messageId)), new Set(longSummaries.map(message => message.id)));
+    for (const target of postedLong.targets) assert.equal(target.revision, target.messageId === latestLong.id ? latestLong.memberships[0].revision : preparation.states.find(state => state.messageId === target.messageId)!.revision);
+    const doneReceipt = await host.inbox.mailboxStateReceipt(host.owner, `attention:${postedLong.id}`);
+    assert.equal(doneReceipt.states.filter(state => state.done).length, 120);
+    await longUndo();
+    const restoredReceipt = await host.inbox.mailboxStateReceipt(host.owner, `attention:${postedLong.id}`);
+    assert.equal(restoredReceipt.retracted, true); assert.equal(restoredReceipt.states.filter(state => state.done).length, 119, "W Undo restores the 119 prepared Done memberships, not zero");
+    assert.equal(restoredReceipt.states.find(state => state.messageId === latestLong.id)!.done, false);
+    assert.equal((await host.inbox.mailboxStateReceipt(host.owner, preparation.id)).retracted, false);
+
+    // The 101st newest message is outside the canonical preview; only explicit targets carry its current fence.
+    const olderLong = longSummaries[100], frozenFeedback = JSON.stringify(longUndo.recovery);
+    const olderWrite = await host.inbox.mutate(host.owner, { messageIds: [olderLong.id], viaMailboxId: box.id,
+      changes: { isRead: false, isStarred: true }, ifRevisions: { [olderLong.id]: olderLong.revision }, idempotencyKey: "web-long-older-flags" });
+    await host.inbox.runDue(); assert.equal((await host.inbox.operation(host.owner, olderWrite.id)).status, "succeeded");
+    await store.retry();
+    const freshOlder = await host.inbox.mailboxMessageSummary(host.owner, box.id, olderLong.id);
+    assert.ok(freshOlder.revision > olderLong.revision); assert.equal(freshOlder.isRead, false); assert.equal(freshOlder.isStarred, true);
+    assert.ok(!long().messages.some(message => message.id === olderLong.id));
+    assert.notEqual(long().window!.contextVersion, context, "noncanonical target changes retain the host's existing context invalidation fence");
+    assert.equal(long().window!.targets.find(target => target.messageId === olderLong.id)!.messageRevision, freshOlder.revision);
+    const newerDetails = detailPages;
+    const olderUndo = await store.action([long()], "not-important");
+    const postedOlder = feedbackRequests.at(-1)!;
+    assert.equal(detailPages - newerDetails, 2, "only a new explicit action completes the changed noncanonical context");
+    assert.equal(feedbackReplies.at(-1)!.status, 200); assert.equal(postedOlder.targets.length, 120);
+    assert.equal(postedOlder.targets.find(target => target.messageId === olderLong.id)!.messageRevision, freshOlder.revision);
+    for (const target of postedOlder.targets) assert.equal(target.revision, restoredReceipt.states.find(state => state.messageId === target.messageId)!.revision);
+    const projectedOlder = long().messages.find(message => message.id === olderLong.id)!;
+    assert.equal(projectedOlder.revision, freshOlder.revision); assert.equal(projectedOlder.isRead, false); assert.equal(projectedOlder.isStarred, true);
+    assert.equal(JSON.stringify(longUndo.recovery), frozenFeedback, "fresh actions never mutate an earlier accepted capture/receipt");
+    await olderUndo();
+    const restoredOlder = await host.inbox.mailboxStateReceipt(host.owner, `attention:${postedOlder.id}`);
+    assert.equal(restoredOlder.retracted, true); assert.equal(restoredOlder.states.filter(state => state.done).length, 119);
+    assert.equal((await host.inbox.mailboxStateReceipt(host.owner, preparation.id)).retracted, false);
+    assert.equal(bodyReads, loadedBodies); assert.equal(inventories, 0);
+    store.pinWindow("reader", []); store.pinWindow("draft:long-guard", []); store.pinWindow("draft:deep-guard", [unaffected.id]);
+
+    const deepSubject = "Deep reader retention fixture", deepAt = Date.now();
+    let deepNative: ReturnType<typeof host.store.receive> | undefined;
+    for (let index = 0; index < 620; index++) {
+      const received = host.store.receive(source, { from: "deep-retention@example.test", to: nativeBox.email, subject: deepSubject,
+        threadId: deepNative?.threadId, receivedAt: new Date(deepAt - (619 - index) * 1000).toISOString(), isRead: true,
+        text: `DEEP-RETENTION-${index + 1}` });
+      deepNative ??= received;
+    }
+    more = true; while (more) more = (await host.inbox.sync(host.owner, source.accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    const deepSummaries: import("inbox-sdk/types").MailboxMessageSummary[] = []; let deepCursor: string | undefined;
+    do {
+      const page = await host.inbox.mailboxMessages(host.owner, { mailboxIds: [box.id], search: `subject:"${deepSubject}"`, limit: 100, cursor: deepCursor });
+      deepSummaries.push(...page.items); deepCursor = page.nextCursor ?? undefined;
+    } while (deepCursor);
+    deepSummaries.sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)); assert.equal(new Set(deepSummaries.map(summary => summary.id)).size, 620);
+    const newestDeep = deepSummaries[0], oldDeep = deepSummaries[600], replyOrigin = deepSummaries[220], missingRecent = deepSummaries[70];
+    const deepKey = `${box.id}:${newestDeep.threadId}`, deepMail = () => store.getSnapshot().mail.find(mail => mail.id === deepKey)!;
+    store.pinWindow("reader", [deepKey]);
+    await store.setWindowQuery({ ...query, search: true, query: `subject:"${deepSubject}"` });
+    await store.loadThread(deepKey); store.pinThreadMessages(deepKey, [newestDeep.id]);
+    const initialDeepPages = detailPages, loadedNewest = deepMail().messages.at(-1)!, deepBodyReads = bodyReads;
+    assert.match(loadedNewest.bodyText!, /DEEP-RETENTION-620/);
+    for (let page = 0; page < 7; page++) {
+      await store.loadMoreMessages(deepKey);
+      if (page === 2) store.pinThreadMessages(deepKey, [newestDeep.id, replyOrigin.id]);
+      assert.equal(deepMail().messages.at(-1)!.id, newestDeep.id); assert.equal(deepMail().messages.at(-1)!.body, loadedNewest.body);
+      assert.ok(deepMail().messages.length <= 500); assert.ok(deepMail().messages.some(message => message.id === newestDeep.id));
+      const current = store.getSnapshot().mail; await store.loadThread(deepKey);
+      assert.equal(bodyReads, deepBodyReads); assert.strictEqual(store.getSnapshot().mail, current);
+    }
+    assert.equal(detailPages - initialDeepPages, 7); assert.equal(deepMail().messages.length, 500); assert.equal(deepMail().historyExhausted, true);
+    assert.equal(deepMail().historyTruncated, true); assert.equal(deepMail().window!.messagesComplete, false);
+    assert.ok(deepMail().messages.some(message => message.id === oldDeep.id)); assert.ok(deepMail().messages.some(message => message.id === replyOrigin.id));
+    assert.ok(!deepMail().messages.some(message => message.id === missingRecent.id));
+    const feedbackBeforeDeep = feedbackRequests.length;
+    await assert.rejects(store.action([deepMail()], "not-important"), /exceeds 500/); assert.equal(feedbackRequests.length, feedbackBeforeDeep);
+    await store.loadThread(deepKey, oldDeep.id); await store.loadThread(deepKey, replyOrigin.id);
+    store.pinThreadMessages(deepKey, [newestDeep.id, oldDeep.id, replyOrigin.id]);
+    const loadedDeepBodies = bodyReads, oldDeepBody = deepMail().messages.find(message => message.id === oldDeep.id)!;
+    assert.match(oldDeepBody.bodyText!, /DEEP-RETENTION-20/);
+    await store.resetThreadHistory(deepKey);
+    assert.equal(detailPages - initialDeepPages, 8); assert.equal(deepMail().messages.length, 102); assert.equal(deepMail().historyTruncated, undefined);
+    assert.ok(deepMail().messages.some(message => message.id === missingRecent.id)); assert.equal(deepMail().messages.find(message => message.id === oldDeep.id)!.body, oldDeepBody.body);
+    assert.equal(deepMail().messages.find(message => message.id === replyOrigin.id)!.loaded, true); assert.equal(bodyReads, loadedDeepBodies);
+    await store.loadMoreMessages(deepKey); assert.ok(deepMail().messages.length > 102 && deepMail().messages.length <= 500);
+    assert.equal(deepMail().messages.find(message => message.id === oldDeep.id)!.body, oldDeepBody.body);
+
+    const beforePinRefresh = pinnedMetadataReads.length, beforePinPages = detailPages;
+    const deepRead = await host.inbox.mutate(host.owner, { messageIds: [oldDeep.id], viaMailboxId: box.id, changes: { isRead: false, isStarred: true },
+      ifRevisions: { [oldDeep.id]: oldDeep.revision }, idempotencyKey: "web-deep-open-flags" });
+    await host.inbox.runDue(); assert.equal((await host.inbox.operation(host.owner, deepRead.id)).status, "succeeded");
+    await store.retry();
+    const currentOld = await host.inbox.mailboxMessageSummary(host.owner, box.id, oldDeep.id), projectedOld = deepMail().messages.find(message => message.id === oldDeep.id)!;
+    assert.deepEqual(new Set(pinnedMetadataReads.slice(beforePinRefresh)), new Set([oldDeep.id, replyOrigin.id]));
+    assert.equal(pinnedMetadataReads.length - beforePinRefresh, 2); assert.equal(detailPages, beforePinPages, "deep upserts revalidate only open identities, not a full history");
+    assert.equal(projectedOld.revision, currentOld.revision); assert.equal(projectedOld.isRead, false); assert.equal(projectedOld.isStarred, true);
+    assert.equal(projectedOld.loaded, true); assert.equal(projectedOld.bodyRevision, oldDeepBody.bodyRevision); assert.equal(projectedOld.body, oldDeepBody.body);
+    assert.equal(bodyReads, loadedDeepBodies); assert.equal(deepMail().messages.at(-1)!.id, newestDeep.id);
+    const cachedDeep = store.getSnapshot().mail; await store.loadThread(deepKey, oldDeep.id); await store.loadThread(deepKey);
+    assert.strictEqual(store.getSnapshot().mail, cachedDeep); assert.equal(bodyReads, loadedDeepBodies);
+    assert.strictEqual(store.getSnapshot().mail.find(mail => mail.id === unaffected.id), unaffected);
+    assert.equal(inventories, 0); assert.ok(store.getSnapshot().window!.residentBytes <= 32 * 1024 * 1024);
+    store.pinThreadMessages(deepKey, []); store.pinWindow("reader", []); store.pinWindow("draft:deep-guard", []);
+    stop(); stop = undefined;
+  } finally {
+    releasePage?.(); releaseChanges?.(); stop?.(); await service.close(); await ai.close(); await host.close(); database.close();
+    globalThis.fetch = originalFetch; console.info = originalInfo; console.warn = originalWarn;
+    for (const [key, descriptor] of globals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("host-service-backed forwarded duplicate compaction is response-batch local", async () => {
+  if (process.env.INBOX_FORWARDED_TEST_CHILD !== "1") {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "host-service-backed forwarded duplicate", "--timeout", "60000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false", INBOX_FORWARDED_TEST_CHILD: "1" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const [{ createMockHost }, { Database }, { createInboxWindowService }, { createInboxViewPreferencesStore },
+    { createSplitPreferencesStore }, { createAttentionOverridesStore }, { createAiTriageService }, fs, { tmpdir }, { join }] = await Promise.all([
+    import("../../mock-api/src/host.ts"), import("bun:sqlite"), import("../../local-host/src/inbox-window.ts"), import("../../local-host/src/inbox-preferences.ts"),
+    import("../../local-host/src/split-preferences.ts"), import("../../local-host/src/attention-overrides.ts"), import("../../local-host/src/ai-triage.ts"),
+    import("node:fs/promises"), import("node:os"), import("node:path"),
+  ]);
+  type Query = import("../../shared/inbox-window").InboxViewQuery;
+  type State = import("../../shared/inbox-window").InboxWindowState;
+  const root = await fs.mkdtemp(join(tmpdir(), "host-forwarded-")), originalInfo = console.info, originalWarn = console.warn;
+  console.info = () => {}; console.warn = () => {};
+  const token = "fictional-forwarded-fixture-token-only";
+  const host = await createMockHost({ dataDir: root, encryptionKey: Buffer.alloc(32, 49).toString("base64"), token, allowProviderWrites: true });
+  const database = new Database(join(root, "host-window.sqlite"));
+  const preferences = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+  const ai = createAiTriageService({ database, inbox: host.inbox, configuration: null, sessionKey: token });
+  const service = createInboxWindowService({ database, inbox: host.inbox, owner: host.owner, sessionKey: token, allowProviderWrites: true,
+    inboxPreferences: preferences, splitPreferences: createSplitPreferencesStore(database, host.owner),
+    attentionOverrides: createAttentionOverridesStore(database, host.inbox, host.owner), ai });
+  type Transport = import("../../shared/inbox-window").InboxWindowTransport;
+  const request = <K extends "query" | "page" | "counts" | "lookup" | "changes">(name: K, input: Parameters<Transport[K]>[0]) =>
+    service.dispatch(`/host/inbox/${name}`, input) as ReturnType<Transport[K]>;
+  const query: Query = { account: "unified", folder: "All Mail", split: "Important", search: true, query: 'subject:"Forwarded host fixture"', filter: null };
+  const collect = async (view: Query = query, pageSize = 2) => {
+    const first = await request("query", { ...view, limit: pageSize });
+    let page = first, calls = 1;
+    const rows = [...page.rows];
+    while (page.nextCursor && calls < 300) {
+      page = await request("page", { queryId: first.state.queryId, cursor: page.nextCursor, limit: pageSize }); rows.push(...page.rows); calls++;
+    }
+    assert.equal(page.exhausted, true, "bounded pages eventually exhaust even across suppressed/nonmatching ordinals");
+    assert.equal(new Set(rows.map(row => row.key)).size, rows.length, "page boundaries neither duplicate nor skip matching conversations");
+    let counts = await request("counts", { queryId: first.state.queryId });
+    for (let attempt = 0; counts.totals.conversations === null && attempt < 100; attempt++) counts = await request("counts", { queryId: first.state.queryId });
+    return { first, rows, counts, calls };
+  };
+  const drain = async (state: State, residentKeys: string[], pinnedKeys: string[] = []) => {
+    const input = { queryId: state.queryId, sinceRevision: state.indexRevision, sinceCursor: state.readCursor, residentKeys, pinnedKeys, limit: 2 };
+    let page = await request("changes", input), calls = 1;
+    const upserts = [...page.upserts], newHead = [...page.newHead], removed = [...page.removed];
+    while (page.nextCursor && calls++ < 100) {
+      page = await request("changes", { ...input, cursor: page.nextCursor }); upserts.push(...page.upserts); newHead.push(...page.newHead); removed.push(...page.removed);
+    }
+    assert.equal(page.nextCursor, null); assert.equal(page.resetReason, null, "ordinary dependencies reconcile without a query reset");
+    return { state: page.state, upserts, newHead, removed };
+  };
+  try {
+    const [nativeOriginal, nativeForward] = host.store.mailboxes(host.owner);
+    const source = (native: typeof nativeOriginal) => ({ owner: host.owner, storeId: native.id, accountId: host.store.link(host.owner, native.id)!.accountId });
+    const originalSource = source(nativeOriginal), forwardSource = source(nativeForward);
+    const sync = async (accountId: string) => {
+      let more = true; while (more) more = (await host.inbox.sync(host.owner, accountId, { folder: "all", lane: "latest", limit: 100 })).hasMore;
+    };
+    const boxes = await host.inbox.mailboxes(host.owner), originalBox = boxes.find(box => box.sourceId === originalSource.accountId)!, forwardBox = boxes.find(box => box.sourceId === forwardSource.accountId)!;
+    const now = Date.now(), at = (offset: number) => new Date(now + offset).toISOString();
+    const text = "Please bring the fictional paper lantern to our imaginary meeting.";
+    const pair = (label: string, originalAt: number, copyAt: number, sameSource = false, extra: Partial<Parameters<typeof host.store.receive>[1]> = {}) => {
+      const subject = `Forwarded host fixture ${label}`, rfcMessageId = `<forwarded-host-${label.replaceAll(" ", "-")}@example.test>`;
+      const receiveCopy = () => host.store.receive(sameSource ? originalSource : forwardSource, { from: nativeOriginal.email, to: sameSource ? nativeOriginal.email : nativeForward.email,
+        replyTo: "author@example.test", subject, text, inReplyTo: rfcMessageId, receivedAt: at(copyAt) });
+      // Receive same-source copies first so the mock does not automatically join
+      // them to the original thread; exercise two real native conversations.
+      const earlyCopy = sameSource ? receiveCopy() : undefined;
+      const original = host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject, text, rfcMessageId, receivedAt: at(originalAt), ...extra });
+      return { original, copy: earlyCopy ?? receiveCopy() };
+    };
+    const firstPair = pair("paging first", 5000, 4000), secondPair = pair("paging second", 2000, 3000);
+    const unique = host.store.receive(forwardSource, { from: "colleague@example.test", to: nativeForward.email, subject: "Forwarded host fixture paging unique", text: "A distinct fictional note.", receivedAt: at(1000) });
+    const pagingQuery = { ...query, query: 'subject:"Forwarded host fixture paging"' };
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const summaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: pagingQuery.query, limit: 100 })).items;
+    const summary = (native: typeof unique) => summaries.find(message => message.receivedAt === native.receivedAt)!;
+    const key = (message: typeof summaries[number]) => `unified:${message.sourceId}:${message.threadId}`;
+    const ordered = [firstPair.original, firstPair.copy, secondPair.copy, secondPair.original, unique].map(summary);
+    assert.equal(new Set(ordered.map(message => message.id)).size, 5);
+    const [originalSummary, forwardSummary] = ordered, originalKey = key(originalSummary), forwardKey = key(forwardSummary);
+    const resolver = host.inbox.mailboxForwardedCopies.bind(host.inbox), resolverCalls: string[][] = [];
+    host.inbox.mailboxForwardedCopies = async (owner, input) => { resolverCalls.push([...input.messageIds]); return resolver(owner, input); };
+    const expectBatch = (messages: typeof summaries, message: string) => {
+      assert.equal(resolverCalls.length, messages.length < 2 ? 0 : 1, message);
+      if (messages.length >= 2) assert.deepEqual(new Set(resolverCalls[0]), new Set(messages.map(value => value.id)), message);
+      resolverCalls.length = 0;
+    };
+    assert.equal((await preferences.read()).hideForwardedDuplicates, true);
+    const first = await request("query", { ...pagingQuery, limit: 2 });
+    assert.deepEqual(first.rows.map(row => row.key), [originalKey], "two raw matches compact to one; do not consume the third match to fill the page");
+    expectBatch(ordered.slice(0, 2), "resolver sees only the final two matching raw rows, not the next SDK candidates");
+    assert.ok(first.nextCursor);
+    const second = await request("page", { queryId: first.state.queryId, cursor: first.nextCursor!, limit: 2 });
+    assert.deepEqual(second.rows.map(row => row.key), [key(ordered[3])]);
+    expectBatch(ordered.slice(2, 4), "the next response resolves only its different pair");
+    const third = await request("page", { queryId: first.state.queryId, cursor: second.nextCursor!, limit: 2 });
+    assert.deepEqual(third.rows.map(row => row.key), [key(ordered[4])]); expectBatch(ordered.slice(4), "last response remains local");
+    assert.equal(third.exhausted, true);
+    const fromFirstRow = await request("page", { queryId: first.state.queryId, cursor: first.rows[0].pageCursor, limit: 2 });
+    assert.deepEqual(fromFirstRow.rows.map(row => row.key), second.rows.map(row => row.key), "evicting at a row bookmark consumes its hidden trailing raw row");
+    expectBatch(ordered.slice(2, 4), "row bookmarks do not backfill hidden suffixes");
+    const beforeSecondRow = await request("page", { queryId: first.state.queryId, cursor: second.rows[0].pageCursor, direction: "newer", limit: 2 });
+    assert.deepEqual(beforeSecondRow.rows.map(row => row.key), first.rows.map(row => row.key), "reverse row bookmarks consume hidden leading raw rows");
+    expectBatch(ordered.slice(0, 2), "reverse traversal remains a single raw response batch");
+    const whole = await request("query", { ...pagingQuery, limit: 5 });
+    assert.deepEqual(whole.rows.map(row => row.key), [originalKey, key(ordered[3]), key(ordered[4])]);
+    expectBatch(ordered, "one larger response resolves exactly its five matching raw rows");
+    const subpage = await request("page", { queryId: whole.state.queryId, cursor: whole.rows[0].pageCursor, limit: 1 });
+    assert.deepEqual(subpage.rows.map(row => row.key), [key(ordered[3])], "a smaller resumed response does not backfill hidden rows already consumed by the larger response");
+    expectBatch([ordered[3]], "subpage resumes beyond the hidden gap without pulling earlier response candidates");
+    const beforeMiddle = await request("page", { queryId: whole.state.queryId, cursor: whole.rows[1].pageCursor, direction: "newer", limit: 2 });
+    assert.deepEqual(beforeMiddle.rows.map(row => row.key), [originalKey], "a middle-row reverse bookmark accounts for its hidden leading copy");
+    expectBatch([ordered[0]], "middle-row reverse bookmarks do not repeat hidden raw ordinals");
+    const hidden = await collect(pagingQuery, 2); resolverCalls.length = 0;
+    assert.deepEqual(hidden.rows.map(row => row.key), [originalKey, key(ordered[3]), key(ordered[4])]);
+    assert.equal(hidden.counts.totals.conversations, 5); assert.equal(hidden.counts.totals.messages, 5, "counters describe canonical native mail, not compacted rows");
+    await request("counts", { queryId: hidden.first.state.queryId }); assert.equal(resolverCalls.length, 0, "counts never invoke the forwarding resolver");
+    const singles = await collect(pagingQuery, 1);
+    assert.deepEqual(singles.rows.map(row => row.key), ordered.map(key), "copies whose source is on a different response page remain visible");
+    assert.equal(resolverCalls.length, 0, "single-conversation responses cannot fold against earlier pages and need no resolver call");
+    const lookup = await request("lookup", { account: "unified", ids: [forwardKey, originalKey] });
+    assert.deepEqual(lookup.entries.map(entry => entry.status), ["found", "found"]);
+    assert.ok(lookup.entries.every(entry => entry.status === "found" && !("hiddenAsForwardedDuplicate" in entry.row)), "explicit lookup returns unchanged native rows");
+    assert.equal(resolverCalls.length, 0, "explicit lookup does not classify duplicates");
+    const originalRow = first.rows[0];
+    assert.deepEqual(originalRow.targets.map(target => [target.mailboxId, target.messageId]), [[originalBox.id, originalSummary.id]], "compaction does not merge action targets across accounts");
+    const fromOnly = await collect({ ...pagingQuery, query: `${pagingQuery.query} from:${nativeOriginal.email}` }, 100);
+    assert.deepEqual(new Set(fromOnly.rows.map(row => row.key)), new Set([forwardKey, key(ordered[2])]));
+    expectBatch([ordered[1], ordered[2]], "search filtering happens before batch classification; off-filter parents cannot hide copies");
+    const forwardOnly = await collect({ ...pagingQuery, account: forwardBox.id }, 100);
+    assert.equal(forwardOnly.rows.length, 3); expectBatch([ordered[1], ordered[2], ordered[4]], "individual receiving scope never looks up outside parents");
+
+    const disabled = await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: false });
+    const reset = await request("changes", { queryId: hidden.first.state.queryId, sinceRevision: hidden.first.state.indexRevision, residentKeys: hidden.rows.map(row => row.key), pinnedKeys: [] });
+    assert.equal(reset.resetReason, "query", "preference revision invalidates the old filtered query");
+    const visible = await collect(pagingQuery, 2); assert.deepEqual(visible.rows.map(row => row.key), ordered.map(key));
+    assert.deepEqual(visible.counts.totals, hidden.counts.totals, "the preference never changes native counters");
+    assert.equal(resolverCalls.length, 0, "disabled compaction does not call the resolver");
+    const reopened = createInboxViewPreferencesStore(database, host.inbox, host.owner);
+    assert.equal((await reopened.read()).hideForwardedDuplicates, false, "explicit false survives reopening the persisted store");
+    const { hideForwardedDuplicates: _omitted, ...legacy } = disabled;
+    assert.equal((await reopened.write(legacy)).hideForwardedDuplicates, false, "older clients omitting the field preserve explicit false");
+    await preferences.write({ ...await preferences.read(), hideForwardedDuplicates: true, unifiedMode: "selected", includedMailboxIds: [forwardBox.id] });
+    const selected = await collect(pagingQuery, 100); assert.equal(selected.rows.length, 3);
+    expectBatch([ordered[1], ordered[2], ordered[4]], "selected unified scope stays within its matching response");
+    await preferences.write({ ...await preferences.read(), unifiedMode: "all", includedMailboxIds: [] });
+
+    pair("same source", 10000, 11000, true);
+    pair("receipt", 12000, 13000);
+    const aged = pair("aged source", -46 * 86400000, 14000);
+    const archived = pair("archived source", 15000, 16000, false, { folder: "archive" });
+    const starred = pair("starred source", 17000, 18000, false, { isStarred: true });
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    resolverCalls.length = 0;
+    const same = await collect({ ...query, account: originalBox.id, query: 'subject:"Forwarded host fixture same source"' }, 100);
+    assert.equal(same.rows.length, 1, "verified forwarding also compacts inside an individual source/mailbox");
+    assert.equal(same.rows[0].summaries[0].from.email, "author@example.test");
+    assert.equal(resolverCalls.length, 1); assert.equal(resolverCalls[0].length, 2); resolverCalls.length = 0;
+    const receipt = await collect({ ...query, search: false, query: "", folder: "Inbox", split: "Other" }, 100);
+    assert.equal(receipt.rows.filter(row => row.mail.subject === "Forwarded host fixture receipt").length, 1, "Other is compacted after its own split filter");
+    const scopeSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: query.query, limit: 100 })).items;
+    const scopeSummary = (native: typeof unique) => scopeSummaries.find(message => message.receivedAt === native.receivedAt)!;
+    const receiptIds = scopeSummaries.filter(message => message.subject === "Forwarded host fixture receipt").map(message => message.id);
+    assert.ok(resolverCalls.some(ids => receiptIds.every(id => ids.includes(id))));
+    assert.ok(resolverCalls.every(ids => ids.every(id => !ordered.some(message => message.id === id))), "Other does not classify Important candidates"); resolverCalls.length = 0;
+    const important = await collect({ ...query, search: false, query: "", folder: "Inbox", split: "Important" }, 100);
+    assert.ok(important.rows.some(row => row.key === key(scopeSummary(aged.copy))), "an original outside the 45-day Important window cannot hide a current copy");
+    assert.ok(important.rows.some(row => row.key === key(scopeSummary(archived.copy))), "an archived original cannot hide its Inbox copy");
+    assert.ok(resolverCalls.every(ids => !ids.includes(scopeSummary(aged.original).id) && !ids.includes(scopeSummary(archived.original).id) && receiptIds.every(id => !ids.includes(id))), "folder, age and split exclusions precede the resolver");
+    resolverCalls.length = 0;
+    const filtered = await collect({ ...query, query: 'subject:"Forwarded host fixture starred source"', filter: "Starred" }, 100);
+    assert.equal(filtered.rows.length, 1); expectBatch([scopeSummary(starred.original)], "active filters apply before forwarding candidate collection");
+
+    const beforeFlags = await collect(pagingQuery, 2); resolverCalls.length = 0;
+    host.store.mutate(originalSource, firstPair.original.id, { isRead: true }); await sync(originalSource.accountId);
+    const flags = await drain(beforeFlags.first.state, beforeFlags.rows.map(row => row.key), [forwardKey]);
+    assert.ok(flags.upserts.some(row => row.key === originalKey && !row.mail.unread));
+    assert.ok(!flags.upserts.some(row => row.key === forwardKey) && !flags.removed.some(row => row.key === forwardKey), "an ordinary source flag change never walks a forwarded-dependency graph");
+    assert.ok(resolverCalls.every(ids => ids.length <= 2 && ids.every(id => ordered.slice(0, 2).some(message => message.id === id))), "changes may classify only their bounded new-head response, never resident or pinned lookups");
+    resolverCalls.length = 0;
+    const arrivalState = flags.state;
+    const arrived = pair("paging arrived", 21000, 22000); await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const arrivedSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: 'subject:"Forwarded host fixture paging arrived"', limit: 100 })).items;
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const arrival = await drain(arrivalState, beforeFlags.rows.map(row => row.key));
+      assert.equal(arrival.newHead.filter(row => row.mail.subject === arrived.original.subject).length, 1, "new-head polls compact their own final response batch");
+      assert.ok(resolverCalls.length > 0); assert.ok(resolverCalls.every(ids => ids.length <= 2 && ids.every(id => arrivedSummaries.some(message => message.id === id))), "replaying an old poll never broadens its batch into loaded history");
+      resolverCalls.length = 0;
+    }
+    // An oversized complete response fails open as a whole, even when its first
+    // two rows alone would prove a duplicate. No chunk-dependent partial hiding.
+    const batchSubject = "Forwarded batch fixture original", batchRfc = "<forwarded-host-batch@example.test>";
+    const batchText = "Please bring a fictional blue notebook.", batchHtml = `<p>${batchText}</p>`;
+    const batchQuery = { ...query, query: 'subject:"Forwarded batch fixture"' };
+    host.store.receive(originalSource, { from: "author@example.test", to: nativeOriginal.email, subject: batchSubject,
+      text: batchText, html: batchHtml, rfcMessageId: batchRfc, receivedAt: at(40000) });
+    host.store.receive(forwardSource, { from: nativeOriginal.email, to: nativeForward.email, replyTo: "author@example.test", subject: batchSubject,
+      text: batchText, html: batchHtml, inReplyTo: batchRfc, receivedAt: at(39000) });
+    for (let index = 0; index < 84; index++) {
+      let threadId: string | undefined;
+      for (let member = 0; member < 6; member++) {
+        const copy = host.store.receive(forwardSource, { from: nativeOriginal.email, to: nativeForward.email, replyTo: "author@example.test",
+          subject: batchSubject, text: batchText, html: batchHtml, inReplyTo: batchRfc, threadId, receivedAt: at(30000 + index * 10 + member) });
+        threadId = copy.threadId;
+      }
+    }
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const batchRaw = await host.inbox.mailboxConversations(host.owner, { mailboxIds: boxes.map(box => box.id), query: { search: batchQuery.query }, limit: 100 });
+    assert.equal(batchRaw.items.length, 86);
+    assert.ok(batchRaw.items.every(row => row.messagesComplete), "the >500 case contains complete conversations, not conservative partial previews");
+    assert.equal(batchRaw.items.reduce((sum, row) => sum + row.messages.length, 0), 506);
+    resolverCalls.length = 0;
+    const batch = await collect(batchQuery, 100);
+    assert.equal(batch.rows.length, 86); assert.equal(batch.counts.totals.messages, 506);
+    assert.equal(resolverCalls.length, 0, "over-500 complete response bypasses the resolver entirely rather than resolving chunks");
+    const shortBatch = await request("query", { ...batchQuery, limit: 2 });
+    assert.equal(shortBatch.rows.length, 1, "the same known pair compacts when the complete response is within budget");
+    assert.equal(resolverCalls.length, 1); assert.equal(resolverCalls[0].length, 2); resolverCalls.length = 0;
+    const rawRemainder = await request("page", { queryId: shortBatch.state.queryId, cursor: shortBatch.nextCursor!, limit: 100 });
+    assert.equal(rawRemainder.rows.length, 84); assert.equal(resolverCalls.length, 0, "the next >500 response cannot reuse the source from the previous response");
+
+    // Reverse pagination is request-local too. Single-row subpages intentionally
+    // retain all copies and must not duplicate or omit any canonical boundary.
+    let reversePage = await request("page", { queryId: batch.first.state.queryId, seek: "end", limit: 1 }), reverseCalls = 1;
+    const reverseRows = [...reversePage.rows];
+    while (reversePage.nextCursor && reverseCalls++ < 100) {
+      reversePage = await request("page", { queryId: batch.first.state.queryId, cursor: reversePage.nextCursor, direction: "newer", limit: 1 });
+      reverseRows.push(...reversePage.rows);
+    }
+    assert.equal(reversePage.exhausted, true); assert.equal(reverseRows.length, 86);
+    assert.equal(new Set(reverseRows.map(row => row.key)).size, 86);
+    assert.deepEqual(new Set(reverseRows.map(row => row.key)), new Set(batch.rows.map(row => row.key)), "reverse raw subpages preserve all native identities without cross-page folding");
+    resolverCalls.length = 0;
+    const batchLookup = await request("lookup", { account: "unified", ids: batch.rows.map(row => row.key) });
+    assert.equal(batchLookup.entries.length, 86);
+    assert.ok(batchLookup.entries.every(entry => entry.status === "found" && !("hiddenAsForwardedDuplicate" in entry.row)));
+    assert.equal(resolverCalls.length, 0, "bulk explicit lookup never resolves forwarded copies");
+
+    // Hold only an unseen original: new-head presentation must remove that row
+    // before resolving duplicates, without changing normal query/page behavior.
+    const readAiState = ai.state, readAiLookup = ai.lookup, savedAiState = await ai.state(host.owner);
+    let heldDecision: AiDecision | undefined;
+    ai.state = async () => ({ ...savedAiState, configured: true, problemCode: null,
+      settings: { ...savedAiState.settings, enabled: true, mode: "apply", model: "fictional-hold-model" } });
+    ai.lookup = async (_owner, keys) => ({ decisions: heldDecision && keys.some(item => item.sourceId === heldDecision!.sourceId && item.threadId === heldDecision!.threadId) ? [heldDecision] : [],
+      removed: [], cursor: savedAiState.cursor, hasMore: false, resetRequired: false });
+    try {
+      const holdQuery = { ...query, search: false, query: "", folder: "Inbox", split: "Important" };
+      const beforeHold = await request("query", { ...holdQuery, limit: 2 });
+      const heldPair = pair("held arrival", 60000, 61000);
+      await sync(originalSource.accountId); await sync(forwardSource.accountId);
+      const heldSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: 'subject:"Forwarded host fixture held arrival"', limit: 100 })).items;
+      const heldOriginal = heldSummaries.find(message => message.receivedAt === heldPair.original.receivedAt)!;
+      const unheldCopy = heldSummaries.find(message => message.receivedAt === heldPair.copy.receivedAt)!;
+      heldDecision = { sourceId: heldOriginal.sourceId, threadId: heldOriginal.threadId, revision: 1, settingsRevision: savedAiState.settings.revision,
+        state: "pending", mailboxIds: [originalBox.id], messageIds: [heldOriginal.id], contextVersions: [{ messageId: heldOriginal.id, bodyRevision: heldOriginal.bodyRevision ?? null }],
+        latestMessageId: heldOriginal.id, inputHash: null, model: "fictional-hold-model", schemaVersion: AI_TRIAGE_VERSION, updatedAt: at(0), holdUntil: at(120000),
+        assessment: null, score: null, override: null, problemCode: null };
+      resolverCalls.length = 0;
+      const openHeld = await request("query", { ...holdQuery, limit: 2 });
+      assert.deepEqual(openHeld.rows.map(row => row.key), [key(heldOriginal)], "normal initial queries still show held originals and compact their same-batch copy");
+      assert.equal(openHeld.rows[0].mail.aiHoldUntil, Date.parse(heldDecision.holdUntil!));
+      expectBatch(heldSummaries, "normal query compaction retains the existing ignore-holds policy");
+      const pageHeld = await request("page", { queryId: openHeld.state.queryId, seek: "start", limit: 2 });
+      assert.deepEqual(pageHeld.rows.map(row => row.key), [key(heldOriginal)], "normal page reads also ignore new-arrival holds");
+      expectBatch(heldSummaries, "normal page compaction still receives both matching rows");
+      const heldArrival = await drain(beforeHold.state, beforeHold.rows.map(row => row.key));
+      assert.deepEqual(heldArrival.newHead.map(row => row.key), [key(unheldCopy)], "an unseen AI-held original cannot suppress its unheld forward in the new-head response");
+      assert.equal(heldArrival.newHead[0].mail.aiHoldUntil, undefined);
+      assert.equal(resolverCalls.length, 0, "removing the unseen held original leaves one row, so no off-response parent reaches the resolver");
+      const residentHeld = await drain(beforeHold.state, [...beforeHold.rows.map(row => row.key), key(heldOriginal)]);
+      assert.deepEqual(residentHeld.newHead, [], "a held original already resident within the same requested head remains valid batch context");
+      expectBatch(heldSummaries, "resident context is retained only when it belongs to this same bounded head response");
+    } finally {
+      ai.state = readAiState; ai.lookup = readAiLookup;
+    }
+
+    // Real conditional Done/Undo receipts change which raw rows match Inbox.
+    // A pinned reader is not an active resident row after Done removes it.
+    const undoPair = pair("Undo restoration", 80000, 81000);
+    await sync(originalSource.accountId); await sync(forwardSource.accountId);
+    const undoSummaries = (await host.inbox.mailboxMessages(host.owner, { mailboxIds: [originalBox.id, forwardBox.id], search: 'subject:"Forwarded host fixture Undo restoration"', limit: 100 })).items;
+    const undoOriginal = undoSummaries.find(message => message.receivedAt === undoPair.original.receivedAt)!;
+    const undoCopy = undoSummaries.find(message => message.receivedAt === undoPair.copy.receivedAt)!;
+    const undoOriginalKey = key(undoOriginal), undoCopyKey = key(undoCopy);
+    resolverCalls.length = 0;
+    const beforeDone = await request("query", { ...query, search: false, query: "", folder: "Inbox", split: "Important", limit: 2 });
+    assert.deepEqual(beforeDone.rows.map(row => row.key), [undoOriginalKey]);
+    expectBatch(undoSummaries, "the initial Inbox response compacts the same-batch copy");
+    const doneReceipt = await host.inbox.setMailboxStates(host.owner, { id: "forwarded-batch-original-done", done: true, targets: beforeDone.rows[0].targets });
+    assert.equal(doneReceipt.states.length, 1); assert.equal(doneReceipt.states[0].done, true);
+    const afterDone = await drain(beforeDone.state, [undoOriginalKey]);
+    assert.ok(afterDone.removed.some(row => row.key === undoOriginalKey && row.reason === "not-matching"));
+    // The head pass recalls the original this host already proved, so marking it Done does not resurface its copy as new mail.
+    assert.ok(!afterDone.newHead.some(row => row.key === undoCopyKey), "a copy stays hidden after its proven original is marked Done");
+    assert.ok(!afterDone.newHead.some(row => row.key === undoOriginalKey));
+    assert.ok(resolverCalls.some(ids => ids.includes(undoOriginal.id) && ids.includes(undoCopy.id)), "the head pass re-proves the copy against its remembered Done original");
+    assert.ok(resolverCalls.every(ids => ids.length <= 2 + 2), "recall adds only the remembered originals, never a history search");
+    resolverCalls.length = 0;
+    await host.inbox.undoMailboxStates(host.owner, doneReceipt.id);
+    const undoneReceipt = await host.inbox.mailboxStateReceipt(host.owner, doneReceipt.id);
+    assert.equal(undoneReceipt.retracted, true); assert.equal(undoneReceipt.states[0].done, false);
+    const afterUndo = await drain(afterDone.state, afterDone.newHead.map(row => row.key), [undoOriginalKey, undoCopyKey]);
+    assert.deepEqual(afterUndo.removed, [], "the copy was never resident, so Undo removes nothing");
+    assert.deepEqual(afterUndo.newHead.map(row => row.key), [undoOriginalKey], "the restored original re-enters the active view even though it is already a pinned reader");
+    expectBatch(undoSummaries, "Undo resolves the final matching head once, with no offpage resident or pinned context");
+    const retainedReaders = await request("lookup", { account: "unified", ids: [undoCopyKey, undoOriginalKey] });
+    assert.deepEqual(retainedReaders.entries.map(entry => entry.status), ["found", "found"], "compaction removes only the active row, never the copy's canonical data or pinned-reader lookup");
+    assert.ok(retainedReaders.entries.every(entry => entry.status === "found" && !("hiddenAsForwardedDuplicate" in entry.row)));
+    assert.equal(resolverCalls.length, 0, "reader lookup stays raw after Done/Undo compaction");
+  } finally {
+    await service.close(); await ai.close(); await host.close(); database.close(); console.info = originalInfo; console.warn = originalWarn;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("guided zero recovery protocol preserves partial credit, exact retries, Undo and legacy traversal", async () => {
+  if (!process.versions.bun) {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn("bun", ["--no-env-file", "test", import.meta.filename, "--test-name-pattern", "guided zero recovery protocol", "--timeout", "10000"], {
+        env: { ...process.env, INBOX_TEST_LIVE: "false" }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = ""; child.stdout.on("data", chunk => { output += chunk; }); child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output }));
+    });
+    assert.equal(result.code, 0, result.output); return;
+  }
+  const { ZeroActionRecovery, restoreZeroRecovery, legacyZeroPage, confirmZeroReservation, boundedZeroBatch, assertZeroMembershipBudget, revalidateZeroBatch } = await import("../src/GuidedZero.tsx");
+  const { InboxClassificationError } = await import("../src/inbox.ts");
+  type Session = import("../../shared/inbox-window").InboxZeroSession;
+  type Input = import("../../shared/inbox-window").InboxZeroProgressInput;
+  type Result = import("../../shared/inbox-window").InboxZeroProgressResult;
+  type UndoInput = import("../../shared/inbox-window").InboxZeroUndoInput;
+  type Journal = import("../src/GuidedZero.tsx").ZeroRecoveryJournal;
+  type Reverse = import("../src/inbox.ts").InboxUndo;
+  const initialSession = (): Session => ({ version: 2, id: "zero-session", account: "box", scopeKey: "captured-scope", revision: 1,
+    startedAt: 1, phase: "batches", paused: false, currentId: "a", status: "ready",
+    progress: { initialCount: 3, remainingCount: 3, decidedCount: 0, ineligibleCount: 0, unknownCount: 0, captureComplete: true } });
+  const journal = (): Journal => ({ version: 1, session: initialSession(), selection: ["a", "b", "c"].map(id => ({ id, decision: "other", reviewVersion: `captured:${id}` })),
+    completedIds: [], undoneIds: [], receipts: [], inverseReceipts: [], attempts: [], mailPending: true, undoRequested: false, problem: "" });
+  const reverse = (...ids: string[]): Reverse => Object.assign(async () => { throw new Error("The original classifier-wide Undo must not retire pending groups."); }, {
+    receipts: ids.map(id => ({ kind: "category" as const, id })),
+  });
+  // This is a pure protocol fixture, not an SDK or host-service replacement.
+  function protocol() {
+    let session = initialSession(), saved: Journal | null = null, statuses: Record<string, "accepted" | "pending" | "rejected"> = {};
+    let loseProgress = false, loseUndo = false;
+    const requests: Input[] = [], inverseRequests: UndoInput[] = [], mailUndos: string[][] = [];
+    const persisted = new Map<string, Input>(), inverseBodies = new Map<string, UndoInput>(), credited = new Set<string>();
+    const progressResults = new Map<string, Result>();
+    const update = () => { session = { ...session, revision: session.revision + 1, progress: { ...session.progress, decidedCount: credited.size, remainingCount: 3 - credited.size } }; return structuredClone(session); };
+    const io = {
+      save: (value: Journal) => { saved = structuredClone(value); return true; },
+      session: (_value: Session) => {},
+      undoMail: async (references: import("../../shared/inbox-window").InboxActionReceiptReference[]) => { mailUndos.push(references.map(reference => "id" in reference ? reference.id : reference.target.messageId)); return structuredClone(references); },
+      transport: {
+        zeroResume: async () => ({ status: "found" as const, session: structuredClone(session) }),
+        zeroProgress: async (input: Input): Promise<Result> => {
+          assert.deepEqual(saved!.attempts.find(attempt => attempt.input.id === input.id)?.input, input, "the exact progress body is durable before POST");
+          if (persisted.has(input.id)) assert.deepEqual(input, persisted.get(input.id), "idempotency identity never receives a rebased/subset body");
+          else persisted.set(input.id, structuredClone(input));
+          requests.push(structuredClone(input));
+          const previous = progressResults.get(input.id);
+          const results = input.decisions.map(decision => {
+            const before = previous?.results.find(result => result.id === decision.id)?.status;
+            return { id: decision.id, status: before && before !== "pending" ? before : statuses[decision.id] ?? "accepted" as const };
+          });
+          for (const result of results) if (result.status === "accepted") credited.add(result.id);
+          const result: Result = { session: update(), results, undo: results.some(result => result.status === "accepted") ? { sessionId: session.id, progressId: input.id } : null };
+          progressResults.set(input.id, structuredClone(result));
+          if (loseProgress) { loseProgress = false; throw new TypeError("Lost accepted progress response"); }
+          return result;
+        },
+        zeroUndo: async (input: UndoInput) => {
+          assert.deepEqual(saved!.attempts.find(attempt => attempt.input.id === input.reference.progressId)?.undoInput, input, "inverse progress identity is saved before POST");
+          if (inverseBodies.has(input.id)) assert.deepEqual(input, inverseBodies.get(input.id)); else inverseBodies.set(input.id, structuredClone(input));
+          inverseRequests.push(structuredClone(input));
+          for (const result of progressResults.get(input.reference.progressId)?.results ?? []) if (result.status === "accepted") credited.delete(result.id);
+          const result = { status: "accepted" as const, session: update() };
+          if (loseUndo) { loseUndo = false; throw new TypeError("Lost accepted Undo response"); }
+          return result;
+        },
+      },
+    };
+    return { io, requests, inverseRequests, mailUndos, get saved() { return saved!; }, get session() { return session; },
+      statuses: (value: typeof statuses) => { statuses = value; }, loseProgress: () => { loseProgress = true; }, loseUndo: () => { loseUndo = true; } };
+  }
+  {
+    const api = protocol(); let newCommands = 0, exactRetries = 0;
+    const record = new ZeroActionRecovery(journal(), api.io);
+    const originalRetry = async () => { exactRetries++; return reverse("category-a", "category-bc"); };
+    await record.begin(async () => { newCommands++; throw new InboxClassificationError("HOST_CATEGORY_ACK_PENDING", 1, 2, originalRetry, reverse("category-a")); });
+    assert.equal(api.session.progress.decidedCount, 1); assert.equal(record.complete, false); assert.equal(record.blocked, true); assert.equal(record.canUndo, true);
+    assert.deepEqual(api.requests[0].decisions.map(item => item.id), ["a"], "partial command counts only acknowledged conversations");
+    record.journal.session.paused = true; record.checkpoint(); // UI pause does not replace the runtime command closure.
+    await record.undo();
+    assert.equal(api.session.progress.decidedCount, 0); assert.equal(exactRetries, 0);
+    assert.deepEqual(api.mailUndos, [["category-a"]], "Undo targets only acknowledged receipts while later groups remain recoverable");
+    assert.equal(record.blocked, true); assert.deepEqual(record.journal.undoneIds, ["a"]);
+    await record.retry();
+    assert.equal(newCommands, 1); assert.equal(exactRetries, 1, "recovery invokes error.retry, not a new classify call");
+    assert.deepEqual(api.requests.at(-1)!.decisions.map(item => item.id), ["b", "c"], "retracted/previously credited prefixes are never credited again");
+    assert.equal(api.session.progress.decidedCount, 2); assert.equal(record.complete, true);
+  }
+  {
+    const api = protocol(); let originalRetries = 0;
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await record.begin(async () => { throw new InboxClassificationError("HOST_CATEGORY_ACK_PENDING", 1, 2,
+      async () => { originalRetries++; return reverse("category-a", "category-bc"); }, reverse("category-a")); });
+    const reloaded = new ZeroActionRecovery(restoreZeroRecovery(api.saved, initialSession())!, api.io);
+    await assert.rejects(reloaded.retry(), /replay is unavailable after reload/);
+    assert.equal(originalRetries, 0); assert.equal(api.session.progress.decidedCount, 1);
+    assert.equal(reloaded.canUndo, true); assert.deepEqual(reloaded.journal.selection.map(item => item.id), ["a", "b", "c"]);
+    await reloaded.undo();
+    assert.equal(api.session.progress.decidedCount, 0); assert.equal(reloaded.blocked, true, "unconfirmed original commands remain retained, never silently recreated");
+  }
+  {
+    const api = protocol(); let writes = 0;
+    api.loseProgress();
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await assert.rejects(record.begin(async () => { writes++; return reverse("category-all"); }), /Lost accepted progress/);
+    const exact = structuredClone(api.requests[0]);
+    const restored = restoreZeroRecovery(JSON.parse(JSON.stringify(api.saved)), initialSession());
+    assert.ok(restored); assert.equal(record.blocked, true);
+    const reloaded = new ZeroActionRecovery(restored!, api.io);
+    await reloaded.retry();
+    assert.equal(writes, 1); assert.deepEqual(api.requests[1], exact, "reload resumes the original approved progress ID and body");
+    assert.equal(api.session.progress.decidedCount, 3); assert.equal(reloaded.complete, true);
+    api.loseUndo();
+    await assert.rejects(reloaded.undo(), /Lost accepted Undo/);
+    const inverse = structuredClone(api.inverseRequests[0]);
+    const resumedUndo = new ZeroActionRecovery(restoreZeroRecovery(api.saved, initialSession())!, api.io);
+    await resumedUndo.retry();
+    assert.equal(api.mailUndos.length, 1, "reload of an acknowledged mail Undo does not issue it again");
+    assert.deepEqual(api.inverseRequests[1], inverse); assert.equal(api.session.progress.decidedCount, 0);
+  }
+  {
+    const api = protocol(); let writes = 0;
+    api.statuses({ b: "pending", c: "rejected" });
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await record.begin(async () => { writes++; return reverse("category-all"); });
+    const original = structuredClone(api.requests[0]);
+    assert.equal(record.complete, false); assert.equal(api.session.progress.decidedCount, 1);
+    api.statuses({ c: "rejected" }); await record.retry();
+    assert.equal(record.complete, false); assert.equal(api.session.progress.decidedCount, 2);
+    api.statuses({}); await record.retry();
+    assert.equal(record.complete, false, "a definitive rejected progress result never becomes a synthetic success"); assert.equal(writes, 1);
+    assert.equal(api.session.progress.decidedCount, 2);
+    assert.ok(api.requests.every(request => JSON.stringify(request) === JSON.stringify(original)), "accepted/pending/rejected results preserve one original body");
+    const foreign = { ...initialSession(), scopeKey: "different-scope" };
+    assert.equal(restoreZeroRecovery(api.saved, foreign), null, "captured recovery never widens to another scope");
+  }
+  {
+    const api = protocol();
+    const record = new ZeroActionRecovery(journal(), { ...api.io, save: () => false });
+    let writes = 0;
+    await assert.rejects(record.begin(async () => { writes++; return reverse("category-all"); }), /could not be saved/);
+    assert.equal(writes, 0, "storage failure before dispatch cannot create an unrecoverable new command");
+  }
+  {
+    type Item = import("../../shared/inbox-window").InboxZeroItem;
+    const items: Item[] = Array.from({ length: 50 }, (_, i) => ({ id: `batch-${i}`, eligibility: "eligible", batchEligibility: "eligible", reviewVersion: `opaque-${i}`,
+      batchCandidate: { id: `batch-${i}`, basis: "no-outstanding-work", membershipCount: 11, reviewVersion: `opaque-${i}` } }));
+    let remaining = [...items], server = { ...initialSession(), progress: { ...initialSession().progress, initialCount: 50, remainingCount: 50 } };
+    const mail = (item: Item): Mail => ({ ...inbox, id: item.id, messages: Array.from({ length: 11 }, (_, i) => ({ ...inbox.messages[0], id: `${item.id}-message-${i}`, pending: false,
+      memberships: [{ mailboxId: "box", messageId: `${item.id}-message-${i}`, revision: 1, done: false, snoozedUntil: null }] })) });
+    const posts: Input[] = [], readRequests: unknown[] = [], classifications: string[][] = [];
+    const read = async (input: Parameters<import("../../shared/inbox-window").InboxWindowTransport["zeroPage"]>[0]) => {
+      readRequests.push(input); return { session: server, items: remaining, nextCursor: null, exhausted: true };
+    };
+    assert.equal(boundedZeroBatch(items).length, 45, "50 safe conversations with 11 memberships offer a 495-membership prefix, not 550");
+    assert.throws(() => assertZeroMembershipBudget(items.map(mail)), /at most 500/, "runtime-expanded checked mail is rejected before classification");
+    await assert.rejects(revalidateZeroBatch({ sessionId: server.id, cursor: "original-captured-page" }, items, read), /membership budget/);
+    assert.equal(readRequests.length, 0, "an oversized edited list cannot even reach batch dispatch preparation");
+    while (remaining.length) {
+      const offered = boundedZeroBatch(remaining);
+      assertZeroMembershipBudget(offered.map(mail));
+      await revalidateZeroBatch({ sessionId: server.id, cursor: "original-captured-page" }, offered, read);
+      const captured: Journal = { ...journal(), session: server, selection: offered.map(item => ({ id: item.id, decision: "other", reviewVersion: item.reviewVersion! })) };
+      const record = new ZeroActionRecovery(captured, { save: () => true, session: next => { server = next; }, undoMail: async refs => refs,
+        transport: { zeroResume: async () => ({ status: "found", session: server }), zeroUndo: async () => ({ status: "accepted", session: server }),
+          zeroProgress: async input => {
+            assert.ok(input.decisions.reduce((sum, decision) => sum + items.find(item => item.id === decision.id)!.batchCandidate!.membershipCount, 0) <= 500, "every progress body stays within the unchanged host limit");
+            posts.push(structuredClone(input)); remaining = remaining.filter(item => !input.decisions.some(decision => decision.id === item.id));
+            server = { ...server, revision: server.revision + 1, progress: { ...server.progress, remainingCount: remaining.length, decidedCount: 50 - remaining.length } };
+            return { session: server, results: input.decisions.map(item => ({ id: item.id, status: "accepted" })), undo: { sessionId: server.id, progressId: input.id } };
+          } } });
+      await record.begin(async () => { classifications.push(offered.map(item => item.id)); return reverse(`bounded-command-${posts.length}`); });
+      assert.equal(record.complete, true);
+    }
+    assert.deepEqual(classifications.map(ids => ids.length), [45, 5]);
+    assert.deepEqual(posts.flatMap(post => post.decisions.map(item => item.id)), items.map(item => item.id), "the suffix remains available for the next confirmed batch, with no selected decisions discarded");
+    assert.equal(server.progress.decidedCount, 50);
+    assert.ok(readRequests.every(input => (input as { cursor: string }).cursor === "original-captured-page"), "fresh validation never recaptures or widens the queue");
+    const reserved = { ...items[0], batchEligibility: "ineligible" as const, batchCandidate: null };
+    assert.equal(boundedZeroBatch([reserved, ...items.slice(1)]).some(item => item.id === reserved.id), false, "persisted unchecked reservations never re-enter a later batch");
+  }
+  {
+    const scope = zeroScope("box", [], [{ id: "box", sourceId: "source", sourceGeneration: 1, name: "Box", email: "me@example.test", canSend: false }]);
+    const ai = { configured: true, settings: { enabled: true, revision: 2, model: "fixture-model", mode: "apply" } } as AiTriageState;
+    const decision: AiDecision = { sourceId: "source", threadId: "thread", revision: 1, settingsRevision: 2, state: "ready", mailboxIds: ["box"], messageIds: ["message"],
+      contextVersions: [{ messageId: "message", bodyRevision: "body-1" }], latestMessageId: "message", inputHash: "fixture-hash", model: "fixture-model", schemaVersion: AI_TRIAGE_VERSION, updatedAt: deadline, holdUntil: null,
+      assessment: { type: "newsletter", response: "not_needed", task: "none", actions: [], urgency: "none", deadline: null, topics: [], risk: "none_observed", certainty: "clear", reason: "Fictional quiet campaign", evidence: [{ messageRef: "m1", field: "type", quote: "Newsletter" }] },
+      score: { category: "Important", score: 55, reasons: [], contributions: [], version: "preference-2" }, override: null, problemCode: null };
+    const mail: Mail = { ...inbox, id: "box:thread", account: "box", mailboxId: "box", sourceId: "source", sdkThreadId: "thread", locations: ["Inbox"], attentionCategory: "Important", triage: decision,
+      messages: [{ ...inbox.messages[0], id: "message", bodyRevision: "body-1", revision: 1, nativeFolder: "inbox", outgoing: false,
+        memberships: [{ mailboxId: "box", messageId: "message", revision: 1, done: false, snoozedUntil: null }] }] };
+    const candidate = zeroBatchCandidate(mail, scope, ai, Date.parse(deadline))!; assert.ok(candidate);
+    const selected: import("../../shared/inbox-window").InboxZeroItem = { id: mail.id, eligibility: "eligible", batchEligibility: "eligible", reviewVersion: "opaque-same-content", batchCandidate: { ...candidate, reviewVersion: "opaque-same-content" } };
+    const changed = { ...mail, triage: { ...decision, revision: 2, assessment: { ...decision.assessment!, task: "required" as const } } };
+    assert.equal(zeroReviewVersion(changed, scope), zeroReviewVersion(mail, scope), "a new AI task receipt changes safety without changing the mail body/review identity");
+    assert.equal(zeroBatchCandidate(changed, scope, ai, Date.parse(deadline)), null);
+    let writes = 0, reads = 0;
+    for (const state of ["ineligible", "unknown"] as const) {
+      await assert.rejects((async () => {
+        await revalidateZeroBatch({ sessionId: initialSession().id, cursor: "frozen-page" }, [selected], async input => {
+          reads++; assert.equal(input.cursor, "frozen-page");
+          return { session: initialSession(), items: [{ ...selected, batchEligibility: state, batchCandidate: null }], nextCursor: null, exhausted: true };
+        });
+        writes++;
+      })(), /Review it individually/);
+    }
+    assert.equal(reads, 2); assert.equal(writes, 0, "task/stale/manual/unavailable fresh proof cannot reach automatic batch classification");
+    assert.equal(zeroEligible(changed, scope, Date.parse(deadline)), true, "the conversation remains available for an individual manual decision");
+  }
+  {
+    const api = protocol(); let writes = 0, saves = 0;
+    const raw = journal(); raw.selection[0].reviewVersion = JSON.stringify(["Private subject", "person@example.test", "snippet"]);
+    const record = new ZeroActionRecovery(raw, { ...api.io, save: () => { saves++; return true; } });
+    await assert.rejects(record.begin(async () => { writes++; return reverse("category-all"); }), /opaque cleanup review tokens/);
+    assert.equal(writes, 0); assert.equal(saves, 0, "legacy content-bearing host review versions never enter browser recovery storage");
+    assert.equal(restoreZeroRecovery(raw, initialSession()), null);
+  }
+  {
+    const api = protocol(); let writes = 0, replays = 0;
+    const command: import("../src/inbox.ts").InboxCommandRecovery = { version: 1, owner: null, sources: [{ sourceId: "source", generation: 1, mailboxIds: ["box"] }], kind: "mailbox-state",
+      input: { id: "frozen-done-command", done: true, targets: ["a", "b", "c"].map(messageId => ({ mailboxId: "box", messageId, revision: 1 })) }, status: "uncertain", before: [], accepted: [] };
+    const record = new ZeroActionRecovery(journal(), api.io);
+    await assert.rejects(record.begin(async sink => { sink(command); writes++; throw new TypeError("Lost original command acknowledgement"); }), /Lost original/);
+    const restored = restoreZeroRecovery(JSON.parse(JSON.stringify(api.saved)), initialSession()); assert.ok(restored);
+    const reloaded = new ZeroActionRecovery(restored!, { ...api.io, replayMail: async (captured, sink) => {
+      replays++; assert.deepEqual(captured, command, "reload hands the exact frozen command to the store, never fresh mail");
+      sink({ ...captured, status: "accepted" } as typeof command);
+      return Object.assign(async () => {}, { receipts: [{ kind: "mailbox-state" as const, id: command.input.id }] });
+    } });
+    assert.equal(replays, 0, "rehydration never dispatches a mail mutation");
+    await reloaded.retry(); assert.equal(replays, 1); assert.equal(writes, 1); assert.equal(reloaded.complete, true);
+    assert.equal(api.saved.command?.kind, "mailbox-state");
+  }
+  {
+    const input: Input = { sessionId: initialSession().id, id: "original-reservation", ifRevision: 1, decisions: [], reviewOnlyIds: ["a"] };
+    let saved: Input | null = null, sends = 0, acknowledged = false;
+    const requests: Input[] = [];
+    const persist = (value: Input | null) => { saved = structuredClone(value); return true; };
+    const send = async (value: Input): Promise<Result> => {
+      assert.deepEqual(saved, input, "checkbox exclusion is durable before the host call");
+      requests.push(structuredClone(value));
+      if (++sends === 1) throw new TypeError("Lost reservation acknowledgement");
+      acknowledged = true; return { session: { ...initialSession(), revision: 2 }, results: [], undo: null };
+    };
+    await assert.rejects(confirmZeroReservation(input, persist, send), /Lost reservation/);
+    assert.deepEqual(saved, input); assert.equal(acknowledged, false);
+    await confirmZeroReservation(JSON.parse(JSON.stringify(saved)), persist, send);
+    assert.equal(saved, null); assert.equal(acknowledged, true); assert.deepEqual(requests[0], requests[1], "reload replays the same reservation ID/body instead of silently losing unchecked IDs");
+    await assert.rejects(confirmZeroReservation(input, () => false, send), /could not be saved/);
+    assert.equal(sends, 2, "a reservation storage failure blocks dispatch and dependent decisions");
+  }
+  {
+    const ids = Array.from({ length: ZERO_QUEUE_LIMIT }, (_, index) => `legacy-${index}`);
+    const original = [...ids], requests: string[][] = [];
+    const first = await legacyZeroPage(ids, 0, 1, async wanted => { requests.push(wanted); return []; });
+    const second = await legacyZeroPage(ids, first.next, 1, async wanted => { requests.push(wanted); throw new Error("Captured eligibility unknown"); });
+    assert.ok(second.error); assert.equal(second.next, 200);
+    const found = { ...inbox, id: ids[230] };
+    const third = await legacyZeroPage(ids, second.next, 1, async wanted => { requests.push(wanted); return [found]; });
+    assert.deepEqual(third.rows, [found]); assert.ok(requests.every(request => request.length === 100));
+    const last = await legacyZeroPage(ids, ids.length - 10, 1, async wanted => { requests.push(wanted); return []; });
+    assert.equal(last.exhausted, true); assert.equal(last.rows.length, 0);
+    assert.deepEqual(ids, original, "unavailable pages and captured-ID exhaustion never truncate the legacy queue or credit decisions");
+    const previous = await legacyZeroPage(ids, 230, -1, async wanted => { requests.push(wanted); return []; });
+    assert.equal(previous.next, 130); assert.equal(previous.requested[0], ids[230]);
+  }
+});
+
+test("bounded host windows expose only the active server view and retain unknown totals", () => {
+  const base = inbox;
+  const pinned = { ...base, id: "pinned", folder: "Done", split: "Other" };
+  const active = { ...base, id: "active", split: "Other", unread: false };
+  const window = { keys: [active.id], totals: { conversations: null, messages: null, inbox: null, splits: { Important: null, Other: null }, folders: {}, holding: null } };
+  const view = selectMailView([pinned, active], base.account, "Inbox", "Important", { ...defaultPreferences, hideEmptySplits: true }, false, "", "Unread", undefined, false, window);
+  assert.deepEqual(view.visibleMail, [active], "host predicate wins over partial local flags and inactive/pinned rows never enter the view");
+  assert.equal(view.inboxCount, null);
+  assert.equal(view.splitCounts.Important, null);
+  assert.ok(view.shownSplits.includes("Other"), "an unknown split is not an empty split");
+});
+
 test("sender host extraction normalizes IDNs without accepting URLs, extra addresses or IP literals", () => {
   assert.equal(senderHostname("mail@em1.Cloudflare.com"), "em1.cloudflare.com");
   assert.equal(senderHostname("mail@bücher.de"), "xn--bcher-kva.de");
@@ -1662,4 +5056,67 @@ test("sender host extraction normalizes IDNs without accepting URLs, extra addre
   for (const address of ["a@b@cloudflare.com", "Cloudflare <mail@cloudflare.com>", "a@cloudflare.com/path", "a@cloudflare.com?x=1", "a@cloudflare.com:443", "a@127.0.0.1", "a@[::1]", "a@localhost"]) {
     assert.equal(senderHostname(address), null, address);
   }
+});
+
+test("Important bulk Done freezes its own unfiltered query, pages beyond 500 rows, and preserves changed mail and Undo", async () => {
+  const { ImportantDoneRun } = await import("../src/important-done.ts");
+  const total = 1002, acted: string[] = [], undone: string[] = [];
+  let capturedQuery: unknown, captures = 0;
+  const selection = { id: "frozen", account: "unified", scopeKey: "scope", revision: 1, count: total, captureComplete: true };
+  const run = new ImportantDoneRun({
+    windowTransport: {
+      query: async (input: unknown) => { capturedQuery = input; return { state: { queryId: "important-only" } }; },
+      selectionCreate: async (input: { queryId: string }) => { captures++; assert.equal(input.queryId, "important-only"); return selection; },
+      selectionPage: async ({ cursor, limit }: { cursor?: string; limit: number }) => {
+        assert.equal(limit, 1); const n = Number(cursor ?? 0);
+        return { selection, entries: n === 500 ? [{ id: String(n), status: "changed" }] : [{ id: String(n), status: "found", row: {
+          mail: { ...seedMail[0], id: String(n) }, counts: {}, messagesComplete: false,
+          targets: [{ mailboxId: "box", messageId: `message-${n}`, revision: 7 }], targetsComplete: true,
+          actionContextComplete: false, contextVersion: "captured",
+        } }], nextCursor: n + 1 < total ? String(n + 1) : null, exhausted: n + 1 === total };
+      },
+    },
+    action: async (mails: Mail[], action: string) => { assert.equal(action, "done"); assert.equal(mails.length, 1); assert.equal(mails[0].window?.targets[0].revision, 7); acted.push(mails[0].id); return async () => { undone.push(mails[0].id); }; },
+  } as never, "unified");
+  assert.equal(await run.prepare(), true); assert.equal(acted.length, 0);
+  assert.deepEqual(capturedQuery, { account: "unified", folder: "Inbox", split: "Important", search: false, query: "", filter: null, limit: 1 });
+  await run.run(() => {}); assert.equal(captures, 1); assert.equal(run.completed, 1001); assert.equal(run.changed, 1);
+  assert.equal(acted.includes("500"), false); assert.equal(run.finished, true);
+  await run.undo(); assert.deepEqual(undone, [...acted].reverse());
+});
+
+test("Important bulk Done retries the original uncertain receipt without recapturing or crediting pending work", async () => {
+  const { ImportantDoneRun } = await import("../src/important-done.ts");
+  const selection = { id: "frozen", account: "box", scopeKey: "scope", revision: 1, count: 1, captureComplete: true };
+  const plan = { kind: "mailbox-state", status: "uncertain", input: { id: "same-command" } };
+  let pages = 0, actions = 0, replayed = 0, undos = 0;
+  const run = new ImportantDoneRun({
+    windowTransport: {
+      query: async () => ({ state: { queryId: "query" } }), selectionCreate: async () => selection,
+      selectionPage: async () => { pages++; return { selection, exhausted: true, nextCursor: null, entries: [{ status: "found", row: { mail: seedMail[0], targets: [], targetsComplete: true } }] }; },
+    },
+    action: async (_m: unknown, _a: unknown, _v: unknown, sink: (p: unknown) => void) => { actions++; sink(plan); throw new Error("Lost acknowledgement"); },
+    replayCommand: async (saved: unknown) => { assert.strictEqual(saved, plan); replayed++; return async () => { undos++; }; },
+  } as never, "box");
+  await run.prepare(); await assert.rejects(run.run(() => {}), /Lost acknowledgement/);
+  assert.equal(run.completed, 0); assert.equal(run.finished, false);
+  await run.run(() => {}); assert.equal(actions, 1); assert.equal(replayed, 1); assert.equal(pages, 1); assert.equal(run.completed, 1);
+  await run.undo(); assert.equal(undos, 1);
+});
+
+test("Important bulk Done keeps the same query and capture ID while the host prepares", async () => {
+  const { ImportantDoneRun } = await import("../src/important-done.ts");
+  let queries = 0; const captures: any[] = [];
+  const run = new ImportantDoneRun({ windowTransport: {
+    query: async () => { queries++; return { state: { queryId: "fixed-query" } }; },
+    selectionCreate: async (input: any) => {
+      captures.push(input);
+      if (captures.length === 1) throw Object.assign(new Error("Preparing"), { code: "HOST_INBOX_PREPARING" });
+      return { id: input.id, count: 0, captureComplete: true };
+    },
+  } } as never, "unified");
+  assert.equal(await run.prepare(), false);
+  assert.equal(await run.prepare(), true);
+  assert.equal(queries, 1);
+  assert.deepEqual(captures[0], captures[1]);
 });

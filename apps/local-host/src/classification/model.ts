@@ -1,4 +1,5 @@
 import { preprocessingVersion, sourceFactKeys, taxonomy, taxonomyVersion, validateClassificationInput, type Classification, type ClassificationInput } from './schema'
+import { hasCurrentText } from './source'
 
 type EmailType = Classification['primaryType']
 type Action = Classification['actions'][number]
@@ -41,6 +42,10 @@ export type Model = {
 }
 export type Prediction = {
   primaryType: EmailType
+  rawPrimaryType: EmailType
+  /** Source/training support before any selectable score threshold is applied. */
+  eligible: boolean
+  eligibleActions: Action[]
   /** Winning pre-abstention softmax score, NOT the probability of the returned label. */
   typeScore: number
   actions: Action[]
@@ -136,7 +141,7 @@ function lexical(input: ClassificationInput): Array<Map<number, number>> {
   })
 }
 
-type Features = { indices: Uint16Array; values: Float32Array; knownFraction: number; known: number }
+type Features = { indices: Uint16Array; values: Float32Array; knownFraction: number; known: number; grounded: boolean }
 function features(input: ClassificationInput, dimensions: number, vocabulary: Set<number>): Features {
   const fields = lexical(input), all = new Set(fields.flatMap(field => [...field.keys()]))
   const known = [...all].filter(id => vocabulary.has(id)).length
@@ -156,7 +161,7 @@ function features(input: ClassificationInput, dimensions: number, vocabulary: Se
   values.set(0, 1)
   values.set(1, input.bodyTruncated ? 0.25 : 0)
   sourceFactKeys.forEach((key, index) => { if (typeof input.facts[key] === 'boolean') values.set(index + 2, input.facts[key] ? 0.25 : -0.25) })
-  return { indices: Uint16Array.from(values.keys()), values: Float32Array.from(values.values()), knownFraction: all.size ? known / all.size : 0, known }
+  return { indices: Uint16Array.from(values.keys()), values: Float32Array.from(values.values()), knownFraction: all.size ? known / all.size : 0, known, grounded: hasCurrentText(input) }
 }
 
 function dot(weights: number[], vector: Features): number {
@@ -185,17 +190,18 @@ function random(seed: number): () => number {
 
 function rawPrediction(model: Model, vector: Features) {
   const scores = softmax(model.weights.types, vector), winner = scores.indexOf(Math.max(...scores)), label = types[winner]
-  const grounded = vector.known > 0 && vector.knownFraction >= model.hyperparameters.minimumKnownFraction
+  const grounded = vector.grounded && vector.known > 0 && vector.knownFraction >= model.hyperparameters.minimumKnownFraction
   const eligible = grounded && label !== 'unknown' && model.training.types[label] >= model.hyperparameters.minimumClassSamples && types.filter(type => model.training.types[type] > 0).length >= 2
   const actionScores = mapActions(action => sigmoid(dot(model.weights.actions[actions.indexOf(action)], vector)))
   return { label, typeScore: scores[winner], actionScores, grounded, eligible }
 }
 function prediction(model: Model, raw: ReturnType<typeof rawPrediction>): Prediction {
-  const abstained = !raw.eligible || raw.typeScore < model.thresholds.type
-  const abstainedActions = actions.filter(action => !raw.grounded || model.selection.actions[action].method === 'disabled' || model.thresholds.actions[action] > 1 ||
-    model.training.actions[action].positive < model.hyperparameters.minimumClassSamples || model.training.actions[action].negative < model.hyperparameters.minimumClassSamples)
+  const abstained = !raw.eligible || model.selection.type.method === 'disabled' || raw.typeScore < model.thresholds.type
+  const eligibleActions = actions.filter(action => raw.grounded && model.training.actions[action].positive >= model.hyperparameters.minimumClassSamples && model.training.actions[action].negative >= model.hyperparameters.minimumClassSamples)
+  const abstainedActions = actions.filter(action => !eligibleActions.includes(action) || model.selection.actions[action].method === 'disabled' || model.thresholds.actions[action] > 1)
   return {
     primaryType: abstained ? 'unknown' : raw.label,
+    rawPrimaryType: raw.label, eligible: raw.eligible, eligibleActions,
     typeScore: raw.typeScore,
     actions: actions.filter(action => !abstainedActions.includes(action) && raw.actionScores[action] >= model.thresholds.actions[action]),
     actionScores: raw.actionScores,
@@ -384,10 +390,18 @@ export function validateModel(value: unknown): Model {
     }
   }
   if (value.selection.targetPrecision !== 0.9 || value.selection.minimumAccepted !== 20 || !object(value.selection.actions)) return invalid()
-  const selections = [value.selection.type, ...actions.map(label => (value.selection as Model['selection']).actions[label])]
-  for (const selection of selections) {
+  const training = value.training as Distribution, validation = value.validation as Distribution
+  const selections = [{ value: value.selection.type, threshold: value.thresholds.type, positives: types.reduce((sum, label) => sum + (label !== 'unknown' && training.types[label] >= 3 ? validation.types[label] : 0), 0) },
+    ...actions.map(label => ({ value: (value.selection as Model['selection']).actions[label], threshold: (value.thresholds as Model['thresholds']).actions[label], positives: validation.actions[label].positive }))]
+  for (const { value: selection, threshold, positives } of selections) {
     if (!object(selection) || !['validation', 'conservative_default', 'disabled'].includes(selection.method as string) ||
-      !(selection.accepted === null || count(selection.accepted)) || !(selection.precision === null || bounded(selection.precision, 0, 1))) return invalid()
+      Object.keys(selection).length !== 3 || !(selection.accepted === null || count(selection.accepted) && selection.accepted <= validation.samples) || !(selection.precision === null || bounded(selection.precision, 0, 1))) return invalid()
+    if (selection.method === 'disabled' ? threshold !== 1.01 || selection.accepted !== 0 || selection.precision !== null : (threshold as number) > 1) return invalid()
+    if (selection.accepted === null ? selection.method !== 'conservative_default' || selection.precision !== null : selection.accepted === 0 ? selection.precision !== null : selection.precision === null) return invalid()
+    if (typeof selection.accepted === 'number' && typeof selection.precision === 'number') {
+      const correct = selection.accepted * selection.precision
+      if (correct > positives + 1e-8 || Math.abs(correct - Math.round(correct)) > 1e-8) return invalid()
+    }
     if (selection.method === 'validation' && (!count(selection.accepted) || selection.accepted < 20 || !bounded(selection.precision, 0.9, 1))) return invalid()
   }
   for (const name of ['type', 'actions']) {

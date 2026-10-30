@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type RefObject,
 } from "react";
 import Composer from "./Composer";
 import MessageBody, { type MessageCanvasColor } from "./MessageBody";
@@ -16,14 +17,19 @@ import {
   type Preferences,
   type SendOptions,
   type MailboxOption,
+  type LoadSendingIdentities,
 } from "./data";
 import "./message.css";
 import "./thread-comments.css";
 import { plainText } from "./mail-text";
 import { readText, writeText } from "./storage";
+import { unsubscribeMessage } from "./unsubscribe";
 import { getQuickReplies } from "./quick-replies";
 import type { AiDecision, AiFeedbackInput, AiReadingInput } from "../../shared/ai-triage";
 import ConversationTriage from "./ConversationTriage";
+import ConversationCategory from "./ConversationCategory";
+import { currentCategoryOverride } from "./mail-model";
+import type { AttentionCategory } from "../../shared/attention-overrides";
 import { useReadingEngagement } from "./use-reading-engagement";
 
 type ThreadComment = {
@@ -64,6 +70,8 @@ function messageCanvasStyle(background: MessageCanvasColor): CSSProperties {
 }
 
 type ThreadViewProps = {
+  scrollRef?: RefObject<HTMLDivElement | null>;
+  onSequenceKey?: (event: KeyboardEvent) => void;
   mail: Mail;
   draft?: Draft;
   replyRequest?: number;
@@ -71,10 +79,17 @@ type ThreadViewProps = {
   preferences: Preferences;
   account: string;
   accounts: MailboxOption[];
+  loadSendingIdentities: LoadSendingIdentities;
   contacts: Array<{ name: string; email: string }>;
+  loadContacts?: (query: string) => Promise<Array<{ name: string; email: string }>>;
+  onLoadMessage?: (id: string) => Promise<void>;
+  onLoadOlder?: () => Promise<void>;
+  onResetHistory?: () => Promise<void>;
+  onPinMessages?: (ids: readonly string[]) => void;
   onBack: () => void;
   onNavigate: (delta: number) => void;
   onAction: (action: string) => void;
+  onUnsubscribe: (messageId: string) => void;
   supportsAction: (action: string) => boolean;
   onCompose: (mode: "reply" | "replyAll" | "forward", popOut?: boolean, sourceMessageId?: string) => void;
   onDraftChange: (draft: Draft) => void;
@@ -88,12 +103,15 @@ type ThreadViewProps = {
   aiDecision?: AiDecision;
   aiEnabled?: boolean;
   aiMode?: "preview" | "apply";
+  onCategory?: (category: AttentionCategory) => Promise<() => Promise<void>>;
   onAiFeedback?: (input: AiFeedbackInput) => Promise<AiDecision>;
   onAiReading?: (input: AiReadingInput) => Promise<void>;
   aiReadingEnabled?: boolean;
 };
 
 export default function ThreadView({
+  scrollRef,
+  onSequenceKey,
   mail,
   draft,
   replyRequest = 0,
@@ -101,10 +119,17 @@ export default function ThreadView({
   preferences,
   account,
   accounts,
+  loadSendingIdentities,
   contacts,
+  loadContacts,
+  onLoadMessage,
+  onLoadOlder,
+  onResetHistory,
+  onPinMessages,
   onBack,
   onNavigate,
   onAction,
+  onUnsubscribe,
   supportsAction,
   onCompose,
   onDraftChange,
@@ -118,10 +143,12 @@ export default function ThreadView({
   aiDecision,
   aiEnabled = false,
   aiMode = "preview",
+  onCategory,
   onAiFeedback,
   onAiReading,
   aiReadingEnabled = false,
 }: ThreadViewProps) {
+  const explicitCategory = mail.window ? mail.attentionOverride?.override?.category : currentCategoryOverride(mail, mail.attentionOverride?.override)?.category;
   const [expanded, setExpanded] = useState<string[]>([
     messageKey(mail.messages.at(-1)),
   ]);
@@ -135,10 +162,24 @@ export default function ThreadView({
   const entryReplyRequest = useRef(replyRequest);
   const popOut = draft?.popOut === true;
   const [snippetRequest, setSnippetRequest] = useState(0);
-  const [unsubscribed, setUnsubscribed] = useState(
-    () => readText(`unsubscribed:${mail.email}`) === "true",
-  );
-  const scroller = useRef<HTMLDivElement>(null);
+  const ownScroller = useRef<HTMLDivElement>(null);
+  const scroller = scrollRef ?? ownScroller;
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const historyRequest = useRef(0);
+  const messageCount = mail.window ? mail.window.counts.messages : mail.messages.length;
+  useEffect(() => {
+    if (!mail.window || !onLoadMessage || !scroller.current) return;
+    const missing = new Set(mail.messages.filter(message => message.loaded === false).map(message => message.id));
+    const observer = new IntersectionObserver(entries => {
+      for (const entry of entries) if (entry.isIntersecting) {
+        const id = (entry.target as HTMLElement).dataset.threadMessage;
+        if (id && missing.delete(id)) void onLoadMessage(id).catch(() => {});
+      }
+    }, { root: scroller.current, rootMargin: "200px" });
+    for (const element of scroller.current.querySelectorAll(".thread-message.is-expanded")) observer.observe(element);
+    return () => observer.disconnect();
+  }, [mail, expanded, onLoadMessage]);
   const readerPane = useRef<HTMLElement>(null);
   const messageColumn = useRef<HTMLDivElement>(null);
   const backGutter = useRef<HTMLButtonElement>(null);
@@ -178,6 +219,7 @@ export default function ThreadView({
     onReading: onAiReading,
   });
   const marketing = !mail.sourceId && ["Basecamp", "Mail Me Later"].includes(mail.from);
+  const unsubscribeTarget = unsubscribeMessage(mail, account);
   const conversationLink = new URL(location.href);
   const linkParams = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
   linkParams.set("account", account);
@@ -292,6 +334,13 @@ export default function ThreadView({
     node?.scrollIntoView({ block: "end", behavior: "auto" });
   }, [replyFocusKey, replyResult?.id, draft?.id]);
 
+  useLayoutEffect(() => {
+    historyRequest.current++;
+    setHistoryLoading(false); setHistoryError("");
+    return () => { historyRequest.current++; onPinMessages?.([]); };
+  }, [mail.id, onPinMessages]);
+  useLayoutEffect(() => { reportMessagePins(); }, [mail.messages, expanded, draft?.sourceMessageId, onPinMessages]);
+
   useEffect(() => {
     if (draft && !popOut) reply.current?.scrollIntoView({ block: "nearest" });
   }, [draft?.id, popOut]);
@@ -310,12 +359,14 @@ export default function ThreadView({
     scrollToMessage.current = "";
   }, [expanded]);
 
-  function messageLinks(root: ParentNode): HTMLAnchorElement[] {
+  function messageLinks(root: ParentNode, includeDisclosures = false): HTMLElement[] {
     const elements = root.querySelectorAll<HTMLAnchorElement | HTMLIFrameElement>(
       '.thread-body a[href]:not([aria-disabled="true"]), .message-html-frame, .thread-attachments a[href]:not([aria-disabled="true"])',
     );
+    const inFrame = 'a[href]:not([aria-disabled="true"])'
+      + (includeDisclosures ? ', details[data-inbox-disclosure] > summary' : '');
     return Array.from(elements).flatMap(element => element.tagName === "IFRAME"
-      ? Array.from((element as HTMLIFrameElement).contentDocument?.querySelectorAll<HTMLAnchorElement>('a[href]:not([aria-disabled="true"])') ?? [])
+      ? Array.from((element as HTMLIFrameElement).contentDocument?.querySelectorAll<HTMLElement>(inFrame) ?? [])
       : [element as HTMLAnchorElement]).filter(link => link.getClientRects().length > 0);
   }
 
@@ -360,8 +411,8 @@ export default function ThreadView({
     } else if (command && !event.shiftKey && key === ";") {
       setSnippetRequest((request) => request + 1);
       onCompose("reply");
-    } else if (command && !event.shiftKey && key === "u" && marketing) {
-      unsubscribe();
+    } else if (command && !event.shiftKey && key === "u" && unsubscribeTarget) {
+      onUnsubscribe(unsubscribeTarget.id);
     } else if (command && !event.shiftKey && key === "o") {
       const links = messageLinks(scroller.current);
       const focusedLink = target?.closest<HTMLAnchorElement>("a[href]");
@@ -443,7 +494,7 @@ export default function ThreadView({
           behavior: "auto",
         });
       } else if (key === "tab" && focusedMessage) {
-        const links = messageLinks(focusedMessage);
+        const links = messageLinks(focusedMessage, true);
         const index = links.indexOf(target as HTMLAnchorElement);
         const next =
           index >= 0 ? links[index + (event.shiftKey ? -1 : 1)] : undefined;
@@ -465,10 +516,12 @@ export default function ThreadView({
   function bodyKeyboard(event: KeyboardEvent, id: string) {
     const article = scroller.current?.querySelector<HTMLElement>(`[data-thread-message="${CSS.escape(id)}"]`);
     if (!article) return;
+    onSequenceKey?.(event);
+    if (event.defaultPrevented) return;
     shortcut(event, article);
     if (event.defaultPrevented || event.key === "Tab") return;
     const target = event.target as HTMLElement | null;
-    if (["Enter", " "].includes(event.key) && target?.closest?.("a, button")) return;
+    if (["Enter", " "].includes(event.key) && target?.closest?.("a, button, summary")) return;
     const forwarded = new KeyboardEvent("keydown", {
       key: event.key, code: event.code, altKey: event.altKey, ctrlKey: event.ctrlKey,
       metaKey: event.metaKey, shiftKey: event.shiftKey, repeat: event.repeat,
@@ -476,6 +529,23 @@ export default function ThreadView({
     });
     article.dispatchEvent(forwarded);
     if (forwarded.defaultPrevented) event.preventDefault();
+  }
+
+  function reportMessagePins() {
+    const keys = new Set([...expanded, activeMessage.current]);
+    onPinMessages?.(mail.messages.filter(message => keys.has(messageKey(message)) || message.id === draft?.sourceMessageId).map(message => message.id));
+  }
+
+  function loadHistory(reset = false) {
+    const load = reset ? onResetHistory : onLoadOlder;
+    if (!load) return;
+    reportMessagePins(); // Include focus/expansion from this event before the request captures its scope.
+    const request = ++historyRequest.current;
+    setHistoryLoading(true); setHistoryError("");
+    void load().catch(error => {
+      if (request === historyRequest.current && !(error instanceof DOMException && error.name === "AbortError"))
+        setHistoryError(error instanceof Error ? error.message : "Could not load conversation history.");
+    }).finally(() => { if (request === historyRequest.current) setHistoryLoading(false); });
   }
 
   function revealMessage(id: string) {
@@ -493,15 +563,6 @@ export default function ThreadView({
         ? [messageKey(mail.messages.at(-1))]
         : mail.messages.map(messageKey),
     );
-  }
-
-  function unsubscribe() {
-    setUnsubscribed(true);
-    try {
-      writeText(`unsubscribed:${mail.email}`, "true");
-    } catch {
-      /* Keep the subscription state for this session. */
-    }
   }
 
   function setPopOut(value: boolean) {
@@ -602,19 +663,19 @@ export default function ThreadView({
           </div>
         </div>
         <div className="message-column thread-toolbar">
-          {aiEnabled && <ConversationTriage
+          {explicitCategory && onCategory ? <ConversationCategory category={explicitCategory} onChange={onCategory} disabled={!supportsAction("done")} /> : aiEnabled && <ConversationTriage
             key={JSON.stringify([mail.sourceId, mail.sdkThreadId])}
             decision={aiDecision?.sourceId === mail.sourceId && aiDecision?.threadId === mail.sdkThreadId ? aiDecision : undefined}
             mode={aiMode}
             onFeedback={onAiFeedback}
           />}
-          {marketing && (
+          {unsubscribeTarget && (
             <button
               className="thread-unsubscribe"
-              title="Unsubscribe (Cmd+U)"
-              onClick={unsubscribe}
+              title="Unsubscribe (⌘U)"
+              onClick={() => onUnsubscribe(unsubscribeTarget.id)}
             >
-              {unsubscribed ? "Unsubscribed" : "Unsubscribe"}
+              Unsubscribe
             </button>
           )}
           {!!mail.mailboxNames?.length && <div className="thread-mailbox-origin" title={mail.mailboxNames.join(", ")}>{mail.mailboxNames[0]}{mail.mailboxNames.length > 1 ? ` +${mail.mailboxNames.length - 1} mailboxes` : ""}</div>}
@@ -650,9 +711,14 @@ export default function ThreadView({
               {mail.operationId && <button type="button" className="text-button" onClick={() => onAction("cancel")}>Cancel send</button>}
             </div>
           )}
-          {mail.messages.length > 1 && (
+          {mail.window && (!mail.window.messagesComplete && !mail.historyExhausted && onLoadOlder || mail.historyTruncated && onResetHistory || historyError || mail.historyError) && <div role="status">
+            {!mail.window.messagesComplete && !mail.historyExhausted && onLoadOlder && <button type="button" className="text-button" disabled={historyLoading} onClick={() => loadHistory()}>{historyLoading ? "Loading history…" : "Load more messages"}</button>}
+            {mail.historyTruncated && onResetHistory && <> <button type="button" className="text-button" disabled={historyLoading} onClick={() => loadHistory(true)}>Show recent messages</button></>}
+            {(historyError || mail.historyError) && <span role="alert">{historyError || mail.historyError}</span>}
+          </div>}
+          {(messageCount === null || messageCount > 1) && (
             <div className="thread-conversation-controls">
-              <span>{mail.messages.length} messages</span>
+              <span>{messageCount ?? "…"} messages</span>
               <button
                 type="button"
                 title="Expand or collapse all (Shift+O)"
@@ -684,10 +750,10 @@ export default function ThreadView({
                 style={canvas ? messageCanvasStyle(canvas) : undefined}
                 tabIndex={-1}
                 onFocusCapture={() => {
-                  activeMessage.current = key;
+                  activeMessage.current = key; reportMessagePins();
                 }}
                 onPointerDownCapture={() => {
-                  activeMessage.current = key;
+                  activeMessage.current = key; reportMessagePins();
                 }}
                 className={`thread-message ${open ? "is-expanded" : "is-collapsed"} ${index === mail.messages.length - 1 ? "is-final" : ""}`}
                 aria-label={`Message from ${message.from}`}
@@ -704,7 +770,7 @@ export default function ThreadView({
                     }}
                   >
                     <strong>{sent ? "Me" : message.from}</strong>
-                    <span>{message.bodyFormat === "text" ? message.bodyText : plainText(message.body)}</span>
+                    <span>{message.loaded === false ? message.preview : message.bodyFormat === "text" ? message.bodyText : plainText(message.body)}</span>
                     <time dateTime={message.receivedAt} title={message.receivedAt ? new Date(message.receivedAt).toLocaleString() : message.date}>{message.date}</time>
                     <Icon name="ChevronDown" size={12} />
                   </button>
@@ -833,7 +899,7 @@ export default function ThreadView({
                         text={message.bodyText}
                         format={message.bodyFormat}
                         fontSize={preferences.fontSize}
-                        onActivate={() => { activeMessage.current = key; }}
+                        onActivate={() => { activeMessage.current = key; reportMessagePins(); }}
                         onKeyboard={event => bodyKeyboard(event, message.id)}
                         onImageSettings={onImageSettings}
                         onCanvasColor={color => setMessageCanvases(all => {
@@ -968,7 +1034,9 @@ export default function ThreadView({
                       snippetRequest={snippetRequest}
                       preferences={preferences}
                       accounts={accounts}
+                      loadSendingIdentities={loadSendingIdentities}
                       contacts={contacts}
+                      loadContacts={loadContacts}
                       onChange={onDraftChange}
                       onSearch={onSearch}
                       onToggleFocus={onToggleFocus}

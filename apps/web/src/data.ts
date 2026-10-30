@@ -1,6 +1,9 @@
-import type { MailboxMembership } from "inbox-sdk/types";
+import type { MailboxMembership, MailFacts, SendingIdentities } from "inbox-sdk/types";
 import type { AttentionDecision } from "../../shared/mail-attention";
 import type { AiDecision, AiCategory } from "../../shared/ai-triage";
+import type { CategoryEntry } from "../../shared/attention-overrides";
+
+export type LoadSendingIdentities = (mailboxId: string, input?: { refresh?: boolean }) => Promise<SendingIdentities>;
 
 export { readSaved as loadSaved } from "./storage.ts";
 
@@ -17,6 +20,8 @@ export type Message = {
   from: string;
   email: string;
   to: string;
+  /** SDK-derived display excerpt; shown in collapsed thread rows until the body is loaded. */
+  preview?: string;
   cc?: string;
   bcc?: string;
   date: string;
@@ -41,6 +46,8 @@ export type Message = {
   isStarred?: boolean;
   memberships?: MailboxMembership[];
   attention?: AttentionDecision;
+  /** Body-free source evidence; `listUnsubscribe` is the actionable unsubscribe signal. */
+  facts?: MailFacts;
 };
 export type Mail = {
   id: string;
@@ -48,6 +55,8 @@ export type Mail = {
   from: string;
   email: string;
   to: string;
+  /** Actual To header addresses, never receiving-mailbox ownership or Cc/Bcc. */
+  toAddresses?: string[];
   subject: string;
   snippet: string;
   date: string;
@@ -58,16 +67,30 @@ export type Mail = {
   starred: boolean;
   labels: string[];
   messages: Message[];
+  /** Host-authoritative aggregate and captured-context provenance; never inferred from a preview. */
+  window?: Pick<import("../../shared/inbox-window").InboxWindowRow, "counts" | "messagesComplete" | "targets" | "targetsComplete" | "actionContextComplete" | "contextVersion">;
+  hasAttachments?: boolean;
+  historyExhausted?: boolean;
+  /** Client-only bounded history recovery, never host action provenance. */
+  historyTruncated?: boolean;
+  historyError?: string;
   triage?: AiDecision;
   /** A validated, opted-in local decision; never a provider folder mutation. */
   attentionCategory?: AiCategory;
+  /** Explicit captured-context choice, independent of AI opt-in. */
+  attentionOverride?: CategoryEntry;
+  sourceGeneration?: number;
   aiHoldUntil?: number;
   opened?: string;
   muted?: boolean;
   reminder?: string;
   scheduled?: string;
   reminderAt?: number;
+  /** Due instant of a reminder that has returned this conversation to Inbox; it sorts and dates by this until newer mail or an explicit action. */
+  remindedAt?: number;
   receivedAt?: number;
+  /** Latest awake incoming inbox message across the full selected conversation. */
+  importantReceivedAt?: number | null;
   sourceId?: string;
   mailboxId?: string;
   sdkThreadId?: string;
@@ -77,6 +100,8 @@ export type Mail = {
   mailboxIds?: string[];
   mailboxNames?: string[];
 };
+/** Commands freeze metadata/receiving context, never retained reader body graphs. */
+export const captureActionMail = (mail: Mail): Mail => ({ ...mail, messages: mail.messages.map(message => ({ ...message, body: "", bodyText: undefined, bodyDocument: undefined, attachments: undefined, loaded: false })) });
 export type Draft = {
   id: string;
   account: string;
@@ -96,15 +121,18 @@ export type Draft = {
   saving?: boolean;
   dirty?: boolean;
   saveError?: string;
+  sendError?: { message: string; code: string };
   from?: string;
 };
 export type MailboxOption = {
   id: string;
   sourceId: string;
+  sourceGeneration?: number;
   name: string;
   email: string;
   canSend: boolean;
   selectorKind?: "all" | "domain" | "address";
+  selectorValue?: string;
 };
 export type SendOptions = { instant?: boolean; markDone?: boolean };
 export type Preferences = {
@@ -132,9 +160,10 @@ export type Preferences = {
 };
 
 export const accounts = ["mira@example.test", "noah@example.test"];
-export const folders = [
+/** Name, shortcut key, icon, and the provider capability a source must expose for the folder to be offered (empty: always). */
+export const folders: ReadonlyArray<readonly [name: string, key: string, icon: string, capability?: "star" | "folders" | "trash"]> = [
   ["Inbox", "i", "Inbox"],
-  ["Starred", "s", "Star"],
+  ["Starred", "s", "Star", "star"],
   ["Drafts", "d", "PencilSquircle"],
   ["Sent", "t", "Send"],
   ["Done", "e", "Check"],
@@ -143,8 +172,8 @@ export const folders = [
   ["Reminders", "h", "Clock"],
   ["Muted", "m", "Envelope"],
   ["Snippets", ";", "Snippet"],
-  ["Spam", "!", "Shield"],
-  ["Trash", "#", "Trash"],
+  ["Spam", "!", "Shield", "folders"],
+  ["Trash", "#", "Trash", "trash"],
   ["All Mail", "a", "Envelope"],
 ];
 export const defaultPreferences: Preferences = {

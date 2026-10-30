@@ -16,6 +16,7 @@ export type SettingsProps = {
   preferences: Preferences;
   onChange: (patch: Partial<Preferences>) => void;
   onClose: () => void;
+  onSectionChange?: (section: string) => void;
   initialPage?: string;
   jumpRequest?: number;
   onExitGuardChange?: (guard: (() => boolean) | null) => void;
@@ -27,6 +28,9 @@ export type SettingsProps = {
   onboardingReturn?: { providerId: string; connectionId: string | null } | null;
   /** Clears the completed onboarding return without leaving the settings page. */
   onOnboardingDone?: () => void;
+  onStartZero?: () => void;
+  zeroReady?: boolean;
+  zeroResumable?: boolean;
   aiActions?: AiTriageActions;
   aiMailboxes?: Array<{ id: string; name: string; email?: string }>;
 };
@@ -78,6 +82,7 @@ export function Settings({
   preferences,
   onChange,
   onClose,
+  onSectionChange,
   initialPage,
   jumpRequest = 0,
   onExitGuardChange,
@@ -88,6 +93,8 @@ export function Settings({
   onboardingReturn = null,
   onOnboardingDone,
   aiActions,
+  onStartZero,
+  zeroReady = false,
   aiMailboxes = [],
 }: SettingsProps) {
   const [entry, setEntry] = useState("");
@@ -1149,18 +1156,10 @@ export function Settings({
     case "Get Me To Zero":
       content = (
         <>
-          {select(
-            "inboxZeroAge",
-            "Focus on conversations from",
-            [
-              "The last week",
-              "The last month",
-              "The last three months",
-              "All time",
-            ],
-            "All time",
-          )}
-          {checkbox("celebrateInboxZero", "Celebrate Inbox Zero", true)}
+          <p className="settings-note">Mark all conversations currently in Important as Done, including already-read mail. Review the count before confirming. You can Undo.</p>
+          <button type="button" className="settings-button zero-settings-entry" disabled={!zeroReady || !onStartZero} onClick={onStartZero}>
+            Get me to zero
+          </button>
         </>
       );
       break;
@@ -1323,7 +1322,7 @@ export function Settings({
         <div className="settings-content">
           <nav className="settings-jumps" aria-label="Jump to settings">
             {[["AI triage", "AI triage"], ["Mailboxes", "Mailboxes"], ["Accounts", "Add Accounts"], ["Appearance", "Theme"], ["Inbox", "Split Inbox"], ["Writing", "Signatures"], ["Workflow", "Blocked Senders"], ["Calendar", "Calendar Settings"], ["Advanced", "Backtick as Escape"], ["Shortcuts", "Shortcuts"]].map(([label, name]) => (
-              <a key={name} href={sectionHref(name)} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); jumpTo(name); }}>{label}</a>
+              <a key={name} href={sectionHref(name)} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); if (onSectionChange) onSectionChange(name); else jumpTo(name); }}>{label}</a>
             ))}
           </nav>
           {sections.map(name => (

@@ -1,10 +1,13 @@
 .mail-sync-slot {
+  container-type: inline-size;
+  container-name: mail-sync;
   flex: 0 0 auto;
   min-height: 0;
 }
 .mail-sync-status {
   padding: 12px var(--sidebar-gutter) 0;
   color: var(--muted);
+  font-family: "Helvetica Neue", sans-serif;
   font-size: var(--ui-small);
   line-height: 1.4;
 }
@@ -17,31 +20,19 @@
   overscroll-behavior: contain;
 }
 .mail-sync-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
   padding-block: 6px;
+  min-width: 0;
 }
-.mail-sync-glyph {
-  flex: 0 0 14px;
-  height: 18px;
+.mail-sync-row p {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted);
+  gap: 6px;
+  margin: 0;
+  min-width: 0;
 }
-.mail-sync-glyph > svg { width: 14px; height: 14px; }
-.mail-sync-glyph > i {
-  width: 12px;
-  height: 12px;
-  border: 1.5px solid var(--border);
-  border-top-color: var(--muted);
-  border-right-color: var(--muted);
-  border-radius: 50%;
-  animation: mail-sync-turn 1s linear infinite;
-}
-.mail-sync-copy { min-width: 0; flex: 1; }
 .mail-sync-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
   color: var(--text);
   font-weight: 500;
   overflow: hidden;
@@ -49,10 +40,31 @@
   white-space: nowrap;
 }
 .mail-sync-name > span { color: var(--muted); font-weight: 400; }
-.mail-sync-copy p { margin: 2px 0 0; overflow-wrap: anywhere; }
-.mail-sync-count { font-variant-numeric: tabular-nums; }
-.mail-sync-unavailable { margin: 0 0 6px; color: var(--text); }
-.mail-sync-unavailable > span { display: block; color: var(--muted); }
+.mail-sync-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.mail-sync-progress {
+  height: 3px;
+  margin-block: 7px 2px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--border);
+}
+.mail-sync-progress > span {
+  display: block;
+  width: 30%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--muted);
+  transform: translateX(115%);
+  opacity: .5;
+}
+.mail-sync-progress.is-active > span {
+  opacity: 1;
+  animation: mail-sync-slide 1.5s ease-in-out infinite alternate;
+}
 .mail-sync-settings {
   display: inline-flex;
   align-items: center;
@@ -66,10 +78,59 @@
   height: auto;
   background: var(--sidebar);
 }
-@keyframes mail-sync-turn { to { transform: rotate(360deg); } }
+@keyframes mail-sync-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(333%); }
+}
 @media (prefers-reduced-motion: reduce) {
-  .mail-sync-glyph > i { animation: none; }
+  .mail-sync-progress.is-active > span { animation: none; }
 }
 @media (max-width: 700px) {
   .mail-sync-settings { min-height: 44px; }
 }
+
+@media (min-width: 701px) {
+  @container mail-sync (max-width: 390px) {
+    .mail-sync-row p {
+      flex-direction: column;
+      gap: 2px;
+    }
+    .mail-sync-name { max-width: 100%; }
+  }
+}
+.ai-sorting-status {
+  padding-bottom: 4px;
+}
+.ai-sorting-row {
+  display: block;
+  width: 100%;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 6px 0;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.ai-sorting-row p {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  min-width: 0;
+}
+.ai-sorting-row:hover .mail-sync-name { color: var(--text); }
+.ai-sorting-progress {
+  display: block;
+  width: 100%;
+  height: 3px;
+  margin-block: 7px 2px;
+  appearance: none;
+  border: 0;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.ai-sorting-progress::-webkit-progress-bar { background: var(--border); }
+.ai-sorting-progress::-webkit-progress-value { background: var(--muted); border-radius: inherit; }
+.ai-sorting-progress::-moz-progress-bar { background: var(--muted); }

@@ -4,6 +4,8 @@ import { chmodSync, lstatSync, mkdirSync, realpathSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { LocalConfigurationError, object, readPrivateJson, ROOT_DIR, writePrivateJson, type LocalConfig } from './config'
 
+declare const __SUPERLOCAL_STANDALONE__: boolean
+
 function exists(path: string): boolean {
   try { lstatSync(path); return true } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
@@ -25,10 +27,24 @@ function regularFile(path: string): void {
 /** A separate host ledger binds keys, mode and instance before opening any SDK/mail database. */
 export function openLocalRuntime(config: LocalConfig) {
   const root = realPath(resolve(config.dataDir))
-  const checkout = realpathSync(ROOT_DIR)
-  const inside = relative(checkout, root)
-  if (!inside || inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside)) {
-    throw new LocalConfigurationError('LOCAL_DATA_DIR_IN_CHECKOUT', 'Choose a dataDir outside the source checkout. Existing pilot data is never reused or migrated.')
+  if (typeof __SUPERLOCAL_STANDALONE__ !== 'undefined' && __SUPERLOCAL_STANDALONE__) {
+    // Bun's embedded module URL is synthetic, not a checkout path. Walk the
+    // resolved data path instead, rejecting both git worktrees and app bundles.
+    let current = root
+    for (;;) {
+      if (exists(join(current, '.git')) || current.toLowerCase().endsWith('.app')) {
+        throw new LocalConfigurationError('LOCAL_DATA_DIR_IN_CHECKOUT', 'Choose a dataDir outside source checkouts and application bundles. Existing pilot data is never reused or migrated.')
+      }
+      const parent = dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+  } else {
+    const checkout = realpathSync(ROOT_DIR)
+    const inside = relative(checkout, root)
+    if (!inside || inside !== '..' && !inside.startsWith(`..${sep}`) && !isAbsolute(inside)) {
+      throw new LocalConfigurationError('LOCAL_DATA_DIR_IN_CHECKOUT', 'Choose a dataDir outside the source checkout. Existing pilot data is never reused or migrated.')
+    }
   }
   const dataDir = join(root, config.mode)
   if (exists(dataDir) && lstatSync(dataDir).isSymbolicLink()) {

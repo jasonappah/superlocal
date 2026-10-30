@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, wri
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { builtInProviders } from 'inbox-sdk/providers'
 
 export const ROOT_DIR = fileURLToPath(new URL('../../../', import.meta.url))
 export type Mode = 'mock' | 'real'
@@ -14,7 +15,13 @@ export interface ImapHostPreset {
   imap: { host: string; port: number; secure: boolean }
   smtp?: { host: string; port: number; secure: boolean }
   sentCopy: 'server' | 'append'
+  /** Descriptor data only: how the browser labels and explains this preset. Endpoints above stay host-owned. */
+  onboarding?: { passwordLabel?: string; credentialHelp?: { text: string; url: string; linkLabel: string }; usernameIsEmail?: boolean }
 }
+/** Every provider entry has `enabled`; provider-specific settings (OAuth client, presets) are typed per key below. */
+export interface ProviderConfig { enabled: boolean; [setting: string]: unknown }
+/** Every built-in SDK provider (plus the offline mock) is a key; unknown providers are rejected. */
+export const PROVIDER_IDS: readonly string[] = Object.freeze(['mock', ...builtInProviders.map(provider => provider.id)])
 export interface LocalConfig {
   configPath: string
   instanceId: string
@@ -23,14 +30,20 @@ export interface LocalConfig {
   web: { port: number; origin: string; allowedOrigins: string[] }
   backend: { port: number }
   auth: { method: 'loopback' | 'google'; sessionHours: number; allowedEmails?: string[] }
+  /** Desktop mode from `SUPERLOCAL_DESKTOP=1` only: one loopback port serves both the built UI and the API. Never stored in the config file. */
+  desktop: boolean
+  /** Set by the desktop host: one-time bootstrap token and the built UI asset directory. Never stored in the config file. */
+  desktopBootstrapToken?: string
+  desktopAssets?: string | null
   allowProviderWrites: boolean
   providers: {
-    mock: { enabled: boolean }
-    gmail: { enabled: boolean; oauth: { clientId: SecretSource; clientSecret: SecretSource; scopes: string[] } }
+    mock: ProviderConfig
+    gmail: ProviderConfig & { oauth: { clientId: SecretSource; clientSecret: SecretSource; scopes: string[] } }
+    inbound: ProviderConfig
+    imap: ProviderConfig & { servers: ImapHostPreset[] }
+    /** Personal fork: local Microsoft 365 IMAP/SMTP over OAuth (public client, no secret). Key is not an SDK provider id. */
     exchangeImap: { enabled: boolean; oauth: { clientId: SecretSource; scopes: string[] } }
-    inbound: { enabled: boolean }
-    imap: { enabled: boolean; servers: ImapHostPreset[] }
-  }
+  } & Record<string, ProviderConfig>
 }
 
 export class LocalConfigurationError extends Error {
@@ -147,6 +160,7 @@ function defaults() {
         clientId: '9e5f94bc-e8a4-4e73-b8be-63364c29d753',
         scopes: ['https://outlook.office.com/IMAP.AccessAsUser.All', 'https://outlook.office.com/SMTP.Send', 'offline_access'],
       } },
+      ...Object.fromEntries(PROVIDER_IDS.filter(id => !['mock', 'gmail', 'inbound', 'imap'].includes(id)).map(id => [id, { enabled: false }])),
     },
   }
 }
@@ -176,11 +190,16 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   const allowedEmails = normalizeAllowedEmails(environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS === undefined ? auth.allowedEmails ?? [] :
     environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.trim() === '' ? [] : environment.SUPERLOCAL_AUTH_ALLOWED_EMAILS.split(','))
   const writes = record(input.allowProviderWrites, 'allowProviderWrites', ['mock', 'real'])
-  const providers = record(input.providers, 'providers', ['mock', 'gmail', 'inbound', 'imap', 'exchangeImap'])
+  const providers = record(input.providers, 'providers', [...PROVIDER_IDS, 'exchangeImap'])
   const mock = record(providers.mock, 'providers.mock', ['enabled'])
   const gmail = record(providers.gmail, 'providers.gmail', ['enabled', 'oauth'])
   const inbound = record(providers.inbound, 'providers.inbound', ['enabled'])
   const imap = record(providers.imap ?? { enabled: true, servers: [] }, 'providers.imap', ['enabled', 'servers'])
+  // Built-in providers without host-specific settings: optional keys, disabled unless configured. Older private files omit them.
+  const others = Object.fromEntries(PROVIDER_IDS.filter(id => !['mock', 'gmail', 'inbound', 'imap'].includes(id)).map(id => {
+    const entry = record(providers[id] ?? { enabled: false }, `providers.${id}`, ['enabled'])
+    return [id, { enabled: bool(entry.enabled, `providers.${id}.enabled`) }]
+  }))
   const exchangeImap = record(providers.exchangeImap ?? { enabled: false, oauth: { clientId: null, scopes: [] } }, 'providers.exchangeImap', ['enabled', 'oauth'])
   if (!Array.isArray(imap.servers ?? []) || ((imap.servers ?? []) as unknown[]).length > 16) invalid('providers.imap.servers')
   const imapServers: ImapHostPreset[] = ((imap.servers ?? []) as unknown[]).map(value => {
@@ -220,8 +239,10 @@ export function loadLocalConfig(options: { configPath?: string; environment?: No
   return {
     configPath, instanceId: input.instanceId, mode: input.mode, dataDir,
     web: { port: webPort, origin: webOrigin, allowedOrigins: authMethod === 'google' ? [webOrigin] : [...new Set([webOrigin, `http://localhost:${webPort}`, `http://127.0.0.1:${webPort}`, ...allowedOrigins])] },
-    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails }, allowProviderWrites: policy[input.mode],
-    providers: { mock: { enabled: enabledMock }, inbound: { enabled: bool(inbound.enabled, 'providers.inbound.enabled') },
+    backend: { port: apiPort }, auth: { method: authMethod, sessionHours: auth.sessionHours, allowedEmails },
+    desktop: environment.SUPERLOCAL_DESKTOP === '1', desktopBootstrapToken: undefined, desktopAssets: null,
+    allowProviderWrites: policy[input.mode],
+    providers: { ...others, mock: { enabled: enabledMock }, inbound: { enabled: bool(inbound.enabled, 'providers.inbound.enabled') },
       imap: { enabled: bool(imap.enabled, 'providers.imap.enabled'), servers: imapServers }, gmail: {
       enabled: bool(gmail.enabled, 'providers.gmail.enabled'), oauth: {
         clientId: secretSource(oauth.clientId, 'providers.gmail.oauth.clientId'), clientSecret: secretSource(oauth.clientSecret, 'providers.gmail.oauth.clientSecret'), scopes: oauth.scopes as string[],

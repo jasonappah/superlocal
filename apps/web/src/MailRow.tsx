@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type CSSProperties } from "react";
 import { Icon, IconButton } from "./components";
 import { displayDate, type Mail } from "./data";
 
@@ -11,6 +11,17 @@ type MailRowProps = {
   showSnippets: boolean;
 };
 
+const labelHues: Record<string, number> = { social: 250, marketing: 25, pitch: 300, news: 85, updates: 200, forums: 150, promotions: 55, finance: 130 };
+
+/** Stable hue per label so the same label reads the same color everywhere. */
+export function labelHue(label: string) {
+  const key = label.trim().toLowerCase();
+  if (key in labelHues) return labelHues[key];
+  let hash = 0;
+  for (const char of key) hash = (hash * 31 + char.codePointAt(0)!) >>> 0;
+  return hash % 360;
+}
+
 function MailRow({
   mail: m,
   index: i,
@@ -19,12 +30,14 @@ function MailRow({
   sent,
   showSnippets,
 }: MailRowProps) {
+  const recipients = m.toAddresses?.join(", ") ?? m.to;
+  const messageCount = m.window ? m.window.counts.messages : m.messages.length;
   return (
     <div
       key={m.id}
       data-motion-id={m.id}
       data-mail-id={m.id}
-      className={`mail-row ${highlighted ? "highlighted" : ""} ${selected ? "selected" : ""} ${m.unread ? "unread" : ""} ${m.mailboxNames?.length ? "has-mailbox" : ""}`}
+      className={`mail-row has-recipients ${highlighted ? "highlighted" : ""} ${selected ? "selected" : ""} ${m.unread ? "unread" : ""}`}
       role="row"
       aria-rowindex={i + 1}
       aria-selected={selected}
@@ -42,9 +55,9 @@ function MailRow({
       </button>
       <span className="unread-dot" aria-label={m.unread ? "Unread" : "Read"} />
       <span className="row-from" role="cell">
-        {sent && m.messages.length === 1 ? "Me" : m.from}
-        {m.messages.length > 1 && (
-          <span className="message-count">{m.messages.length}</span>
+        {sent && messageCount === 1 ? "Me" : m.from}
+        {(messageCount === null || messageCount > 1) && (
+          <span className="message-count">{messageCount ?? "…"}</span>
         )}
       </span>
       <span className="row-content" role="cell">
@@ -52,14 +65,24 @@ function MailRow({
         {showSnippets && <span className="row-snippet">{m.snippet}</span>}
       </span>
       {m.labels.length > 0 && (
-        <span className="row-label" role="cell" title={m.labels.join(", ")}>
+        <span
+          className="row-label"
+          role="cell"
+          title={m.labels.join(", ")}
+          style={{ "--label-hue": labelHue(m.labels[0]) } as CSSProperties}
+        >
           {m.labels[0]}
         </span>
       )}
-      {!!m.mailboxNames?.length && <span className="row-mailbox" role="cell" title={m.mailboxNames.join(", ")}>{m.mailboxNames[0]}{m.mailboxNames.length > 1 ? ` +${m.mailboxNames.length - 1}` : ""}</span>}
+      <span className="row-recipients" role="cell" title={recipients ? `To: ${m.to || recipients}` : "No To recipients"}>
+        {recipients ? `To: ${recipients}` : "No To recipients"}
+      </span>
       <span className="row-metadata">
+        {m.remindedAt !== undefined && (
+          <Icon name="Bell" size={13} className="reminded-icon" />
+        )}
         {m.starred && <Icon name="Star" size={13} className="starred-icon" />}
-        {m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length) && (
+        {(m.window ? m.hasAttachments : m.messages.some((msg) => msg.hasAttachments || msg.attachments?.length)) && (
           <Icon name="Paperclip" size={14} />
         )}
         <time className={m.reminder || m.scheduled ? "reminder-date" : ""}>
