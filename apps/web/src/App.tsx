@@ -1723,7 +1723,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     ...folders.map(([label, key, icon]) => ({
       label: `Go to ${label}`,
       detail: `Open ${label}`,
-      key: key ? `G then ${key.toUpperCase()}` : "",
+      key: key && label !== "Inbox" ? `G then ${key.toUpperCase()}` : "",
       icon,
       run: () => {
         setOverlay(null);

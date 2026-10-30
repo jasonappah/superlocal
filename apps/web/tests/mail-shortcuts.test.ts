@@ -2,9 +2,32 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   resolveMailShortcut,
+  shouldIgnoreMailKey,
   type MailShortcutContext,
   type MailShortcutEvent,
 } from "../src/mail-shortcuts.ts";
+import { shortcutGroups } from "../src/shortcuts.ts";
+
+test("settings is discoverable with its existing shortcut", () => {
+  assert.ok(shortcutGroups.some(([, rows]) => rows.some(([label, key]) => label === "Settings" && key === ",")));
+  assert.deepEqual(resolveMailShortcut({ key: "," }, { mode: "list" }), { type: "settings" });
+});
+
+test("shared key guard leaves IME and already handled events alone", () => {
+  assert.equal(shouldIgnoreMailKey({ isComposing: true }), true);
+  assert.equal(shouldIgnoreMailKey({ defaultPrevented: true }), true);
+  assert.equal(shouldIgnoreMailKey({}), false);
+});
+
+test("help describes existing folder and calendar bindings without promising distinct actions", () => {
+  const rows = shortcutGroups.flatMap(([, entries]) => entries);
+  assert.ok(rows.some(([label, key]) => label === "Go to Important" && key === "G then I"));
+  assert.ok(!rows.some(([label]) => label === "Go to Inbox" || label === "Show New Messages" || label === "Create Empty Event"));
+  assert.ok(rows.some(([label, key]) => label === "Reveal All Messages and Jump to Latest" && key === "Shift N"));
+  assert.ok(rows.some(([label, key]) => label === "Create Event" && key === "B or Shift B"));
+  assert.ok(shortcutGroups.some(([group, entries]) => group === "Browser Windows" && entries.some(([label]) => label === "Print")));
+  assert.deepEqual(resolveMailShortcut({ key: "i" }, { mode: "list", sequence: true }), { type: "goFolder", folder: "Inbox", split: "Important", clearSequence: true });
+});
 
 function resolve(
   key: string,

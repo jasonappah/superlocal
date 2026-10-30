@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Icon, IconButton, Key, Modal } from "./components";
 import type { Mail, MailboxOption } from "./data";
 import { UNIFIED_ACCOUNT } from "./mail-model";
+import { shouldIgnoreMailKey } from "./mail-shortcuts";
 
 export type CommandItem = {
   label: string;
@@ -223,6 +224,7 @@ export default function MailCommandDialog({
             setMenuIndex(0);
           }}
           onKeyDown={(e) => {
+            if (shouldIgnoreMailKey(e.nativeEvent) || e.defaultPrevented) return;
             if (e.key === "ArrowDown") {
               e.preventDefault();
               setMenuIndex(Math.min(optionCount - 1, activeIndex + 1));

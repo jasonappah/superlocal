@@ -28,6 +28,11 @@ export type MailShortcutContext = {
   hasHighlightedMail?: boolean;
 };
 
+/** Ignore keyboard events already handled elsewhere or owned by an IME. */
+export function shouldIgnoreMailKey(event: Pick<MailShortcutEvent, "isComposing" | "defaultPrevented">): boolean {
+  return !!(event.isComposing || event.defaultPrevented);
+}
+
 export type MailShortcut = (
   | { type: "account"; index: number }
   | { type: "unified" }
@@ -76,7 +81,7 @@ export function resolveMailShortcut(
   event: MailShortcutEvent,
   context: MailShortcutContext,
 ): MailShortcut | null {
-  if (event.isComposing || event.defaultPrevented) return null;
+  if (shouldIgnoreMailKey(event)) return null;
   const key = event.key.toLowerCase();
   const mod = event.metaKey || event.ctrlKey;
   const shift = !!event.shiftKey;
