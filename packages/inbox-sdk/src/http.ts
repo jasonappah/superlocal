@@ -190,6 +190,8 @@ const schemas = {
   Membership: membership,
   MailboxMessageSummary: mailboxMessageSummary,
   MailboxMessage: message.extend({ sourceId: id, memberships: z.array(membership) }),
+  UnsubscribeResult: z.object({ kind: z.enum(['one-click', 'mailto', 'link']), sender: z.string(), status: z.number().int().optional(),
+    sent: z.boolean().optional(), mailto: z.string().optional(), url: z.string().optional() }),
   MailboxMessagePage: z.object({ items: z.array(mailboxMessageSummary), nextCursor: opaque.nullable(), state: opaque, total: revision }),
   MailboxMessagePageInput: mailboxReadInput.extend({ cursor: opaque.optional(), sourceId: id.optional(), threadId: id.optional() }),
   MailboxLiveMessagePage: z.object({ items: z.array(mailboxMessageSummary).max(500), nextCursor: opaque.nullable(), state: opaque, scopeState: opaque }),
@@ -687,6 +689,11 @@ export function createInboxApi(options: InboxApiOptions) {
     c.header('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
     c.header('Referrer-Policy', 'no-referrer')
     return json(c, validate(schemas.MailboxMessage, await inbox.mailboxMessage(c.get('owner'), pathId(c), c.req.param('messageId')!)), 200, policy)
+  })
+  route('post', '/v1/mailboxes/:id/messages/:messageId/unsubscribe', { summary: 'Deliver the sender’s advertised unsubscribe request', output: 'UnsubscribeResult',
+    description: 'Uses only the bounded targets captured from the message headers at ingest, falling back to a visible unsubscribe link in the stored body. RFC 8058 one-click POST is preferred (HTTPS only, no credentials, no redirects, bounded timeout, private addresses rejected). Otherwise a mailto target is sent through an enabled sending identity; if sending is unavailable the caller receives the mailto to open. No target is fetched while reading mail. Returns 422 when the message advertises no unsubscribe option.' }, async c => {
+    body(c, emptyQuery, true)
+    return json(c, validate(schemas.UnsubscribeResult, await inbox.unsubscribe(c.get('owner'), pathId(c), c.req.param('messageId')!)))
   })
   route('patch', '/v1/mailboxes/:id/messages/:messageId/state', { summary: 'Update mailbox-local message state', input: 'MailboxState', output: 'Membership', conditional: true, description: 'Use the ETag from GET /v1/mailboxes/{id}/messages/{messageId}. The full representation is checked, then the selected membership revision fences the update. Other mailbox memberships and provider state are unchanged.' }, async (c) => {
     ifMatch(c)

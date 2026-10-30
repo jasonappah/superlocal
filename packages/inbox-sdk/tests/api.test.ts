@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { Hono } from 'hono'
 import { DomUtils, parseDocument } from 'htmlparser2'
-import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
+import { createHash, createHmac, generateKeyPairSync, randomUUID, sign } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
@@ -14,6 +14,7 @@ import { builtInProviders } from '../src/providers'
 import { createInboxApi } from '../src/http'
 import { createInboxClient } from '../src/client'
 import { pinnedMediaNetwork } from '../src/media'
+import { assertPublicHost, findUnsubscribeLink, mailtoRecipient, postOneClick, privateAddress, privateHost, unsubscribeTargets } from '../src/unsubscribe'
 import { CredentialError, InboxError } from '../src/contracts'
 import { createGoogleOAuthHost, type GoogleOAuthConfig, type OAuthAttempt } from '../server/google-oauth'
 import { createGoogleOAuthApi } from '../server/google-oauth-api'
@@ -5953,6 +5954,143 @@ describe('mailbox action HTTP receipts', () => {
     expect(reminded.states.every(state => !state.done && state.revision === 4 && state.snoozedUntil === reminder.snoozedUntil)).toBe(true)
     expect(await client.setMailboxStates(reminder)).toEqual(reminded)
     expect(await client.mailboxStateReceipt(reminder.id)).toEqual(reminded)
+  })
+})
+
+describe('advertised unsubscribe targets', () => {
+  test('parses bounded RFC 2369/8058 targets, visible links, and rejects private or unbounded destinations', () => {
+    const target = 'https://93.184.216.34/unsubscribe/u/abc'
+    expect(unsubscribeTargets({
+      'List-Unsubscribe': `<${target}>, <mailto:leave@example.test?subject=unsubscribe>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    })).toEqual({ version: 1, oneClick: target, https: target, mailto: 'mailto:leave@example.test?subject=unsubscribe' })
+    // Header names and schemes are case-insensitive; a target is not one-click
+    // merely because it is HTTPS.
+    expect(unsubscribeTargets({ 'list-unsubscribe': '<HTTPS://Lists.Example.Test/u/7>' }))
+      .toEqual({ version: 1, https: 'https://lists.example.test/u/7' })
+    expect(unsubscribeTargets({ 'list-unsubscribe': '<https://lists.example.test/u/7>', 'list-unsubscribe-post': 'List-Unsubscribe=One-Clickish' }))
+      .toEqual({ version: 1, https: 'https://lists.example.test/u/7' })
+    for (const headers of [
+      undefined,
+      {},
+      { 'list-unsubscribe': '<http://lists.example.test/u/7>' },
+      { 'list-unsubscribe': '<https://user:pass@lists.example.test/u/7>' },
+      { 'list-unsubscribe': '<https://127.0.0.1/u/7>' },
+      { 'list-unsubscribe': '<https://[::1]/u/7>' },
+      { 'list-unsubscribe': `<https://lists.example.test/${'x'.repeat(2048)}>` },
+      { 'list-unsubscribe': '<mailto:not-an-address>' },
+    ] as Array<Record<string, string> | undefined>) expect(unsubscribeTargets(headers)).toBeUndefined()
+    expect(mailtoRecipient('mailto:leave@example.test?subject=unsubscribe')).toEqual({ address: 'leave@example.test', subject: 'unsubscribe' })
+
+    expect(findUnsubscribeLink('<p><a href="https://news.example.test/preferences/unsubscribe?token=1">Manage preferences</a></p>'))
+      .toBe('https://news.example.test/preferences/unsubscribe?token=1')
+    expect(findUnsubscribeLink('<p><a href="https://news.example.test/prefs/a">Unsubscribe here</a></p>'))
+      .toBe('https://news.example.test/prefs/a')
+    expect(findUnsubscribeLink('<p><a href="http://news.example.test/preferences/unsubscribe">Unsubscribe</a></p>')).toBeUndefined()
+    expect(findUnsubscribeLink('', 'Read this digest, then unsubscribe at https://news.example.test/u/unsubscribe now.'))
+      .toBe('https://news.example.test/u/unsubscribe')
+
+    expect(privateHost('localhost')).toBe(true)
+    expect(privateHost('box.localhost')).toBe(true)
+    expect(privateHost('news.example.test')).toBe(false)
+    for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '192.168.1.1', '169.254.1.1', '100.64.0.1',
+      '203.0.113.5', '198.51.100.5', '0.0.0.0', '224.0.0.1', '::1', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1']) {
+      expect(privateAddress(address)).toBe(true)
+    }
+    expect(privateAddress('93.184.216.34')).toBe(false)
+  })
+
+  test('delivers at most one bounded POST with no credentials, redirects, or response retention', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = []
+    const remote = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} })
+      return new Response('sender page body is discarded', { status: 204 })
+    }) as typeof fetch
+    await expect(postOneClick('https://93.184.216.34/u/one', { fetch: remote })).resolves.toEqual({ status: 204 })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe('https://93.184.216.34/u/one')
+    expect(calls[0]!.init).toMatchObject({ method: 'POST', body: 'List-Unsubscribe=One-Click', redirect: 'manual', credentials: 'omit' })
+    expect(new Headers(calls[0]!.init.headers).get('content-type')).toBe('application/x-www-form-urlencoded')
+    await expect(postOneClick('http://93.184.216.34/u/one', { fetch: remote })).rejects.toThrow('not a safe HTTPS URL')
+    await expect(postOneClick('https://127.0.0.1/u/one', { fetch: remote })).rejects.toThrow('not a safe HTTPS URL')
+    await expect(assertPublicHost('localhost')).rejects.toThrow('not a public address')
+    expect(calls).toHaveLength(1)
+  })
+
+  test('keeps advertised targets outside bodyRevision and delivers one-click through the core and HTTP client', async () => {
+    const posts: Array<{ url: string; init: RequestInit }> = []
+    let status = 204
+    const remote = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      posts.push({ url: String(input), init: init ?? {} }); return new Response(null, { status })
+    }) as typeof fetch
+    const h = await fixture({ fetch: remote })
+    const target = 'https://93.184.216.34/unsubscribe/u/abc'
+    const { account, box } = await h.seed('alice', 'unsubscribe-one-click', [native('bulk', {
+      from: participant('news@example.test', 'Fictional News'), subject: 'Fictional newsletter',
+      bodyHtml: '<p>Fictional newsletter</p><a href="https://news.example.test/preferences/unsubscribe">Unsubscribe</a>',
+      headers: { 'List-Unsubscribe': `<${target}>, <mailto:leave@example.test?subject=unsubscribe>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' },
+    }), native('broken', {
+      from: participant('news@example.test', 'Fictional News'), subject: 'Fictional one-click only',
+      headers: { 'List-Unsubscribe': '<https://93.184.216.34/unsubscribe/u/broken>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' },
+    })])
+    const messages = (await h.inbox.messages('alice', { accountId: account.id })).items
+    const message = messages.find(value => value.subject === 'Fictional newsletter')!
+    const broken = messages.find(value => value.subject === 'Fictional one-click only')!
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    expect(message.facts).toMatchObject({ listUnsubscribe: true })
+    const database = new Database(h.database, { readonly: true })
+    let stored: { owner: string; account: string; generation: number; body: string; confirmed: string } | undefined
+    try { stored = database.query<{ owner: string; account: string; generation: number; body: string; confirmed: string }, [string]>(
+      'SELECT owner,account,generation,body,confirmed FROM sdk_messages WHERE id=?').get(message.id) ?? undefined } finally { database.close() }
+    expect(stored).toBeDefined()
+    const body = JSON.parse(stored!.body) as Record<string, unknown>
+    expect(body.unsubscribe).toEqual({ version: 1, oneClick: target, https: target, mailto: 'mailto:leave@example.test?subject=unsubscribe' })
+    // The delivery capability is stored next to the body but excluded from the
+    // identity cached readers use to skip a refetch.
+    const { unsubscribe: _targets, ...content } = body
+    expect(JSON.parse(stored!.confirmed).bodyRevision).toBe(createHmac('sha256', KEY)
+      .update(JSON.stringify([stored!.owner, stored!.account, stored!.generation, message.id]))
+      .update('\0').update(JSON.stringify(content)).digest('base64url'))
+    expect(message.bodyRevision).toMatch(/^[a-zA-Z0-9_-]{43}$/)
+
+    await expect(h.inbox.unsubscribe('alice', mailbox.id, message.id))
+      .resolves.toEqual({ kind: 'one-click', sender: 'news@example.test', status: 204 })
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.url).toBe(target)
+    expect(posts[0]!.init).toMatchObject({ method: 'POST', body: 'List-Unsubscribe=One-Click', redirect: 'manual', credentials: 'omit' })
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    expect(await client.unsubscribe(mailbox.id, message.id)).toEqual({ kind: 'one-click', sender: 'news@example.test', status: 204 })
+    expect(posts).toHaveLength(2)
+    status = 503
+    // A mailto fallback is a real unsubscribe, so it is attempted before
+    // handing the reader the sender's page.
+    expect(await client.unsubscribe(mailbox.id, message.id)).toEqual({ kind: 'mailto', sender: 'news@example.test', sent: true })
+    expect(box.calls.send).toHaveLength(1)
+    // A failed one-click request still leaves the advertised HTTPS endpoint
+    // available to open, rather than pretending the sender was unsubscribed.
+    expect(await client.unsubscribe(mailbox.id, broken.id)).toEqual({
+      kind: 'link', sender: 'news@example.test', url: 'https://93.184.216.34/unsubscribe/u/broken' })
+  })
+
+  test('falls back to the sender page or mailto and refuses to invent an unsubscribe option', async () => {
+    const h = await fixture({ allowProviderWrites: false })
+    const { account, box } = await h.seed('alice', 'unsubscribe-fallback', [
+      native('linked', { subject: 'Linked', bodyHtml: '<p>Fictional</p><a href="https://news.example.test/preferences/unsubscribe?token=1">Manage preferences</a>' }),
+      native('mailto', { subject: 'Mailto', headers: { 'List-Unsubscribe': '<mailto:leave@example.test?subject=unsubscribe>' } }),
+      native('plain', { subject: 'Plain' }),
+    ])
+    const mailbox = (await h.inbox.mailboxes('alice')).find(value => value.sourceId === account.id)!
+    const messages = (await h.inbox.messages('alice', { accountId: account.id })).items
+    const id = (subject: string) => messages.find(message => message.subject === subject)!.id
+    expect(await h.inbox.unsubscribe('alice', mailbox.id, id('Linked'))).toEqual({
+      kind: 'link', sender: 'sender@example.test', url: 'https://news.example.test/preferences/unsubscribe?token=1' })
+    expect(await h.inbox.unsubscribe('alice', mailbox.id, id('Mailto'))).toEqual({
+      kind: 'mailto', sender: 'sender@example.test', sent: false, mailto: 'mailto:leave@example.test?subject=unsubscribe' })
+    await expect(h.inbox.unsubscribe('alice', mailbox.id, id('Plain'))).rejects.toMatchObject({ code: 'VALIDATION', status: 422 })
+    expect(box.calls.send).toEqual([])
+    const client = createInboxClient({ baseUrl: 'http://inbox.test', fetch: transport(h).fetch, headers: { authorization: 'Bearer alice' } })
+    await expect(client.unsubscribe(mailbox.id, id('Plain'))).rejects.toMatchObject({ status: 422 })
+    expect(await client.unsubscribe(mailbox.id, id('Linked'))).toMatchObject({ kind: 'link' })
   })
 })
 

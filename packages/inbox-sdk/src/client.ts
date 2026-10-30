@@ -529,6 +529,7 @@ export function createInboxClient(options: InboxClientOptions = {}) {
     },
     mailboxMessageSummary: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessageSummary'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}/summary`, requestOptions),
     mailboxMessage: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => request<Result<'mailboxMessage'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}`, requestOptions),
+    unsubscribe: (mailboxId: string, messageId: string, requestOptions: InboxRequestOptions = {}) => write<Result<'unsubscribe'>>(`/mailboxes/${resourceId(mailboxId)}/messages/${resourceId(messageId)}/unsubscribe`, 'POST', undefined, requestOptions),
     mailboxSyncStatus: (input: Parameters<Inbox['mailboxSyncStatus']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxSyncStatus'>>('/mailbox-sync/status', 'POST', input, requestOptions),
     mailboxMessagePage: (input: Parameters<Inbox['mailboxMessagePage']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxMessagePage'>>('/mailbox-message-page', 'POST', input, requestOptions),
     mailboxConversations: (input: Parameters<Inbox['mailboxConversations']>[1], requestOptions: InboxRequestOptions = {}) => write<Result<'mailboxConversations'>>('/mailbox-conversations', 'POST', input, requestOptions),

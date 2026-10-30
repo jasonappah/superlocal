@@ -7,6 +7,7 @@ import { createCredentialCrypto } from '../server/crypto'
 import { sanitizeEmailBody } from '../server/sanitize'
 import { createMediaStore } from './media'
 import { mailFacts } from './mail-facts'
+import { findUnsubscribeLink, mailtoRecipient, postOneClick, unsubscribeTargets } from './unsubscribe'
 import { mailPreview } from './mail-preview'
 import { FORWARDING_BODY_BYTES, FORWARDING_DEPTH, forwardingRfcId, isForwardedCopy, type ForwardingBody, type ForwardingMessage } from './forwarding'
 import { ProviderError, ProviderMutationError, type InboxProvider, type MailAccount, type MailMessage, type SyncResult, type SendInput } from '../server/sdk/types'
@@ -15,7 +16,8 @@ import { CredentialError, InboxError, MAILBOX_SYNC_PROBLEM_CODES, type MailboxSy
   type MessageSummary, type MutationInput, type Operation, type Participant, type Policy,
   type Problem, type Query, type SyncCheckpoint, type SyncRequest, type ThreadSummary, type Connection, type ConnectionIdentity,
   type Mailbox, type MailboxCandidate, type MailboxInput, type MailboxMembership, type MailboxMessageSummary,
-  type MailboxQuery, type MailboxConversationQuery, type MailboxConversation, type MailboxThreadKey, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type MailboxForwardedCopy, type SendingIdentity, type SendingIdentities } from './contracts'
+  type MailboxQuery, type MailboxConversationQuery, type MailboxConversation, type MailboxThreadKey, type MailboxSelector, type MailboxStateReceipt, type MailboxChangesPage, type MailboxForwardedCopy, type SendingIdentity, type SendingIdentities,
+  type UnsubscribeTargets, type UnsubscribeResult } from './contracts'
 
 declare const __SUPERLOCAL_STANDALONE__: boolean
 
@@ -1412,10 +1414,15 @@ export function createInbox(options: InboxOptions): Inbox {
       from: mail.from, to: mail.to, cc: mail.cc, subject: mail.subject, preview: mailPreview(mail), receivedAt: mail.receivedAt,
       isRead: mail.isRead, isStarred: mail.isStarred, folder: mail.folder, folderIds,
       labelIds: [], hasAttachments: attachments.length > 0, snoozedUntil: null, facts: mailFacts(mail) }
-    const body = JSON.stringify({ bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
-      replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo })
+    const bodyContent = { bcc: mail.bcc, bodyText: mail.bodyText, bodyHtml: mail.bodyHtml, attachments,
+      replyTo: normalized.replyTo, rfcMessageId: normalized.rfcMessageId, references: normalized.references, inReplyTo: normalized.inReplyTo }
+    // Advertised unsubscribe destinations are a delivery capability, not body
+    // content: keep them out of bodyRevision so adding them later never forces
+    // a cached reader to refetch a body it already has.
+    const targets = unsubscribeTargets(mail.headers)
+    const body = JSON.stringify(targets ? { ...bodyContent, unsubscribe: targets } : bodyContent)
     summary.bodyRevision = createHmac('sha256', options.encryptionKey)
-      .update(JSON.stringify([row.owner, row.id, row.generation, id])).update('\0').update(body).digest('base64url')
+      .update(JSON.stringify([row.owner, row.id, row.generation, id])).update('\0').update(JSON.stringify(bodyContent)).digest('base64url')
     const confirmed = JSON.stringify(summary)
     if (old && !old.deleted && old.confirmed === confirmed && old.body === body) return old.id
     db.query(`INSERT INTO sdk_messages(id,owner,account,generation,native_id,thread_id,confirmed,visible,body,received_at,folder,is_read,is_starred,subject,search_text)
@@ -2828,6 +2835,44 @@ export function createInbox(options: InboxOptions): Inbox {
       const message = await inbox.message(owner, messageId)
       const state = membership(owner, mailboxId, messageId)
       return { ...message, sourceId: message.accountId, memberships: [state] }
+    }),
+    unsubscribe: (owner, mailboxId, messageId) => run(async () => {
+      membership(owner, mailboxId, messageId)
+      const row = messageRow(owner, messageId)
+      const message = summary(row)
+      const body = JSON.parse(row.body) as { bodyHtml?: string; bodyText?: string; unsubscribe?: UnsubscribeTargets }
+      const targets = body.unsubscribe
+      const link = targets?.https ?? findUnsubscribeLink(body.bodyHtml ?? '', body.bodyText ?? '')
+      if (!targets?.oneClick && !targets?.mailto && !link) throw new InboxError('VALIDATION', 'This message has no unsubscribe option.', 422)
+      if (targets?.oneClick) {
+        try {
+          const { status } = await postOneClick(targets.oneClick, options.fetch ? { fetch: options.fetch } : {})
+          if (status < 200 || status >= 400) throw new InboxError('UPSTREAM', `The sender rejected the unsubscribe request (HTTP ${status}).`, 502)
+          return { kind: 'one-click', sender: message.from.email, status } satisfies UnsubscribeResult
+        } catch (error) {
+          // A sender page is still actionable when its one-click endpoint fails.
+          if (!link) throw error
+        }
+      }
+      if (targets?.mailto) {
+        const recipient = mailtoRecipient(targets.mailto)
+        const account = accountRow(owner, row.account, true)
+        const data = JSON.parse(account.data) as Account
+        if (recipient && options.allowProviderWrites !== false && data.status === 'connected' && data.capabilities.send) {
+          try {
+            await io(account, async provider => {
+              if (!provider.capabilities.send) throw new InboxError('UNSUPPORTED_OPERATION', 'This account cannot send the unsubscribe email.', 409)
+              const identities = await providerSendingIdentities(account, provider)
+              const from = identities.identities.find(identity => identity.isDefault)?.email ?? identities.identities[0]?.email ?? data.email
+              await provider.send({ from: { name: data.name, email: from }, to: recipient.address,
+                subject: recipient.subject ?? 'Unsubscribe', text: 'Unsubscribe' })
+            })
+            return { kind: 'mailto', sender: message.from.email, sent: true } satisfies UnsubscribeResult
+          } catch { /* Fall back to handing the reader the sender's own mailto target. */ }
+        }
+        return { kind: 'mailto', sender: message.from.email, sent: false, mailto: targets.mailto } satisfies UnsubscribeResult
+      }
+      return { kind: 'link', sender: message.from.email, url: link! } satisfies UnsubscribeResult
     }),
     setMailboxState: (owner, mailboxId, messageId, input, revision) => run(() => transaction(() => {
       const box = mailboxRow(owner, mailboxId, true)

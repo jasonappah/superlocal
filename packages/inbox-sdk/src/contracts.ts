@@ -414,6 +414,28 @@ export interface MailboxStateReceipt {
   states: MailboxMembership[]
 }
 
+/**
+ * Bounded delivery targets advertised by a bulk sender. `oneClick` is only
+ * present when the sender also advertises RFC 8058 POST; `https` and `mailto`
+ * are the remaining fallbacks. No URL is fetched while parsing.
+ */
+export interface UnsubscribeTargets {
+  version: 1
+  oneClick?: string
+  https?: string
+  mailto?: string
+}
+
+/** `sent` is false only when a mailto fallback must be opened by the client. */
+export interface UnsubscribeResult {
+  kind: 'one-click' | 'mailto' | 'link'
+  sender: string
+  status?: number
+  sent?: boolean
+  mailto?: string
+  url?: string
+}
+
 export interface MessageSummary {
   id: string
   accountId: string
@@ -627,6 +649,8 @@ export interface Inbox {
   /** Cached metadata only; never reads a body, including legacy fact enrichment. */
   mailboxMessageSummary(owner: string, mailboxId: string, messageId: string): Promise<MailboxMessageSummary>
   mailboxMessage(owner: string, mailboxId: string, messageId: string): Promise<Message & { sourceId: string; memberships: MailboxMembership[] }>
+  /** Deliver the sender's advertised unsubscribe request; never fabricates one. */
+  unsubscribe(owner: string, mailboxId: string, messageId: string): Promise<UnsubscribeResult>
   setMailboxState(owner: string, mailboxId: string, messageId: string, input: { done?: boolean; snoozedUntil?: string | null }, revision: number): Promise<MailboxMembership>
   /** Atomic local-only state change with a durable idempotency receipt; no provider mutation.
    * At least one change is required. Snooze-only preserves Done; Done-only clears snooze as before. */
