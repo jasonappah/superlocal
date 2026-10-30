@@ -223,11 +223,19 @@ fn private_dir(path: &Path) -> Result<(), String> {
 }
 
 fn open_external(url: &tauri::Url) {
-    if matches!(url.scheme(), "http" | "https")
+    // Sender pages and confirmation mail are the only things a local mail client
+    // hands to the operating system. Everything else stays inside the app.
+    let web = matches!(url.scheme(), "http" | "https")
         && url.host_str().is_some()
         && url.username().is_empty()
-        && url.password().is_none()
-    {
+        && url.password().is_none();
+    let mail = url.scheme() == "mailto"
+        && url.host_str().is_none()
+        && !url.path().is_empty()
+        && url.path().len() <= 320
+        && url.path().contains('@')
+        && !url.path().chars().any(|c| c.is_whitespace() || c.is_control());
+    if web || mail {
         let _ = Command::new("/usr/bin/open")
             .arg(url.as_str())
             .stdin(Stdio::null())

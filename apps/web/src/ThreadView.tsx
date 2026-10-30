@@ -23,6 +23,7 @@ import "./message.css";
 import "./thread-comments.css";
 import { plainText } from "./mail-text";
 import { readText, writeText } from "./storage";
+import { unsubscribeMessage } from "./unsubscribe";
 import { getQuickReplies } from "./quick-replies";
 import type { AiDecision, AiFeedbackInput, AiReadingInput } from "../../shared/ai-triage";
 import ConversationTriage from "./ConversationTriage";
@@ -88,6 +89,7 @@ type ThreadViewProps = {
   onBack: () => void;
   onNavigate: (delta: number) => void;
   onAction: (action: string) => void;
+  onUnsubscribe: (messageId: string) => void;
   supportsAction: (action: string) => boolean;
   onCompose: (mode: "reply" | "replyAll" | "forward", popOut?: boolean, sourceMessageId?: string) => void;
   onDraftChange: (draft: Draft) => void;
@@ -127,6 +129,7 @@ export default function ThreadView({
   onBack,
   onNavigate,
   onAction,
+  onUnsubscribe,
   supportsAction,
   onCompose,
   onDraftChange,
@@ -159,9 +162,6 @@ export default function ThreadView({
   const entryReplyRequest = useRef(replyRequest);
   const popOut = draft?.popOut === true;
   const [snippetRequest, setSnippetRequest] = useState(0);
-  const [unsubscribed, setUnsubscribed] = useState(
-    () => readText(`unsubscribed:${mail.email}`) === "true",
-  );
   const ownScroller = useRef<HTMLDivElement>(null);
   const scroller = scrollRef ?? ownScroller;
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -219,6 +219,7 @@ export default function ThreadView({
     onReading: onAiReading,
   });
   const marketing = !mail.sourceId && ["Basecamp", "Mail Me Later"].includes(mail.from);
+  const unsubscribeTarget = unsubscribeMessage(mail, account);
   const conversationLink = new URL(location.href);
   const linkParams = new URLSearchParams(location.hash.replace(/^#\/?/, ""));
   linkParams.set("account", account);
@@ -410,8 +411,8 @@ export default function ThreadView({
     } else if (command && !event.shiftKey && key === ";") {
       setSnippetRequest((request) => request + 1);
       onCompose("reply");
-    } else if (command && !event.shiftKey && key === "u" && marketing) {
-      unsubscribe();
+    } else if (command && !event.shiftKey && key === "u" && unsubscribeTarget) {
+      onUnsubscribe(unsubscribeTarget.id);
     } else if (command && !event.shiftKey && key === "o") {
       const links = messageLinks(scroller.current);
       const focusedLink = target?.closest<HTMLAnchorElement>("a[href]");
@@ -564,15 +565,6 @@ export default function ThreadView({
     );
   }
 
-  function unsubscribe() {
-    setUnsubscribed(true);
-    try {
-      writeText(`unsubscribed:${mail.email}`, "true");
-    } catch {
-      /* Keep the subscription state for this session. */
-    }
-  }
-
   function setPopOut(value: boolean) {
     if (draft && value !== popOut) onDraftChange({ ...draft, popOut: value });
   }
@@ -677,13 +669,13 @@ export default function ThreadView({
             mode={aiMode}
             onFeedback={onAiFeedback}
           />}
-          {marketing && (
+          {unsubscribeTarget && (
             <button
               className="thread-unsubscribe"
-              title="Unsubscribe (Cmd+U)"
-              onClick={unsubscribe}
+              title="Unsubscribe (⌘U)"
+              onClick={() => onUnsubscribe(unsubscribeTarget.id)}
             >
-              {unsubscribed ? "Unsubscribed" : "Unsubscribe"}
+              Unsubscribe
             </button>
           )}
           {!!mail.mailboxNames?.length && <div className="thread-mailbox-origin" title={mail.mailboxNames.join(", ")}>{mail.mailboxNames[0]}{mail.mailboxNames.length > 1 ? ` +${mail.mailboxNames.length - 1} mailboxes` : ""}</div>}

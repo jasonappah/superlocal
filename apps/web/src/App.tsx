@@ -50,6 +50,8 @@ import { UNIFIED_ACCOUNT } from "./mail-model";
 import { plainText } from "./mail-text";
 import { resolveMailShortcut } from "./mail-shortcuts";
 import MailCommandDialog, { type CommandItem } from "./MailCommandDialog";
+import UnsubscribeDialog, { type UnsubscribeMode } from "./UnsubscribeDialog";
+import { unsubscribeMessage } from "./unsubscribe";
 import IssueReporter from "./IssueReporter";
 import Notices, { Notice } from "./Notices";
 import { InboxActionError, type InboxIssue } from "./inbox";
@@ -164,6 +166,9 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
   const [capturingIssue, setCapturingIssue] = useState(false);
   const issueCapturePending = useRef(false);
   const [overlayIds, setOverlayIds] = useState<string[] | null>(null);
+  const [unsubscribeTarget, setUnsubscribeTarget] = useState<{ mail: Mail; messageId: string } | null>(null);
+  const [unsubscribeBusy, setUnsubscribeBusy] = useState(false);
+  const [unsubscribeError, setUnsubscribeError] = useState("");
   const [commandDraftId, setCommandDraftId] = useState<string | null>(null);
   const [teachBusy, setTeachBusy] = useState(false);
   const [teachError, setTeachError] = useState("");
@@ -1429,6 +1434,55 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
     setOverlay(null);
     timing.finish();
   }
+  function openUnsubscribe(mail: Mail, messageId: string) {
+    setUnsubscribeError("");
+    setUnsubscribeTarget({ mail, messageId });
+  }
+  async function chooseUnsubscribe(mode: UnsubscribeMode) {
+    const target = unsubscribeTarget;
+    if (!target || unsubscribeBusy) return;
+    setUnsubscribeBusy(true);
+    setUnsubscribeError("");
+    try {
+      const outcome = await store.unsubscribe(target.mail, target.messageId, mode);
+      const sender = target.mail.email;
+      if (outcome.result.kind === "link" && outcome.result.url) {
+        setUnsubscribeTarget(null);
+        setNotice({ text: `Unsubscribe from ${sender} on the sender’s page.`, action: { label: "Open page", run: () => openExternal(outcome.result.url!) } });
+        return;
+      }
+      if (outcome.result.kind === "mailto" && outcome.result.sent === false && outcome.result.mailto) {
+        setUnsubscribeTarget(null);
+        setNotice({ text: `Unsubscribe from ${sender} by sending the confirmation email.`, action: { label: "Open email", run: () => openExternal(outcome.result.mailto!) } });
+        return;
+      }
+      setUnsubscribeTarget(null);
+      if (mode === "unsubscribe") {
+        setNotice({ text: `Unsubscribed from ${sender}.` });
+        return;
+      }
+      const changed = outcome.affected;
+      setNotice({
+        text: `Unsubscribed from ${sender}. ${changed} conversation${changed === 1 ? "" : "s"} marked ${mode === "done" ? "Done" : "Trash"}.`,
+        undo: outcome.undo ? undoAction(async () => { await outcome.undo!(); }) : undefined,
+      });
+      if (target.mail.id === currentMail?.id) {
+        const next = preferences.autoAdvance
+          ? await adjacentMail(target.mail, preferences.advanceDirection === "Previous conversation" ? -1 : 1).catch(error => { actionError(error); return undefined; })
+          : undefined;
+        if (preferences.autoAdvance && next) openMail(next);
+        else goBack();
+      }
+    } catch (error) {
+      setUnsubscribeError(error instanceof Error && error.message ? error.message : "The unsubscribe request did not complete.");
+    } finally {
+      setUnsubscribeBusy(false);
+    }
+  }
+  /** Open a sender page or confirmation mail through the platform browser (and the shell's external handler). */
+  function openExternal(url: string) {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
   /** One conversation, one note: the host generalizes it into a durable classifier rule and re-sorts recent inbox mail. */
   async function teach(note: string) {
     const target = targets[0] ?? currentMail;
@@ -1622,6 +1676,18 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
       icon: "Check",
       run: () => applyAction("done"),
     },
+    ...(currentMail && unsubscribeMessage(currentMail, route.account) ? [{
+      label: "Unsubscribe",
+      detail: `Stop future email from ${currentMail.from}`,
+      key: "⌘U",
+      icon: "Envelope",
+      run: () => {
+        const message = currentMail && unsubscribeMessage(currentMail, route.account);
+        if (!message) return;
+        setOverlay(null);
+        openUnsubscribe(currentMail!, message.id);
+      },
+    }] : []),
     {
       label: "Remind Me",
       detail: "Bring this conversation back later",
@@ -2281,6 +2347,7 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
             onBack={goBack}
             onNavigate={navigateThread}
             onAction={applyAction}
+            onUnsubscribe={(messageId) => openUnsubscribe(currentMail, messageId)}
             supportsAction={action => zero.active && (zero.busy || !!zero.retry) ? false : !!currentMail.operationId ? action === "trash" : store.supports(action, currentMail.mailboxId ?? currentMail.account)}
             onCompose={composeReply}
             replyRequest={replyRequest}
@@ -2820,6 +2887,15 @@ export default function App({ applicationUser, onSignOut }: { applicationUser?: 
         onAccount={selectAccount}
         onSettings={openSettings}
       />
+      {unsubscribeTarget && (
+        <UnsubscribeDialog
+          sender={unsubscribeTarget.mail.email}
+          busy={unsubscribeBusy}
+          error={unsubscribeError || undefined}
+          onClose={() => { if (!unsubscribeBusy) { setUnsubscribeTarget(null); setUnsubscribeError(""); } }}
+          onChoose={(mode) => { void chooseUnsubscribe(mode); }}
+        />
+      )}
       {capturingIssue && (
         <div data-issue-ui className="issue-capture-status" role="status">
           Capturing screenshot…

@@ -1,4 +1,4 @@
-import type { MailboxMembership, SendingIdentities } from "inbox-sdk/types";
+import type { MailboxMembership, MailFacts, SendingIdentities } from "inbox-sdk/types";
 import type { AttentionDecision } from "../../shared/mail-attention";
 import type { AiDecision, AiCategory } from "../../shared/ai-triage";
 import type { CategoryEntry } from "../../shared/attention-overrides";
@@ -46,6 +46,8 @@ export type Message = {
   isStarred?: boolean;
   memberships?: MailboxMembership[];
   attention?: AttentionDecision;
+  /** Body-free source evidence; `listUnsubscribe` is the actionable unsubscribe signal. */
+  facts?: MailFacts;
 };
 export type Mail = {
   id: string;

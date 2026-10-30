@@ -3127,6 +3127,9 @@ test("demand-driven host windows bound automatic requests and render unknown tot
           };
           const projected = (summaries: Summary[]) => projectMailboxMail({ sources: [source], mailboxes: [box], labels: [], summaries,
             includedMailboxIds: [], allowProviderWrites: false, now: Date.now(), displayTime: () => ({ date: "Today", group: "Today" }) }).mail[0];
+          const factsSummary = { ...summary(1, "facts"), facts: { version: 1 as const, listId: true, listUnsubscribe: true } };
+          assert.deepEqual(projected([factsSummary]).messages[0]?.facts, { version: 1, listId: true, listUnsubscribe: true },
+            "projected messages carry body-free source facts so the reader can offer the sender's unsubscribe");
           const giantRow = (): Row => {
             const preview = Array.from({ length: 50 }, (_, i) => summary(651 + i));
             return { key: giantKey, sourceId: source.id, threadId: "giant", sourceGeneration: 1, revision: giantRevision,

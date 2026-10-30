@@ -75,6 +75,7 @@ export function projectMailboxMail(input: MailProjectionInput): { accounts: Mail
           email: row.from.email, to: addresses(row.to), cc: addresses(row.cc), date: input.displayTime(row.receivedAt).date,
           receivedAt: row.receivedAt, preview: row.preview, body: "", loaded: false, outgoing: row.folder === "sent", hasAttachments: row.hasAttachments,
           attention: classifyAttention(row), nativeFolder: row.folder, isRead: row.isRead, isStarred: row.isStarred,
+          ...(row.facts ? { facts: row.facts } : {}),
           memberships: row.memberships.filter(state => state.mailboxId === box.id) };
         return input.decorateMessage?.(message, row) ?? message;
       });

@@ -8,7 +8,7 @@ import { ApiError, createInboxClient, type InboxClient } from "inbox-sdk/client"
 import { measurePerformance, measureRequest, measureWork } from "./browser-logs";
 import type {
   Account, BlobInfo, ChangeEvent, Changes, Draft as SdkDraft, DraftInput, Folder, Label,
-  Mailbox, MailboxMembership, MailboxMessageSummary, MailboxStateTarget, Message as SdkMessage, MutationInput, Operation, Participant, Policy,
+  Mailbox, MailboxConversationQuery, MailboxMembership, MailboxMessageSummary, MailboxStateTarget, MailboxThreadKey, Message as SdkMessage, MutationInput, Operation, Participant, Policy, UnsubscribeResult,
 } from "inbox-sdk/types";
 import type { Attachment, Draft, LoadSendingIdentities, Mail, MailboxOption, Message } from "./data";
 import { escapeHTML, plainText } from "./mail-text";
@@ -100,6 +100,7 @@ type PendingDone = {
 const PENDING_DONE_LIMIT = 32;
 const PENDING_DONE_TARGET_LIMIT = 4096;
 export type InboxUndo = (() => Promise<void>) & { receipts?: InboxActionReceiptReference[]; inverseReceipts?: InboxActionReceiptReference[]; recovery?: InboxCommandRecovery };
+export type UnsubscribeOutcome = { result: UnsubscribeResult; mails: Mail[]; affected: number; undo?: InboxUndo };
 class InboxRecoveryStorageError extends InboxActionError {}
 export class InboxRecoveryRejected extends InboxActionError {}
 const recoveryBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -3559,6 +3560,60 @@ export class InboxStore {
     await this.receiveFeedback(event);
     if (event.problem) throw new Error(event.problem);
   }, false);
+  /**
+   * Superhuman's ⌘U: deliver the sender's advertised unsubscribe request, then
+   * optionally act on every other conversation from that sender in this scope.
+   * One-click POST is attempted first; nothing is fabricated when no target
+   * exists. Sender-wide Done/Trash reuses the normal action path so Undo,
+   * receipts and pending-done behaviour stay identical to a manual action.
+   */
+  unsubscribe = async (mail: Mail, messageId: string, mode: "unsubscribe" | "done" | "trash"): Promise<UnsubscribeOutcome> => {
+    const message = mail.messages.find(item => item.id === messageId && !item.pending && !item.outgoing);
+    const mailboxId = message?.memberships?.map(state => state.mailboxId).find(id => this.boxes.some(box => box.id === id))
+      ?? (mail.mailboxId && this.boxes.some(box => box.id === mail.mailboxId) ? mail.mailboxId : undefined)
+      ?? (mail.account !== UNIFIED_ACCOUNT && this.boxes.some(box => box.id === mail.account) ? mail.account : undefined);
+    if (!message || !mailboxId) throw new Error("Open a received message before unsubscribing.");
+    const result = await this.client.unsubscribe(mailboxId, messageId, this.requestOptions());
+    if (mode === "unsubscribe") return { result, mails: [], affected: 0 };
+    const sender = (message.email || mail.email || "").trim().toLowerCase();
+    if (!sender) throw new Error("Unsubscribed, but this message has no recognizable sender address.");
+    const mails = await this.senderConversations(mail, sender);
+    if (!mails.some(item => item.id === mail.id)) mails.unshift(mail);
+    if (mails.length > 500) throw new Error("Unsubscribed, but more than 500 conversations match this sender in this view.");
+    let undo: InboxUndo;
+    try { undo = await this.action(mails, mode); }
+    catch (error) {
+      throw new Error(`Unsubscribed, but the sender's other conversations were not changed: ${error instanceof Error ? error.message : "the action failed."}`);
+    }
+    return { result, mails, affected: mails.length, undo };
+  };
+  /** Every conversation from one sender in the current receiving scope, bounded to 500 memberships. */
+  private senderConversations = async (mail: Mail, address: string): Promise<Mail[]> => {
+    const account = this.windowQuery.account;
+    const mailboxIds = account === UNIFIED_ACCOUNT ? this.unifiedMailboxIds() : [mail.mailboxId ?? account];
+    if (!mailboxIds.length || mailboxIds.length > 50 || !mailboxIds.every(id => this.boxes.some(box => box.id === id))) {
+      return this.state.mail.filter(item => item.sourceId === mail.sourceId && item.email.trim().toLowerCase() === address);
+    }
+    const query: MailboxConversationQuery = { participant: { field: "from", match: "address", value: address } };
+    const keys: MailboxThreadKey[] = [];
+    let memberships = 0, cursor: string | undefined, done = false;
+    for (let page = 0; page < 10 && !done; page++) {
+      const result = await this.client.mailboxConversations({ mailboxIds, limit: 100, query, ...(cursor ? { cursor } : {}) }, this.requestOptions());
+      for (const item of result.items) {
+        if (memberships + item.membershipCount > 500) { done = true; break; }
+        memberships += item.membershipCount;
+        keys.push({ sourceId: item.sourceId, threadId: item.threadId });
+      }
+      cursor = result.nextCursor ?? undefined;
+      if (!cursor) done = true;
+    }
+    const ids = [...new Set(keys.map(key => account === UNIFIED_ACCOUNT ? `unified:${key.sourceId}:${key.threadId}` : `${account}:${key.threadId}`))];
+    const found: Mail[] = [];
+    for (let index = 0; index < ids.length; index += INBOX_LOOKUP_LIMIT) {
+      found.push(...await this.lookupWindow(ids.slice(index, index + INBOX_LOOKUP_LIMIT), account));
+    }
+    return found;
+  };
   action = (selected: Mail[], action: string, value?: string, sink?: InboxRecoverySink): Promise<InboxUndo> => {
     if (!selected.length) return Promise.reject(new Error("Select a conversation before making changes."));
     if (selected.some(mail => mail.window && !mail.window.targetsComplete)) return Promise.reject(new Error("This conversation exceeds 500 message memberships. No mail was changed."));
